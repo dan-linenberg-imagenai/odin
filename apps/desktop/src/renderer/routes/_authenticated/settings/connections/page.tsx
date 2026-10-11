@@ -24,6 +24,7 @@ import {
 } from "renderer/components/ConnectProvider/ConnectProvider";
 import { electronTrpc } from "renderer/lib/electron-trpc";
 import { useInAppBrowser } from "renderer/stores/in-app-browser";
+import { LINK_HOSTS } from "shared/in-odin-links";
 import { PROFILE_RESTORE_MS } from "shared/odin-profile";
 import {
 	useOdinFeeds,
@@ -564,22 +565,54 @@ function Profiles({ onSwitched }: { onSwitched: () => void }) {
 	);
 }
 
-/** Undoes "Always open links in your browser" from the in-app browser. */
+/** Every provider names its link hosts, so a new one gets its switch below. */
+const PROVIDER_LINK_HOSTS: Record<Provider, readonly string[]> = LINK_HOSTS;
+const LINK_PROVIDERS = ORDER.filter((p) => PROVIDER_LINK_HOSTS[p].length > 0);
+const linkSiteNames = LINK_PROVIDERS.map((p) => META[p].name);
+const LINK_SITE_LIST = `${linkSiteNames.slice(0, -1).join(", ")} and ${linkSiteNames.at(-1)}`;
+
+/**
+ * Undoes "Always open links in your browser" from the in-app browser; while
+ * it's on, each site can still send its own links to your browser.
+ */
 function OpenLinksInOdinRow() {
 	const external = useInAppBrowser((state) => state.external);
+	const browserSites = useInAppBrowser((state) => state.browserSites);
 	return (
-		<SettingRow
-			label="Open links inside Odin"
-			htmlFor="open-links-in-odin"
-			description="Slack, Jira, GitHub, Notion and Gmail links open in a panel over the page instead of another app; other links always go to your default browser. Off sends them all there."
-		>
-			<Switch
-				id="open-links-in-odin"
-				checked={!external}
-				onCheckedChange={(inOdin) =>
-					useInAppBrowser.setState({ external: !inOdin })
-				}
-			/>
-		</SettingRow>
+		<>
+			<SettingRow
+				label="Open links inside Odin"
+				htmlFor="open-links-in-odin"
+				description={`${LINK_SITE_LIST} links open in a panel over the page instead of another app; other links always go to your default browser. Off sends them all there.`}
+			>
+				<Switch
+					id="open-links-in-odin"
+					checked={!external}
+					onCheckedChange={(inOdin) =>
+						useInAppBrowser.setState({ external: !inOdin })
+					}
+				/>
+			</SettingRow>
+			{!external &&
+				LINK_PROVIDERS.map((id) => (
+					<SettingRow
+						key={id}
+						label={`${META[id].name} links`}
+						htmlFor={`open-links-in-odin-${id}`}
+					>
+						<Switch
+							id={`open-links-in-odin-${id}`}
+							checked={!browserSites.includes(id)}
+							onCheckedChange={(inOdin) =>
+								useInAppBrowser.setState({
+									browserSites: inOdin
+										? browserSites.filter((site) => site !== id)
+										: [...browserSites, id],
+								})
+							}
+						/>
+					</SettingRow>
+				))}
+		</>
 	);
 }
