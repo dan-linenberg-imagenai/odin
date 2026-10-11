@@ -13,7 +13,7 @@ import {
 } from "react";
 import { LuChevronRight, LuSquareTerminal, LuWrench } from "react-icons/lu";
 import { MarkdownRenderer } from "renderer/components/MarkdownRenderer";
-import { isHotkey } from "renderer/hotkeys";
+import { isHotkey, useHotkeyDisplay } from "renderer/hotkeys";
 import { electronTrpc } from "renderer/lib/electron-trpc";
 import { shellEscapePaths } from "renderer/screens/main/components/WorkspaceView/ContentView/TabsContent/Terminal/utils";
 import { draftFor, useChatDrafts } from "renderer/stores/chat-drafts";
@@ -1772,12 +1772,15 @@ export function ChatView({
 /**
  * Types a message into Claude's PTY and submits it. Text goes in as a
  * bracketed paste when it spans lines (a bare newline would submit early),
- * then Enter in its own write.
+ * then Enter in its own write. `now` submits with Claude's send-now chord
+ * (Ctrl+X Ctrl+S) instead: mid-turn it lands right away, not after the turn.
+ * Ctrl+Enter itself can't cross a PTY - it arrives as a plain Enter.
  */
 async function typeIntoClaude(
 	write: (input: { paneId: string; data: string }) => Promise<unknown>,
 	paneId: string,
 	text: string,
+	now = false,
 ) {
 	if (text)
 		await write({
@@ -1785,7 +1788,7 @@ async function typeIntoClaude(
 			data: text.includes("\n") ? `\x1b[200~${text}\x1b[201~` : text,
 		});
 	await new Promise((resolve) => setTimeout(resolve, 30));
-	await write({ paneId, data: "\r" });
+	await write({ paneId, data: now ? "\x18\x13" : "\r" });
 }
 
 /**
@@ -1864,6 +1867,7 @@ function Composer({
 	const inputRef = useRef<HTMLTextAreaElement>(null);
 	const write = electronTrpc.terminal.write.useMutation();
 	const setChat = useSessionView((s) => s.setChat);
+	const sendNowKeys = useHotkeyDisplay("CHAT_SEND_NOW").text;
 	// Type `/` and the agent's skills/commands are searchable, like the New
 	// Session dialog. Picking one fills in `/name `; Enter then sends it.
 	const { data: skills = [] } = electronTrpc.skills.list.useQuery();
@@ -1888,7 +1892,7 @@ function Composer({
 		el.style.height = "auto";
 		el.style.height = `${Math.min(el.scrollHeight, 220)}px`;
 	}, [draft]);
-	const send = async () => {
+	const send = async (now = false) => {
 		const body = draft.trim();
 		const sending = bash ? [] : attached;
 		if (!body && sending.length === 0) return;
@@ -1913,7 +1917,7 @@ function Composer({
 			// A bracketed paste, not typing: only a pasted path becomes an attachment.
 			for (const path of paths)
 				await write.mutateAsync({ paneId, data: `\x1b[200~${path}\x1b[201~ ` });
-			await typeIntoClaude(write.mutateAsync, paneId, text);
+			await typeIntoClaude(write.mutateAsync, paneId, text, now);
 		} catch (error) {
 			setDraft(body);
 			setBash(bash);
@@ -2030,7 +2034,7 @@ function Composer({
 								!event.nativeEvent.isComposing
 							) {
 								event.preventDefault();
-								void send();
+								void send(isHotkey("CHAT_SEND_NOW", event.nativeEvent));
 							}
 						}}
 						placeholder={bash ? "Run a shell command" : placeholder}
@@ -2058,8 +2062,8 @@ function Composer({
 						</span>
 					) : (
 						<span className="text-[11px] text-faint-foreground">
-							Enter to send · Shift+Enter for a new line · ! for bash · / for
-							skills
+							Enter to send · {sendNowKeys} to send now · Shift+Enter for a new
+							line · ! for bash · / for skills
 						</span>
 					)}
 					{working ? (
