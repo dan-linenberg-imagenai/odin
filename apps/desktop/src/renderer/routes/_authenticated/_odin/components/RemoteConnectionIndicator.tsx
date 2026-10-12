@@ -15,7 +15,7 @@ import { electronTrpc } from "renderer/lib/electron-trpc";
  * Home top-bar control that shows where Odin's backend is running. Lit green
  * with the connection name when a remote backend is connected, a quiet "Local"
  * otherwise. The dropdown connects to any configured remote, disconnects back
- * to local, or opens the Remote server settings.
+ * to local, or opens Settings > Advanced > Remote server.
  */
 export function RemoteConnectionIndicator() {
 	const navigate = useNavigate();
@@ -118,7 +118,7 @@ export function RemoteConnectionIndicator() {
 				})}
 				<DropdownMenuSeparator />
 				<DropdownMenuItem
-					onSelect={() => navigate({ to: "/settings/remote-server" })}
+					onSelect={() => navigate({ to: "/settings/advanced" })}
 				>
 					Manage in Settings…
 				</DropdownMenuItem>

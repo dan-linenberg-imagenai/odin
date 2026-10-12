@@ -459,9 +459,9 @@ await step(
 			`(document.activeElement ?? document.body).dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))`,
 		);
 		await waitForText("Run the backend on", false);
-		// The Remote server settings screen mounts from the sidebar.
+		// Remote server is a section of Settings > Advanced.
 		await rail("Settings");
-		await click("a", "Remote server");
+		await click("a", "Advanced");
 		await waitForText("Add a connection");
 		await click("a", "Back");
 	},
@@ -679,7 +679,7 @@ await step("Done takes a task off the list", async () => {
 	await waitForText(TASK, false);
 });
 
-// Settings is nine fixed screens; each sidebar link and the route it opens.
+// Settings is eight fixed screens; each sidebar link and the route it opens.
 const SETTINGS: [string, string][] = [
 	["Connections", "#/settings/connections"],
 	["Sessions", "#/settings/sessions"],
@@ -689,9 +689,8 @@ const SETTINGS: [string, string][] = [
 	["Appearance", "#/settings/appearance"],
 	["Keyboard", "#/settings/keyboard"],
 	["Advanced", "#/settings/advanced"],
-	["Remote server", "#/settings/remote-server"],
 ];
-await step("Settings: exactly its nine screens, and each opens", async () => {
+await step("Settings: exactly its eight screens, and each opens", async () => {
 	await rail("Settings");
 	await waitForText("profiles");
 	const links = await page<string[]>(

@@ -2,22 +2,14 @@ import { Button } from "@odin/ui/button";
 import { Input } from "@odin/ui/input";
 import { toast } from "@odin/ui/sonner";
 import { cn } from "@odin/ui/utils";
-import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
 import { LuTrash2 } from "react-icons/lu";
 import { electronTrpc } from "renderer/lib/electron-trpc";
 import {
 	SettingRow,
-	SettingsPage,
 	SettingsSection,
 	StatusDot,
-} from "../components/SettingsPage";
-
-export const Route = createFileRoute("/_authenticated/settings/remote-server/")(
-	{
-		component: RemoteServerSettings,
-	},
-);
+} from "../../components/SettingsPage";
 
 type AuthMethod = "key" | "password";
 
@@ -45,7 +37,11 @@ const EMPTY_FORM: ConnectionForm = {
 	remoteHostServicePort: "48000",
 };
 
-function RemoteServerSettings() {
+/**
+ * Settings > Advanced > Remote server: the machines Odin can run its backend
+ * on, and the form that adds one.
+ */
+export function RemoteServerSection() {
 	const utils = electronTrpc.useUtils();
 	const { data: connections = [] } =
 		electronTrpc.remoteConnections.list.useQuery();
@@ -120,13 +116,10 @@ function RemoteServerSettings() {
 	});
 
 	return (
-		<SettingsPage
-			title="Remote server"
-			description="Run Odin's backend on any Linux server you can SSH into, so agents keep running when this computer is asleep or closed. The server needs nothing installed: Odin brings its own Node and sets it up in the odin folder on the first connect, which needs internet on the server once. Only the path to your SSH key is stored - never the key itself."
-		>
+		<>
 			<SettingsSection
 				title="Remote server"
-				description="Configured machines Odin can run its backend on."
+				description="Run Odin's workspace backend (workspaces, their terminals, agent and git settings) on any Linux server you can SSH into. Dev Board sessions still run on this Mac for now. The server needs nothing installed: Odin brings its own Node and sets it up in the odin folder on the first connect, which needs internet on the server once. Only the path to your SSH key is stored - never the key itself."
 			>
 				{connections.length === 0 ? (
 					<SettingRow
@@ -319,6 +312,6 @@ function RemoteServerSettings() {
 					</Button>
 				</SettingRow>
 			</SettingsSection>
-		</SettingsPage>
+		</>
 	);
 }

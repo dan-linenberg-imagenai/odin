@@ -5,7 +5,6 @@ import {
 	LuListOrdered,
 	LuPalette,
 	LuPlug,
-	LuServer,
 	LuSlidersHorizontal,
 	LuSquareTerminal,
 } from "react-icons/lu";
@@ -61,14 +60,8 @@ export const SCREENS = [
 	{
 		to: "/settings/advanced",
 		label: "Advanced",
-		hint: "Claude command, default prompt, worktree cleanup",
+		hint: "Claude command, default prompt, cleanup, remote server",
 		icon: LuSlidersHorizontal,
-	},
-	{
-		to: "/settings/remote-server",
-		label: "Remote server",
-		hint: "Run the backend over SSH, keep agents alive",
-		icon: LuServer,
 	},
 ] as const;
 
@@ -296,20 +289,20 @@ export const SETTINGS_INDEX: SettingEntry[] = [
 	},
 	{
 		label: "Remote server",
-		to: "/settings/remote-server",
+		to: "/settings/advanced",
 		section: "Remote server",
 		keywords:
 			"ssh remote backend host run agents offload tunnel machine server",
 	},
 	{
 		label: "Server address",
-		to: "/settings/remote-server",
+		to: "/settings/advanced",
 		section: "Add a connection",
 		keywords: "ip hostname host address ssh remote",
 	},
 	{
 		label: "Odin folder",
-		to: "/settings/remote-server",
+		to: "/settings/advanced",
 		section: "Add a connection",
 		keywords: "odin home dir folder path remote logs database worktrees",
 	},
