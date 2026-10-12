@@ -4,7 +4,22 @@ import type { RemoteConnectionConfig, TestConnectionResult } from "./types";
 
 /** Markers the remote probe prints so we can parse its result unambiguously. */
 export const FOLDER_OK_MARKER = "ODIN_FOLDER_OK";
-export const NODE_OK_MARKER = "ODIN_NODE_OK";
+export const PLATFORM_MARKER = "ODIN_PLATFORM";
+
+/**
+ * The Node the backend runs on, downloaded into the odin folder by
+ * {@link buildNodeInstallCommand}: the server needs nothing installed, and the
+ * native modules npm builds always match the Node that loads them.
+ */
+export const REMOTE_NODE_VERSION = "22.12.0";
+
+/** Node's Linux build names, by `uname -m`. */
+const NODE_ARCH: Record<string, string> = {
+	x86_64: "x64",
+	amd64: "x64",
+	aarch64: "arm64",
+	arm64: "arm64",
+};
 
 /**
  * Single-quote a string for a POSIX shell: wrap in single quotes and escape any
@@ -15,14 +30,14 @@ export function shellQuote(value: string): string {
 }
 
 /**
- * Remote probe for Test-connection: create the odin folder and report whether
- * Node is present. Prints stable markers the parser keys off.
+ * Remote probe for Test-connection: create the odin folder and report the
+ * server's OS and CPU. Prints stable markers the parser keys off.
  */
 export function buildTestCommand(config: RemoteConnectionConfig): string {
 	const folder = shellQuote(config.odinFolder);
 	return [
 		`mkdir -p ${folder} && printf '%s\\n' ${shellQuote(FOLDER_OK_MARKER)}`,
-		`if command -v node >/dev/null 2>&1; then printf '%s %s\\n' ${shellQuote(NODE_OK_MARKER)} "$(node --version 2>/dev/null)"; fi`,
+		`printf '%s %s %s\\n' ${shellQuote(PLATFORM_MARKER)} "$(uname -s)" "$(uname -m)"`,
 	].join("; ");
 }
 
@@ -33,45 +48,77 @@ export function parseTestOutput(
 	errorText = "",
 ): TestConnectionResult {
 	const folderReady = stdout.includes(FOLDER_OK_MARKER);
-	const nodeLine = stdout
-		.split("\n")
-		.find((line) => line.startsWith(NODE_OK_MARKER));
-	const nodeAvailable = Boolean(nodeLine);
-	const nodeVersion = nodeLine
-		? nodeLine.slice(NODE_OK_MARKER.length).trim() || null
-		: null;
+	const [os = "", arch = ""] =
+		stdout
+			.split("\n")
+			.find((line) => line.startsWith(PLATFORM_MARKER))
+			?.slice(PLATFORM_MARKER.length)
+			.trim()
+			.split(/\s+/) ?? [];
+	const platform = os ? `${os} ${arch}`.trim() : null;
+	const fail = (message: string): TestConnectionResult => ({
+		ok: false,
+		reachable,
+		platform,
+		folderReady,
+		message,
+	});
 
 	if (!reachable) {
-		return {
-			ok: false,
-			reachable: false,
-			nodeAvailable: false,
-			nodeVersion: null,
-			folderReady: false,
-			message: errorText.trim() || "Could not reach the host over SSH.",
-		};
+		return fail(errorText.trim() || "Could not reach the host over SSH.");
 	}
-	if (!nodeAvailable) {
-		return {
-			ok: false,
-			reachable: true,
-			nodeAvailable: false,
-			nodeVersion: null,
-			folderReady,
-			message:
-				"Connected, but Node.js was not found on the remote. Install Node 20 or newer.",
-		};
+	// The start command uses setsid and /proc, and Odin ships Node's Linux build.
+	if (os !== "Linux") {
+		return fail(
+			`Connected, but the server runs ${os || "an unknown OS"}. Odin's backend runs on Linux servers only.`,
+		);
 	}
+	if (!NODE_ARCH[arch]) {
+		return fail(
+			`Connected, but the server's CPU (${arch || "unknown"}) is not one Odin can run on. It needs x86_64 or arm64.`,
+		);
+	}
+	if (!folderReady)
+		return fail("Connected, but the odin folder could not be created.");
 	return {
-		ok: folderReady,
+		ok: true,
 		reachable: true,
-		nodeAvailable: true,
-		nodeVersion,
-		folderReady,
-		message: folderReady
-			? `Connected. Node ${nodeVersion ?? "(unknown version)"} found and the odin folder is ready.`
-			: "Connected, but the odin folder could not be created.",
+		platform,
+		folderReady: true,
+		message: `Connected to ${platform}. The odin folder is ready, and Odin sets up its own Node there on the first connect.`,
 	};
+}
+
+/**
+ * Remote command that puts Node {@link REMOTE_NODE_VERSION} under
+ * `<folder>/node`, once: the official Linux build for the server's CPU,
+ * fetched with curl or wget. Exits non-zero with a plain reason when the
+ * server is not Linux, has an unknown CPU, or the download fails.
+ */
+export function buildNodeInstallCommand(folder: string): string {
+	const dir = `${folder}/node`;
+	const q = shellQuote;
+	const v = REMOTE_NODE_VERSION;
+	const arches = Object.entries(NODE_ARCH)
+		.map(([machine, node]) => `${machine}) a=${node};;`)
+		.join(" ");
+	return [
+		`if [ "$(cat ${q(`${dir}/.version`)} 2>/dev/null)" != ${q(v)} ]; then`,
+		`[ "$(uname -s)" = Linux ] || { echo "Odin's backend runs on Linux servers only, this one runs $(uname -s)." >&2; exit 3; };`,
+		`case "$(uname -m)" in ${arches} *) echo "No Node build for this CPU ($(uname -m)); Odin needs x86_64 or arm64." >&2; exit 3;; esac;`,
+		`url=https://nodejs.org/dist/v${v}/node-v${v}-linux-$a.tar.gz;`,
+		`rm -rf ${q(`${dir}.tmp`)} && mkdir -p ${q(`${dir}.tmp`)} &&`,
+		`{ if command -v curl >/dev/null 2>&1; then curl -fsSL "$url"; elif command -v wget >/dev/null 2>&1; then wget -qO- "$url"; else echo "The server has neither curl nor wget to download Node with." >&2; exit 3; fi; }`,
+		`| tar -xz -C ${q(`${dir}.tmp`)} --strip-components=1 &&`,
+		`[ -x ${q(`${dir}.tmp/bin/node`)} ] || { echo "Downloading Node from $url failed." >&2; exit 3; };`,
+		`rm -rf ${q(dir)} && mv ${q(`${dir}.tmp`)} ${q(dir)} && printf '%s' ${q(v)} > ${q(`${dir}/.version`)};`,
+		"fi",
+	].join(" ");
+}
+
+/** Puts the odin folder's own Node first on PATH for the rest of a command. */
+export function remoteNodePath(folder: string): string {
+	return `export PATH=${shellQuote(`${folder}/node/bin`)}:"$PATH"; `;
 }
 
 /**
@@ -131,6 +178,7 @@ export function collectBundleFiles(
 export function buildProvisionCommand(
 	backendDir: string,
 	deps: string[],
+	folder: string,
 ): string {
 	const marker = shellQuote(`${backendDir}/.provisioned`);
 	const spec = deps.join(" ");
@@ -138,6 +186,7 @@ export function buildProvisionCommand(
 	// and misses the prebuilt binary, falling back to a source compile that
 	// needs a full C/C++ toolchain.
 	return [
+		remoteNodePath(folder).trim(),
 		`if [ "$(cat ${marker} 2>/dev/null)" != ${shellQuote(spec)} ]; then`,
 		`cd ${shellQuote(backendDir)}`,
 		`&& printf '%s' '{"name":"odin-remote-backend","private":true}' > package.json`,
@@ -197,7 +246,8 @@ export function buildRemoteStartCommand(
 		`&& { ${env} setsid nohup node ${shellQuote(params.bundlePath)} >> ${log} 2>&1 < /dev/null & }`,
 		`&& echo ${STARTED_MARKER}`,
 	].join(" ");
-	if (!params.existing) return `${READ_SECRETS}${start}`;
+	const prelude = `${READ_SECRETS}${remoteNodePath(folder)}`;
+	if (!params.existing) return `${prelude}${start}`;
 
 	const { pid } = params.existing;
 	const healthProbe = buildRemoteHealthProbe(config.remoteHostServicePort);
@@ -209,7 +259,7 @@ export function buildRemoteStartCommand(
 		`for i in $(seq 1 40); do kill -0 ${pid} 2>/dev/null || break; sleep 0.25; done;`,
 		`kill -9 ${pid} 2>/dev/null; fi`,
 	].join(" ");
-	return `${READ_SECRETS}if [ "$(cat ${stamp} 2>/dev/null)" = ${hash} ] && ${healthProbe}; then echo ${ALREADY_RUNNING_MARKER}; else ${stopOld}; ${start}; fi`;
+	return `${prelude}if [ "$(cat ${stamp} 2>/dev/null)" = ${hash} ] && ${healthProbe}; then echo ${ALREADY_RUNNING_MARKER}; else ${stopOld}; ${start}; fi`;
 }
 
 /**

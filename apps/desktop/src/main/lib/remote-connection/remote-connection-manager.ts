@@ -17,6 +17,7 @@ import {
 import { HOOK_PROTOCOL_VERSION } from "../terminal/env";
 import {
 	ALREADY_RUNNING_MARKER,
+	buildNodeInstallCommand,
 	buildProvisionCommand,
 	buildRemoteStartCommand,
 	buildTestCommand,
@@ -126,7 +127,7 @@ export class RemoteConnectionManager {
 		return this.active;
 	}
 
-	/** Probe reachability, Node presence and that the odin folder is writable. */
+	/** Probe reachability, the server's OS and CPU, and that the odin folder is writable. */
 	async testConnection(
 		config: RemoteConnectionConfig,
 	): Promise<TestConnectionResult> {
@@ -422,7 +423,12 @@ export class RemoteConnectionManager {
 
 		await this.execChecked(
 			client,
-			buildProvisionCommand(backendDir, REMOTE_RUNTIME_DEPS),
+			buildNodeInstallCommand(config.odinFolder),
+			"set up Node on the server",
+		);
+		await this.execChecked(
+			client,
+			buildProvisionCommand(backendDir, REMOTE_RUNTIME_DEPS, config.odinFolder),
 			"install the remote backend's npm dependencies",
 		);
 		return staged.hash;

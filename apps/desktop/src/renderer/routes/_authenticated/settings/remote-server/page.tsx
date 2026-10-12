@@ -122,7 +122,7 @@ function RemoteServerSettings() {
 	return (
 		<SettingsPage
 			title="Remote server"
-			description="Run Odin's backend on an SSH-reachable machine so agents keep running when this computer is asleep or closed. Only the path to your SSH key is stored - never the key itself."
+			description="Run Odin's backend on any Linux server you can SSH into, so agents keep running when this computer is asleep or closed. The server needs nothing installed: Odin brings its own Node and sets it up in the odin folder on the first connect, which needs internet on the server once. Only the path to your SSH key is stored - never the key itself."
 		>
 			<SettingsSection
 				title="Remote server"
@@ -203,7 +203,7 @@ function RemoteServerSettings() {
 
 			<SettingsSection
 				title="Add a connection"
-				description="Key-based SSH only. Point the odin folder at a writable path on the remote - it holds the backend's logs, database and worktrees."
+				description="Any Linux server on x86_64 or arm64, with an SSH key or a password. Point the odin folder at a writable path there - it holds Odin's Node, the backend's logs, database and worktrees. Test connection checks all of this before you connect."
 			>
 				<SettingRow label="Name" htmlFor="remote-name">
 					<Input

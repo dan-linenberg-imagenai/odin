@@ -3,6 +3,7 @@ import hostServicePackage from "../../../../../../packages/host-service/package.
 import desktopPackage from "../../../../package.json";
 import {
 	ALREADY_RUNNING_MARKER,
+	buildNodeInstallCommand,
 	buildProvisionCommand,
 	buildRemoteHealthProbe,
 	buildRemoteStartCommand,
@@ -11,8 +12,9 @@ import {
 	collectBundleFiles,
 	FOLDER_OK_MARKER,
 	hostKeyFingerprint,
-	NODE_OK_MARKER,
+	PLATFORM_MARKER,
 	parseTestOutput,
+	REMOTE_NODE_VERSION,
 	REMOTE_RUNTIME_DEPS,
 	STARTED_MARKER,
 	shellQuote,
@@ -46,30 +48,41 @@ describe("shellQuote", () => {
 });
 
 describe("buildTestCommand + parseTestOutput", () => {
-	it("creates the folder and probes for node", () => {
+	it("creates the folder and reports the OS and CPU", () => {
 		const command = buildTestCommand(config);
 		expect(command).toContain("mkdir -p '/srv/odin'");
-		expect(command).toContain("command -v node");
+		expect(command).toContain('"$(uname -s)" "$(uname -m)"');
+		expect(command).not.toContain("command -v node");
 	});
 
-	it("parses a fully healthy probe", () => {
-		const stdout = `${FOLDER_OK_MARKER}\n${NODE_OK_MARKER} v20.11.1\n`;
-		const result = parseTestOutput(stdout, true);
-		expect(result).toMatchObject({
-			ok: true,
-			reachable: true,
-			nodeAvailable: true,
-			nodeVersion: "v20.11.1",
-			folderReady: true,
-		});
+	it("passes a Linux server on a CPU Node builds for", () => {
+		for (const arch of ["x86_64", "aarch64"]) {
+			const stdout = `${FOLDER_OK_MARKER}\n${PLATFORM_MARKER} Linux ${arch}\n`;
+			expect(parseTestOutput(stdout, true)).toMatchObject({
+				ok: true,
+				reachable: true,
+				platform: `Linux ${arch}`,
+				folderReady: true,
+			});
+		}
 	});
 
-	it("reports node missing even when the folder is ready", () => {
-		const result = parseTestOutput(`${FOLDER_OK_MARKER}\n`, true);
+	it("says a macOS server can't run the backend", () => {
+		const result = parseTestOutput(
+			`${FOLDER_OK_MARKER}\n${PLATFORM_MARKER} Darwin arm64\n`,
+			true,
+		);
 		expect(result.ok).toBe(false);
-		expect(result.nodeAvailable).toBe(false);
-		expect(result.folderReady).toBe(true);
-		expect(result.message).toContain("Node");
+		expect(result.message).toContain("Linux servers only");
+	});
+
+	it("says which CPU is unsupported", () => {
+		const result = parseTestOutput(
+			`${FOLDER_OK_MARKER}\n${PLATFORM_MARKER} Linux armv7l\n`,
+			true,
+		);
+		expect(result.ok).toBe(false);
+		expect(result.message).toContain("armv7l");
 	});
 
 	it("reports unreachable with the error text when ssh failed", () => {
@@ -230,10 +243,11 @@ describe("collectBundleFiles", () => {
 
 describe("buildProvisionCommand", () => {
 	it("reinstalls when the marker does not hold this exact dep list", () => {
-		const command = buildProvisionCommand("/srv/odin/backend", [
-			"a@1",
-			"@b/c@2",
-		]);
+		const command = buildProvisionCommand(
+			"/srv/odin/backend",
+			["a@1", "@b/c@2"],
+			"/srv/odin",
+		);
 		expect(command).toContain(
 			"if [ \"$(cat '/srv/odin/backend/.provisioned' 2>/dev/null)\" != 'a@1 @b/c@2' ]",
 		);
@@ -272,5 +286,37 @@ describe("buildRemoteHealthProbe", () => {
 		const probe = buildRemoteHealthProbe(48000);
 		expect(probe).toContain("/trpc/settings.branchPrefix.get");
 		expect(probe).not.toContain("health.check");
+	});
+});
+
+describe("Odin's own Node on the server", () => {
+	it("downloads the pinned Linux build once, by CPU, with curl or wget", () => {
+		const command = buildNodeInstallCommand("/srv/odin");
+		expect(command).toContain("cat '/srv/odin/node/.version'");
+		expect(command).toContain(`node-v${REMOTE_NODE_VERSION}-linux-$a.tar.gz`);
+		expect(command).toContain("x86_64) a=x64;;");
+		expect(command).toContain("aarch64) a=arm64;;");
+		expect(command).toContain("curl -fsSL");
+		expect(command).toContain("wget -qO-");
+		expect(command).toContain("Linux servers only");
+	});
+
+	it("runs npm and the backend on that Node, not the server's", () => {
+		const path = "export PATH='/srv/odin/node/bin':\"$PATH\";";
+		expect(
+			buildProvisionCommand("/srv/odin/backend", ["a@1"], "/srv/odin"),
+		).toContain(path);
+		const start = buildRemoteStartCommand(config, {
+			existing: { pid: 1 },
+			bundleHash: "h",
+			organizationId: "remote",
+			bundlePath: "/srv/odin/backend/host-service.js",
+			migrationsDir: "/srv/odin/backend/host-migrations",
+			hookPort: 1,
+			hookVersion: "2",
+			vitePort: 5173,
+		});
+		// Before the health probe's node -e and the daemon's node.
+		expect(start.indexOf(path)).toBeLessThan(start.indexOf("node -e"));
 	});
 });

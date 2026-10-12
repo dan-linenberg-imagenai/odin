@@ -29,8 +29,8 @@ export interface RemoteConnectionConfig {
 export interface TestConnectionResult {
 	ok: boolean;
 	reachable: boolean;
-	nodeAvailable: boolean;
-	nodeVersion: string | null;
+	/** `uname -s` and `uname -m`, e.g. "Linux x86_64"; null when unreachable. */
+	platform: string | null;
 	folderReady: boolean;
 	message: string;
 }
