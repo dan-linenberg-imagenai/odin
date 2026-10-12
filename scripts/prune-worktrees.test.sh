@@ -67,6 +67,24 @@ check "--only removes just that worktree" $?
 ! PRUNE_LANDED_MIN_AGE_HOURS=0 GH_TOKEN= "$DIR/prune-worktrees.sh" --only unique "$TMP/repo" | grep -q "^remove"
 check "--only still keeps work main doesn't have" $?
 
+# A deleted, uncommitted file: no mtime to read, and it must not end the run.
+g worktree add -q -b gone .worktrees/gone origin/main
+rm .worktrees/gone/a
+out="$(PRUNE_MIN_AGE_HOURS=0 PRUNE_LANDED_MIN_AGE_HOURS=0 GH_TOKEN= "$DIR/prune-worktrees.sh" --dry-run "$TMP/repo")"
+grep -q "^keep   gone (uncommitted" <<<"$out" && grep -q "^keep   unique " <<<"$out"
+check "a deleted file keeps its worktree and the rest still get a verdict" $?
+g worktree remove --force .worktrees/gone
+
+# --force: gone whatever it holds, but the branch stays and so do its files.
+! GH_TOKEN= "$DIR/prune-worktrees.sh" --force "$TMP/repo" >/dev/null 2>&1
+check "--force without --only refuses" $?
+GH_TOKEN= "$DIR/prune-worktrees.sh" --only unique --force "$TMP/repo" >/dev/null
+[ ! -d .worktrees/unique ] && git rev-parse -q --verify refs/heads/unique >/dev/null
+check "--force removes work main doesn't have and keeps its branch" $?
+GH_TOKEN= "$DIR/prune-worktrees.sh" --only dirty --force "$TMP/repo" >/dev/null
+[ ! -d .worktrees/dirty ] && [ "$(git show refs/pruned/dirty:notes.txt 2>/dev/null)" = scratch ]
+check "--force saves uncommitted files to refs/pruned/<name>" $?
+
 # Closed PR at exactly the worktree's head: gone, even though main moved the
 # same file on. Closed at another commit: kept. The fake gh answers the one
 # GraphQL query with "<branch> <head sha>" lines.
