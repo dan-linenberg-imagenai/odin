@@ -76,6 +76,8 @@ export interface AllItem {
 	dueDate: string | null;
 	/** The comment that put it here - Jira's @-mention rows. Null elsewhere. */
 	mention: { author: string | null; text: string; at?: string | null } | null;
+	/** What the row wants from you and how long it has waited - the band and the reason. */
+	ask: Ask;
 	/** The long form the card is cut from - a message, a description, a PR body. */
 	body: string | null;
 	/** Whatever else the source knows that the card has no room for -
@@ -87,6 +89,12 @@ export interface AllItem {
 
 /** Priority, in the three levels every source can be read as. */
 export type Urgency = "high" | "medium" | "low" | null;
+
+/** Why a row is on your list at all, and since when (ms; 0 when undated). */
+export interface Ask {
+	kind: "asked" | "mentioned" | "review" | "assigned" | "unread" | "own";
+	at: number;
+}
 
 /**
  * Each source names priority its own way - Jira says Highest, Notion says P1,
@@ -245,6 +253,7 @@ export function allItems(
 				createdAt: task.createdAt,
 				dueDate: null,
 				mention: null,
+				ask: { kind: "own", at: task.createdAt },
 				body: task.notes || null,
 				details: facts([
 					["Created", when(task.createdAt)],
@@ -280,6 +289,7 @@ export function allItems(
 					createdAt: row.firstSeenAt ?? ms(row.postedAt),
 					dueDate: null,
 					mention: null,
+					ask: { kind: "asked", at: row.firstSeenAt ?? ms(row.postedAt) },
 					body: row.text || null,
 					details: facts([
 						["Channel", row.channelName],
@@ -325,6 +335,12 @@ export function allItems(
 					createdAt: ms(issue.created) || ms(issue.updated),
 					dueDate: issue.dueDate ?? null,
 					mention: issue.mention ?? null,
+					ask: issue.mention
+						? {
+								kind: "mentioned",
+								at: ms(issue.mention.at) || ms(issue.updated),
+							}
+						: { kind: "assigned", at: ms(issue.updated) },
 					body: issue.description ?? null,
 					details: facts([
 						["Type", issue.issueType],
@@ -371,6 +387,15 @@ export function allItems(
 					createdAt: ms(pull.created) || ms(pull.updated),
 					dueDate: null,
 					mention: null,
+					ask: {
+						kind:
+							pull.kind === "review"
+								? "review"
+								: pull.kind === "mentioned"
+									? "mentioned"
+									: "own",
+						at: ms(pull.created) || ms(pull.updated),
+					},
 					body: pull.body ?? null,
 					details: facts([
 						["Repo", pull.repo],
@@ -415,6 +440,7 @@ export function allItems(
 				createdAt: ms(row.updatedAt ?? row.date),
 				dueDate: null,
 				mention: null,
+				ask: { kind: "assigned", at: ms(row.updatedAt ?? row.date) },
 				body: null,
 				// Every property the database has, as Notion names it.
 				details: facts([
@@ -454,6 +480,7 @@ export function allItems(
 					mention: email.snippet
 						? { author: email.from, text: email.snippet }
 						: null,
+					ask: { kind: "unread", at: ms(email.at) },
 					body: null,
 					details: facts([
 						["From", email.fromEmail ?? email.from],
@@ -484,6 +511,7 @@ export function allItems(
 				createdAt: ms(task.created ?? task.updated),
 				dueDate: task.dueDate,
 				mention: null,
+				ask: { kind: "assigned", at: ms(task.updated) },
 				body: task.description,
 				details: facts([
 					["Status", task.status],
@@ -515,4 +543,74 @@ export function matchesStatus(item: AllItem, filter: string): boolean {
 	return filter.startsWith("hide:")
 		? status !== filter.slice(5)
 		: status === filter.slice(5);
+}
+
+/** Where a row sits on the list, top to bottom. */
+export type Band = "now" | "today" | "later";
+
+const FRESH_ASK_MS = 4 * 3_600_000;
+
+/**
+ * A due date wins. A direct ask (a reaction, an @-mention) is Now for its
+ * first four hours and Today after; a review request is Today; a row its
+ * source rated high is Today; everything else is Later, Read later included.
+ * The rule is the order, not a score: a row can always say why it is where it is.
+ */
+export function bandOf(
+	item: Pick<AllItem, "ask" | "urgency">,
+	dueNow: boolean,
+	now: number,
+	reading = false,
+): Band {
+	if (reading) return "later";
+	if (dueNow) return "now";
+	const { kind, at } = item.ask;
+	if (kind === "asked" || kind === "mentioned")
+		return now - at < FRESH_ASK_MS ? "now" : "today";
+	if (kind === "review") return "today";
+	return item.urgency === "high" ? "today" : "later";
+}
+
+/** "2h", "3d" - how long a row has waited. */
+export function agoLabel(elapsed: number): string {
+	const minutes = Math.floor(elapsed / 60_000);
+	if (minutes < 1) return "now";
+	if (minutes < 60) return `${minutes}m`;
+	const hours = Math.round(minutes / 60);
+	if (hours < 24) return `${hours}h`;
+	return `${Math.round(hours / 24)}d`;
+}
+
+/**
+ * Why the row is here, in two words at most - "Ask 2h", "Review 1d". It
+ * stands in for a rule-made priority, so it has to be read at a glance.
+ */
+export function reasonOf(item: Pick<AllItem, "ask">, now: number): string {
+	const { kind, at } = item.ask;
+	const ago = at ? ` ${agoLabel(now - at)}` : "";
+	switch (kind) {
+		case "asked":
+			return `Ask${ago}`;
+		case "mentioned":
+			return `Mention${ago}`;
+		case "review":
+			return `Review${ago}`;
+		case "unread":
+			return `Unread${ago}`;
+		case "assigned":
+			return "Assigned";
+		default:
+			return "Yours";
+	}
+}
+
+/** A body as one line of plain text - no markdown marks, code or link syntax. */
+export function plainText(body: string): string {
+	return body
+		.replace(/```[\s\S]*?```/g, " ")
+		.replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+		.replace(/^\s*(#{1,6}|[-*+>]|\d+\.)\s+/gm, "")
+		.replace(/[*_~`]+/g, "")
+		.replace(/\s+/g, " ")
+		.trim();
 }

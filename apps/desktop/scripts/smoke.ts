@@ -422,6 +422,48 @@ await step("the My Tasks composer adds a task with its button", async () => {
 	await waitForText(typed);
 });
 
+/**
+ * Where TASK's columns sit, and the header's Task label: every tab draws
+ * rows with the one table, so the same task lines up the same way on All and
+ * on its own tab (task-table.test.ts checks the code; this checks the screen).
+ */
+const taskColumns = () =>
+	page<number[] | null>(`(() => {
+		const title = [...document.querySelectorAll("button")].find((e) => e.textContent.trim() === ${JSON.stringify(TASK)});
+		const row = title?.closest("[data-task-row]");
+		const header = [...document.querySelectorAll("span")].find((e) => e.textContent.trim() === "Task");
+		if (!row || !header) return null;
+		const x = (e) => Math.round(e?.getBoundingClientRect().left ?? -1);
+		return [
+			x(header),
+			x(title),
+			x(row.querySelector('button[aria-label^="Line it up"]')),
+			x(row.querySelector('button[aria-label="Start session"], button[aria-label="Go to session"]')),
+			x(row.querySelector('button[title="Mark done"]')),
+		];
+	})()`);
+
+await step(
+	"a task's columns line up the same on All and on its own tab",
+	async () => {
+		await rail("Tasks");
+		await waitForText(TASK);
+		const all = await taskColumns();
+		await page(`(() => {
+		const strip = __find("button", "Slack").parentElement;
+		__find("button", "Tasks", strip).click();
+	})()`);
+		await waitForText("my own list");
+		await waitForText(TASK);
+		const own = await taskColumns();
+		if (!all || !own) throw new Error("no table row or header for the task");
+		if (all[0] !== all[1] || own[0] !== own[1])
+			throw new Error(`the Task header isn't over the titles: ${all} / ${own}`);
+		if (JSON.stringify(all) !== JSON.stringify(own))
+			throw new Error(`columns moved between All ${all} and Tasks ${own}`);
+	},
+);
+
 await step("a new profile sees none of the first one's tasks", async () => {
 	await rail("Settings");
 	await waitForText("profiles");
@@ -455,11 +497,20 @@ await step("starting a task asks for optional context first", async () => {
 /** Click the button titled `title*` on TASK's row in Tasks. */
 const clickOnTaskRow = (title: string) =>
 	page<boolean>(`(() => {
-		const sel = 'button[title^=${JSON.stringify(title)}]';
+		const sel = 'button[title^=${JSON.stringify(title)}], button[aria-label^=${JSON.stringify(title)}]';
 		let row = [...document.querySelectorAll("button")].find((e) => e.textContent.trim() === ${JSON.stringify(TASK)});
 		while (row && !row.querySelector(sel)) row = row.parentElement;
 		row?.querySelector(sel).click();
 		return !!row;
+	})()`);
+
+/** Whether TASK's row has a button titled `title*`. */
+const clickOnTaskRowHas = (title: string) =>
+	page<boolean>(`(() => {
+		const sel = 'button[title^=${JSON.stringify(title)}], button[aria-label^=${JSON.stringify(title)}]';
+		let row = [...document.querySelectorAll("button")].find((e) => e.textContent.trim() === ${JSON.stringify(TASK)});
+		while (row && !row.querySelector(sel)) row = row.parentElement;
+		return !!row?.querySelector(sel) && !!row.querySelector('button[title="Mark done"]');
 	})()`);
 
 /**
@@ -472,7 +523,7 @@ const taskRowButtons = () =>
 		let row = [...document.querySelectorAll("button")].find((e) => e.textContent.trim() === ${JSON.stringify(TASK)});
 		while (row && !row.querySelector('button[title="Mark done"]')) row = row.parentElement;
 		const done = row?.querySelector('button[title="Mark done"]')?.getBoundingClientRect();
-		const start = [...(row?.querySelectorAll("button") ?? [])].find((e) => /^(Start session|Go to session)/.test(e.textContent.trim()))?.getBoundingClientRect();
+		const start = [...(row?.querySelectorAll("button") ?? [])].find((e) => /^(Start session|Go to session)/.test(e.getAttribute("aria-label") || e.textContent.trim()))?.getBoundingClientRect();
 		return done && start ? { start: Math.round(start.right), done: Math.round(done.left) } : null;
 	})()`);
 
@@ -487,7 +538,15 @@ await step("Read later marks a task and keeps it on the list", async () => {
 		);
 	if (!(await clickOnTaskRow("Mark it Read later")))
 		throw new Error("no Read later button on the task's row");
-	await waitForText("↺ Read later");
+	// The row's own button turns to "Back to Waiting on you": the Status
+	// column that would print "Read later" is hidden on a narrow window.
+	for (
+		const end = Date.now() + 5_000;
+		!(await clickOnTaskRowHas("Back to Waiting on you"));
+	) {
+		if (Date.now() > end) throw new Error("Read later never took");
+		await sleep(200);
+	}
 	await waitForText(TASK);
 	const after = await taskRowButtons();
 	if (JSON.stringify(after) !== JSON.stringify(before))
@@ -496,7 +555,13 @@ await step("Read later marks a task and keeps it on the list", async () => {
 		);
 	if (!(await clickOnTaskRow("Back to Waiting on you")))
 		throw new Error("no way back from Read later on the task's row");
-	await waitForText("↺ Read later", false);
+	for (
+		const end = Date.now() + 5_000;
+		await clickOnTaskRowHas("Back to Waiting on you");
+	) {
+		if (Date.now() > end) throw new Error("Read later never cleared");
+		await sleep(200);
+	}
 	await waitForText(TASK);
 });
 
@@ -508,7 +573,7 @@ await step(
 			throw new Error("no Up next button on the task's row");
 		await waitForText("drag to reorder");
 		await page(
-			`document.querySelector('button[title="Take it off Up next"]')?.click()`,
+			`document.querySelector('button[title="Take it off Up next"], button[aria-label="Take it off Up next"]')?.click()`,
 		);
 		await waitForText("drag to reorder", false);
 		await waitForText(TASK);
@@ -525,7 +590,7 @@ await step("Tonight on a task row picks it for the Night Agent", async () => {
 	// One grid column per row item: one short and Done wraps under the checkbox.
 	const doneWraps = await page<boolean>(`(() => {
 		const title = [...document.querySelectorAll("button")].find((e) => e.textContent.trim() === ${JSON.stringify(TASK)});
-		const done = title?.parentElement.querySelector('button[title="Mark done"]');
+		const done = title?.closest("[data-task-row]")?.querySelector('button[title="Mark done"]');
 		return !done || done.getBoundingClientRect().top > title.getBoundingClientRect().bottom;
 	})()`);
 	if (doneWraps) throw new Error("Done wrapped off the task's row");
