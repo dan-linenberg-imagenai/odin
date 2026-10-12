@@ -7,13 +7,16 @@ import {
 	buildRemoteHealthProbe,
 	buildRemoteStartCommand,
 	buildTestCommand,
+	checkHostKey,
 	collectBundleFiles,
 	FOLDER_OK_MARKER,
+	hostKeyFingerprint,
 	NODE_OK_MARKER,
 	parseTestOutput,
 	REMOTE_RUNTIME_DEPS,
 	STARTED_MARKER,
 	shellQuote,
+	startCommandStdin,
 } from "./ssh";
 import type { RemoteConnectionConfig } from "./types";
 
@@ -83,7 +86,6 @@ describe("buildTestCommand + parseTestOutput", () => {
 
 describe("buildRemoteStartCommand", () => {
 	const startParams = {
-		secret: "s3cr3t",
 		existing: null,
 		bundleHash: "abc123",
 		organizationId: "remote",
@@ -100,7 +102,7 @@ describe("buildRemoteStartCommand", () => {
 			"setsid nohup node '/srv/odin/backend/host-service.js'",
 		);
 		expect(command).toContain("ODIN_HOME_DIR='/srv/odin'");
-		expect(command).toContain("HOST_SERVICE_SECRET='s3cr3t'");
+		expect(command).toContain('HOST_SERVICE_SECRET="$ODIN_NEW_SECRET"');
 		expect(command).toContain("HOST_SERVICE_PORT='48000'");
 		expect(command).toContain("< /dev/null &");
 		expect(command).toContain(STARTED_MARKER);
@@ -136,20 +138,20 @@ describe("buildRemoteStartCommand", () => {
 	it("adopts a previous daemon only on the same bundle and its own secret", () => {
 		const command = buildRemoteStartCommand(config, {
 			...startParams,
-			existing: { secret: "old-secret", pid: 4242 },
+			existing: { pid: 4242 },
 		});
-		expect(
-			command.startsWith("if [ \"$(cat '/srv/odin/backend/.running-bundle'"),
-		).toBe(true);
+		expect(command).toContain(
+			"; if [ \"$(cat '/srv/odin/backend/.running-bundle'",
+		);
 		expect(command).toContain("= 'abc123' ] &&");
-		expect(command).toContain("ODIN_HEALTH_SECRET='old-secret'");
+		expect(command).toContain('ODIN_HEALTH_SECRET="$ODIN_OLD_SECRET"');
 		expect(command).toContain(ALREADY_RUNNING_MARKER);
 	});
 
 	it("stops the previous daemon, by verified pid, before starting anew", () => {
 		const command = buildRemoteStartCommand(config, {
 			...startParams,
-			existing: { secret: "old-secret", pid: 4242 },
+			existing: { pid: 4242 },
 		});
 		const elseBranch = command.slice(command.indexOf("; else "));
 		expect(elseBranch).toContain("/proc/4242/cmdline");
@@ -159,7 +161,40 @@ describe("buildRemoteStartCommand", () => {
 		expect(elseBranch.indexOf("kill 4242")).toBeLessThan(
 			elseBranch.indexOf("setsid"),
 		);
-		expect(elseBranch).toContain("HOST_SERVICE_SECRET='s3cr3t'");
+		expect(elseBranch).toContain('HOST_SERVICE_SECRET="$ODIN_NEW_SECRET"');
+	});
+
+	it("reads both secrets from stdin before it uses them", () => {
+		for (const existing of [null, { pid: 4242 }]) {
+			const command = buildRemoteStartCommand(config, {
+				...startParams,
+				existing,
+			});
+			expect(
+				command.startsWith(
+					"IFS= read -r ODIN_NEW_SECRET; IFS= read -r ODIN_OLD_SECRET; ",
+				),
+			).toBe(true);
+		}
+		expect(startCommandStdin("new", "old")).toBe("new\nold\n");
+		expect(startCommandStdin("new", null)).toBe("new\n\n");
+	});
+});
+
+describe("host key pinning", () => {
+	it("trusts a new host, accepts its key again, refuses a changed one", () => {
+		const known = { "srv:22": "SHA256:aaa" };
+		expect(checkHostKey(known, "other:22", "SHA256:zzz")).toBe("new");
+		expect(checkHostKey(known, "srv:22", "SHA256:aaa")).toBe("match");
+		expect(checkHostKey(known, "srv:22", "SHA256:bbb")).toEqual({
+			expected: "SHA256:aaa",
+		});
+	});
+
+	it("fingerprints like OpenSSH: SHA256, base64, no padding", () => {
+		const fingerprint = hostKeyFingerprint(Buffer.from("key"));
+		expect(fingerprint.startsWith("SHA256:")).toBe(true);
+		expect(fingerprint.endsWith("=")).toBe(false);
 	});
 });
 
@@ -227,14 +262,14 @@ describe("REMOTE_RUNTIME_DEPS", () => {
 
 describe("buildRemoteHealthProbe", () => {
 	it("passes the secret via env, never on the argv", () => {
-		const probe = buildRemoteHealthProbe(48000, "s3cr3t");
-		expect(probe).toContain("ODIN_HEALTH_SECRET='s3cr3t'");
+		const probe = buildRemoteHealthProbe(48000);
+		expect(probe).toContain('ODIN_HEALTH_SECRET="$ODIN_OLD_SECRET"');
 		expect(probe).toContain("process.env.ODIN_HEALTH_SECRET");
 		expect(probe).toContain("statusCode===200");
 	});
 
 	it("probes an authenticated route, not the public health check", () => {
-		const probe = buildRemoteHealthProbe(48000, "s3cr3t");
+		const probe = buildRemoteHealthProbe(48000);
 		expect(probe).toContain("/trpc/settings.branchPrefix.get");
 		expect(probe).not.toContain("health.check");
 	});

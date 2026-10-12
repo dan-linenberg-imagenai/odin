@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import path from "node:path";
 import type { RemoteConnectionConfig, TestConnectionResult } from "./types";
 
@@ -160,9 +161,8 @@ export function buildProvisionCommand(
 export function buildRemoteStartCommand(
 	config: RemoteConnectionConfig,
 	params: {
-		secret: string;
-		/** Secret and pid from the remote manifest of a previous daemon. */
-		existing: { secret: string; pid: number } | null;
+		/** Pid from the remote manifest of a previous daemon. */
+		existing: { pid: number } | null;
 		/** Content hash of the shipped bundle; a change forces a restart. */
 		bundleHash: string;
 		organizationId: string;
@@ -178,7 +178,7 @@ export function buildRemoteStartCommand(
 	const env = [
 		`ODIN_HOME_DIR=${shellQuote(folder)}`,
 		`ORGANIZATION_ID=${shellQuote(params.organizationId)}`,
-		`HOST_SERVICE_SECRET=${shellQuote(params.secret)}`,
+		`HOST_SERVICE_SECRET="$ODIN_NEW_SECRET"`,
 		`HOST_SERVICE_PORT=${shellQuote(String(config.remoteHostServicePort))}`,
 		`HOST_DB_PATH=${shellQuote(`${manifestDir}/host.db`)}`,
 		`HOST_MIGRATIONS_FOLDER=${shellQuote(params.migrationsDir)}`,
@@ -197,13 +197,10 @@ export function buildRemoteStartCommand(
 		`&& { ${env} setsid nohup node ${shellQuote(params.bundlePath)} >> ${log} 2>&1 < /dev/null & }`,
 		`&& echo ${STARTED_MARKER}`,
 	].join(" ");
-	if (!params.existing) return start;
+	if (!params.existing) return `${READ_SECRETS}${start}`;
 
 	const { pid } = params.existing;
-	const healthProbe = buildRemoteHealthProbe(
-		config.remoteHostServicePort,
-		params.existing.secret,
-	);
+	const healthProbe = buildRemoteHealthProbe(config.remoteHostServicePort);
 	// Only signal the pid if it is still our node process (pids get reused),
 	// then wait out its graceful shutdown so the port is free.
 	const stopOld = [
@@ -212,7 +209,24 @@ export function buildRemoteStartCommand(
 		`for i in $(seq 1 40); do kill -0 ${pid} 2>/dev/null || break; sleep 0.25; done;`,
 		`kill -9 ${pid} 2>/dev/null; fi`,
 	].join(" ");
-	return `if [ "$(cat ${stamp} 2>/dev/null)" = ${hash} ] && ${healthProbe}; then echo ${ALREADY_RUNNING_MARKER}; else ${stopOld}; ${start}; fi`;
+	return `${READ_SECRETS}if [ "$(cat ${stamp} 2>/dev/null)" = ${hash} ] && ${healthProbe}; then echo ${ALREADY_RUNNING_MARKER}; else ${stopOld}; ${start}; fi`;
+}
+
+/**
+ * The secrets reach the remote on the command's stdin, never in the command
+ * text: the shell that runs it shows its whole command line to every user on
+ * the server, while a process's environment is readable only by its owner.
+ * Line 1 is the new daemon's secret, line 2 the previous daemon's.
+ */
+const READ_SECRETS =
+	"IFS= read -r ODIN_NEW_SECRET; IFS= read -r ODIN_OLD_SECRET; ";
+
+/** stdin for {@link buildRemoteStartCommand}: the secrets, one per line. */
+export function startCommandStdin(
+	secret: string,
+	existingSecret: string | null,
+): string {
+	return `${secret}\n${existingSecret ?? ""}\n`;
 }
 
 /**
@@ -224,16 +238,38 @@ export const REMOTE_AUTH_PROBE_PATH = "/trpc/settings.branchPrefix.get";
 
 /**
  * A `node -e` one-liner that exits 0 only when the local host-service answers
- * an authenticated query with 200 for this secret. Used remotely (over the
+ * an authenticated query with 200 for the previous daemon's secret. Used remotely (over the
  * configured port) to decide whether the running daemon can be adopted. Node
  * is a hard prerequisite anyway.
  */
-export function buildRemoteHealthProbe(port: number, secret: string): string {
+export function buildRemoteHealthProbe(port: number): string {
 	const script = [
 		"const http=require('http');",
 		`const r=http.get({host:'127.0.0.1',port:${port},path:'${REMOTE_AUTH_PROBE_PATH}',headers:{Authorization:'Bearer '+process.env.ODIN_HEALTH_SECRET},timeout:2000},`,
 		"res=>process.exit(res.statusCode===200?0:1));",
 		"r.on('error',()=>process.exit(1));r.on('timeout',()=>{r.destroy();process.exit(1)});",
 	].join("");
-	return `ODIN_HEALTH_SECRET=${shellQuote(secret)} node -e ${shellQuote(script)}`;
+	// $ODIN_OLD_SECRET was read from stdin by the start command.
+	return `ODIN_HEALTH_SECRET="$ODIN_OLD_SECRET" node -e ${shellQuote(script)}`;
+}
+
+/** OpenSSH-style fingerprint of a raw host key: `SHA256:<base64, no padding>`. */
+export function hostKeyFingerprint(key: Buffer): string {
+	return `SHA256:${createHash("sha256").update(key).digest("base64").replace(/=+$/, "")}`;
+}
+
+/**
+ * Trust on first use, like OpenSSH's known_hosts: the first key a host shows
+ * is kept, and a different key later is refused - otherwise anyone between
+ * the laptop and the server could pose as it and receive the password, the
+ * backend and its secret.
+ */
+export function checkHostKey(
+	known: Record<string, string>,
+	hostId: string,
+	fingerprint: string,
+): "match" | "new" | { expected: string } {
+	const expected = known[hostId];
+	if (!expected) return "new";
+	return expected === fingerprint ? "match" : { expected };
 }

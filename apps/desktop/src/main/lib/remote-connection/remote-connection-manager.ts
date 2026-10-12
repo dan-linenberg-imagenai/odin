@@ -7,7 +7,8 @@ import path from "node:path";
 import { app } from "electron";
 import log from "electron-log/main";
 import { env as sharedEnv } from "shared/env.shared";
-import { Client, type ConnectConfig, type SFTPWrapper } from "ssh2";
+import { Client, type ConnectConfig, type SFTPWrapper, utils } from "ssh2";
+import { ODIN_HOME_DIR } from "../app-environment";
 import {
 	findFreePort,
 	HEALTH_POLL_TIMEOUT_MS,
@@ -19,11 +20,14 @@ import {
 	buildProvisionCommand,
 	buildRemoteStartCommand,
 	buildTestCommand,
+	checkHostKey,
 	collectBundleFiles,
+	hostKeyFingerprint,
 	parseTestOutput,
 	REMOTE_AUTH_PROBE_PATH,
 	REMOTE_RUNTIME_DEPS,
 	shellQuote,
+	startCommandStdin,
 } from "./ssh";
 import type {
 	ActiveRemote,
@@ -53,6 +57,17 @@ const REMOTE_BUNDLE_ENTRIES = [
 	"host-worker.js",
 	"pty-daemon.js",
 ];
+/** Host keys seen on first connect, by "host:port" - see {@link checkHostKey}. */
+const KNOWN_HOSTS_PATH = path.join(ODIN_HOME_DIR, "remote-known-hosts.json");
+
+function readKnownHosts(): Record<string, string> {
+	try {
+		return JSON.parse(fs.readFileSync(KNOWN_HOSTS_PATH, "utf8"));
+	} catch {
+		return {};
+	}
+}
+
 /** Log lines quoted back when the remote backend fails to come up. */
 const REMOTE_LOG_TAIL_LINES = 30;
 
@@ -245,6 +260,8 @@ export class RemoteConnectionManager {
 		return new Promise((resolve, reject) => {
 			const client = new Client();
 			let settled = false;
+			// ssh2 only says "verification failed"; this says which key and why.
+			let hostKeyProblem: string | null = null;
 			client.on("ready", () => {
 				settled = true;
 				resolve(client);
@@ -252,8 +269,27 @@ export class RemoteConnectionManager {
 			client.on("error", (error) => {
 				if (settled) return;
 				settled = true;
-				reject(error);
+				reject(hostKeyProblem ? new Error(hostKeyProblem) : error);
 			});
+			const hostId = `${config.host}:${config.sshPort}`;
+			const hostVerifier = (key: Buffer): boolean => {
+				const fingerprint = hostKeyFingerprint(key);
+				const known = readKnownHosts();
+				const verdict = checkHostKey(known, hostId, fingerprint);
+				if (verdict === "match") return true;
+				if (verdict === "new") {
+					fs.mkdirSync(path.dirname(KNOWN_HOSTS_PATH), { recursive: true });
+					fs.writeFileSync(
+						KNOWN_HOSTS_PATH,
+						JSON.stringify({ ...known, [hostId]: fingerprint }, null, 2),
+						{ mode: 0o600 },
+					);
+					log.info(`[remote-connection] trusting ${hostId} at ${fingerprint}`);
+					return true;
+				}
+				hostKeyProblem = `${hostId} showed a different host key (${fingerprint}, expected ${verdict.expected}). Someone may be posing as the server. If the server was rebuilt, remove its line from ${KNOWN_HOSTS_PATH} and connect again.`;
+				return false;
+			};
 			let connectConfig: ConnectConfig;
 			try {
 				connectConfig = {
@@ -261,6 +297,7 @@ export class RemoteConnectionManager {
 					port: config.sshPort,
 					username: config.username,
 					readyTimeout: SSH_READY_TIMEOUT_MS,
+					hostVerifier,
 					...this.buildAuth(config),
 				};
 			} catch (error) {
@@ -278,20 +315,28 @@ export class RemoteConnectionManager {
 			}
 			return { password: config.password };
 		}
-		const keyPath = config.sshKeyPath
-			? expandHome(config.sshKeyPath)
-			: defaultPrivateKeyPath();
-		if (keyPath) {
-			if (!fs.existsSync(keyPath)) {
-				throw new Error(`SSH key not found at ${keyPath}`);
-			}
-			return { privateKey: fs.readFileSync(keyPath) };
+		const explicit = config.sshKeyPath ? expandHome(config.sshKeyPath) : null;
+		if (explicit && !fs.existsSync(explicit)) {
+			throw new Error(`SSH key not found at ${explicit}`);
 		}
+		const keyPath = explicit ?? defaultPrivateKeyPath();
+		const key = keyPath ? fs.readFileSync(keyPath) : null;
+		// A key with a passphrase can't be read without it; the agent holds it
+		// unlocked. Offer both, so either one gets in.
+		const readable =
+			key && !(utils.parseKey(key) instanceof Error) ? key : null;
 		const agent = sshAgentPath();
-		if (agent) return { agent };
-		throw new Error(
-			"No SSH key found and no agent is running. Set a key path, or switch to password authentication.",
-		);
+		if (!readable && !agent) {
+			throw new Error(
+				key
+					? `${keyPath} is protected by a passphrase. Add it to your SSH agent (ssh-add ${keyPath}) and connect again.`
+					: "No SSH key found and no agent is running. Set a key path, or switch to password authentication.",
+			);
+		}
+		return {
+			...(readable ? { privateKey: readable } : {}),
+			...(agent ? { agent } : {}),
+		};
 	}
 
 	/**
@@ -435,8 +480,7 @@ export class RemoteConnectionManager {
 		const existing = await this.readRemoteManifest(client, config);
 		const secret = randomBytes(32).toString("hex");
 		const command = buildRemoteStartCommand(config, {
-			secret,
-			existing,
+			existing: existing && { pid: existing.pid },
 			bundleHash,
 			organizationId: REMOTE_ORGANIZATION_ID,
 			bundlePath,
@@ -449,6 +493,7 @@ export class RemoteConnectionManager {
 			client,
 			command,
 			"start the remote host-service",
+			startCommandStdin(secret, existing?.secret ?? null),
 		);
 		if (existing && result.stdout.includes(ALREADY_RUNNING_MARKER)) {
 			log.info("[remote-connection] adopted the running remote host-service");
@@ -567,13 +612,18 @@ export class RemoteConnectionManager {
 
 	// ── ssh2 primitives ───────────────────────────────────────────────
 
-	private exec(client: Client, command: string): Promise<CommandResult> {
+	private exec(
+		client: Client,
+		command: string,
+		stdin?: string,
+	): Promise<CommandResult> {
 		return new Promise((resolve, reject) => {
 			client.exec(command, (error, stream) => {
 				if (error) {
 					reject(error);
 					return;
 				}
+				if (stdin !== undefined) stream.end(stdin);
 				let stdout = "";
 				let stderr = "";
 				stream
@@ -594,8 +644,9 @@ export class RemoteConnectionManager {
 		client: Client,
 		command: string,
 		description: string,
+		stdin?: string,
 	): Promise<CommandResult> {
-		const result = await this.exec(client, command);
+		const result = await this.exec(client, command, stdin);
 		if (result.code !== 0) {
 			const detail = (result.stderr || result.stdout).trim();
 			throw new Error(`Failed to ${description}${detail ? `: ${detail}` : ""}`);
