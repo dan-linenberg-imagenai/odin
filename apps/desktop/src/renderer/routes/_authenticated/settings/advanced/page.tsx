@@ -1,4 +1,6 @@
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@odin/ui/tabs";
 import { createFileRoute } from "@tanstack/react-router";
+import type { ReactNode } from "react";
 import { SettingsPage } from "../components/SettingsPage";
 import { CleanupSection } from "./components/CleanupSection";
 import { RemoteServerSection } from "./components/RemoteServerSection";
@@ -9,11 +11,16 @@ export const Route = createFileRoute("/_authenticated/settings/advanced/")({
 });
 
 /**
- * Advanced holds what most people never change, one component per section so
- * the page can keep growing. The jump bar names each section by its title -
- * the `data-setting` its SettingsSection renders.
+ * Advanced holds what most people never change: one tab per area, one
+ * component per tab, so the page can keep growing. Every tab stays mounted
+ * (only hidden), so settings search still finds a row on a tab that isn't
+ * open - and opens that tab first (SettingsSidebar's revealSetting).
  */
-const SECTIONS = ["Sessions", "Cleanup", "Remote server"] as const;
+const TABS: { id: string; label: string; content: ReactNode }[] = [
+	{ id: "sessions", label: "Sessions", content: <SessionsSection /> },
+	{ id: "cleanup", label: "Cleanup", content: <CleanupSection /> },
+	{ id: "remote", label: "Remote server", content: <RemoteServerSection /> },
+];
 
 function AdvancedSettingsPage() {
 	return (
@@ -21,28 +28,25 @@ function AdvancedSettingsPage() {
 			title="Advanced"
 			description="Settings most people never need to change."
 		>
-			<nav
-				aria-label="Advanced sections"
-				className="-mt-2 flex flex-wrap gap-1.5"
-			>
-				{SECTIONS.map((title) => (
-					<button
-						key={title}
-						type="button"
-						onClick={() =>
-							document
-								.querySelector(`[data-setting="${title}"]`)
-								?.scrollIntoView({ behavior: "smooth", block: "start" })
-						}
-						className="rounded-full border border-border px-3 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+			<Tabs defaultValue={TABS[0].id} className="gap-6">
+				<TabsList>
+					{TABS.map((tab) => (
+						<TabsTrigger key={tab.id} value={tab.id} className="px-3">
+							{tab.label}
+						</TabsTrigger>
+					))}
+				</TabsList>
+				{TABS.map((tab) => (
+					<TabsContent
+						key={tab.id}
+						value={tab.id}
+						forceMount
+						className="flex flex-col gap-8 data-[state=inactive]:hidden"
 					>
-						{title}
-					</button>
+						{tab.content}
+					</TabsContent>
 				))}
-			</nav>
-			<SessionsSection />
-			<CleanupSection />
-			<RemoteServerSection />
+			</Tabs>
 		</SettingsPage>
 	);
 }

@@ -14,6 +14,7 @@ import {
 	hostKeyFingerprint,
 	PLATFORM_MARKER,
 	parseTestOutput,
+	REMOTE_ARM64_DEPS,
 	REMOTE_NODE_VERSION,
 	REMOTE_RUNTIME_DEPS,
 	STARTED_MARKER,
@@ -249,13 +250,13 @@ describe("buildProvisionCommand", () => {
 			"/srv/odin",
 		);
 		expect(command).toContain(
-			"if [ \"$(cat '/srv/odin/backend/.provisioned' 2>/dev/null)\" != 'a@1 @b/c@2' ]",
+			"if [ \"$(cat '/srv/odin/backend/.provisioned' 2>/dev/null)\" != 'a@1 @b/c@2 @anush008/tokenizers-linux-arm64-gnu@0.6.0' ]",
 		);
 		expect(command).toContain(
 			"npm install --no-audit --no-fund --loglevel=error 'a@1' '@b/c@2'",
 		);
 		expect(command).toContain(
-			"printf '%s' 'a@1 @b/c@2' > '/srv/odin/backend/.provisioned'",
+			"printf '%s' 'a@1 @b/c@2 @anush008/tokenizers-linux-arm64-gnu@0.6.0' > '/srv/odin/backend/.provisioned'",
 		);
 	});
 });
@@ -264,9 +265,10 @@ describe("REMOTE_RUNTIME_DEPS", () => {
 	it("pins each package to the version the app itself bundles against", () => {
 		const declared: Record<string, string> = {
 			...hostServicePackage.dependencies,
+			...hostServicePackage.optionalDependencies,
 			...desktopPackage.dependencies,
 		};
-		for (const spec of REMOTE_RUNTIME_DEPS) {
+		for (const spec of [...REMOTE_RUNTIME_DEPS, ...REMOTE_ARM64_DEPS]) {
 			const at = spec.lastIndexOf("@");
 			const name = spec.slice(0, at);
 			expect(`${name}@${declared[name]}`).toBe(spec);
@@ -299,6 +301,18 @@ describe("Odin's own Node on the server", () => {
 		expect(command).toContain("curl -fsSL");
 		expect(command).toContain("wget -qO-");
 		expect(command).toContain("Linux servers only");
+	});
+
+	it("adds the tokenizers arm64 binding only on an arm64 server", () => {
+		const command = buildProvisionCommand(
+			"/srv/odin/backend",
+			["a@1"],
+			"/srv/odin",
+		);
+		expect(command).toContain(
+			"aarch64|arm64) arm64='@anush008/tokenizers-linux-arm64-gnu@0.6.0';;",
+		);
+		expect(command).toContain("'a@1' $arm64");
 	});
 
 	it("runs npm and the backend on that Node, not the server's", () => {

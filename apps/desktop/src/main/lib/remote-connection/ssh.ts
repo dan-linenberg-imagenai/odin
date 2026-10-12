@@ -137,6 +137,14 @@ export const REMOTE_RUNTIME_DEPS = [
 	"@agentclientprotocol/claude-agent-acp@0.56.0",
 ];
 
+/**
+ * Installed only on an arm64 server: fastembed (under mastracode) pins
+ * @anush008/tokenizers 0.0.0, which has no Linux arm64 binding, so mastracode
+ * failed to load there. host-service declares the 0.6.0 binding as optional
+ * for the same reason. npm refuses it on any other CPU.
+ */
+export const REMOTE_ARM64_DEPS = ["@anush008/tokenizers-linux-arm64-gnu@0.6.0"];
+
 export const ALREADY_RUNNING_MARKER = "ODIN_ALREADY_RUNNING";
 export const STARTED_MARKER = "ODIN_STARTED";
 
@@ -181,7 +189,7 @@ export function buildProvisionCommand(
 	folder: string,
 ): string {
 	const marker = shellQuote(`${backendDir}/.provisioned`);
-	const spec = deps.join(" ");
+	const spec = [...deps, ...REMOTE_ARM64_DEPS].join(" ");
 	// npm_config_libc=glibc: without it prebuild-install reports an empty libc
 	// and misses the prebuilt binary, falling back to a source compile that
 	// needs a full C/C++ toolchain.
@@ -190,7 +198,8 @@ export function buildProvisionCommand(
 		`if [ "$(cat ${marker} 2>/dev/null)" != ${shellQuote(spec)} ]; then`,
 		`cd ${shellQuote(backendDir)}`,
 		`&& printf '%s' '{"name":"odin-remote-backend","private":true}' > package.json`,
-		`&& npm_config_libc=glibc npm install --no-audit --no-fund --loglevel=error ${deps.map(shellQuote).join(" ")}`,
+		`&& case "$(uname -m)" in aarch64|arm64) arm64=${shellQuote(REMOTE_ARM64_DEPS.join(" "))};; *) arm64="";; esac`,
+		`&& npm_config_libc=glibc npm install --no-audit --no-fund --loglevel=error ${deps.map(shellQuote).join(" ")} $arm64`,
 		`&& printf '%s' ${shellQuote(spec)} > ${marker}; fi`,
 	].join(" ");
 }
