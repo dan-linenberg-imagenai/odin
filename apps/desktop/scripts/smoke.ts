@@ -446,7 +446,14 @@ await step(
 		// The top-bar indicator always renders; its dropdown says where the backend
 		// runs. No remote is configured in the throwaway home, so it reads "Local".
 		await rail("Dev Board");
-		await click("button", "Backend running locally");
+		// A Radix menu trigger opens on pointerdown; a bare click() never fires it.
+		const opened = await page<boolean>(`(() => {
+			const e = __find("button", "Backend running locally");
+			e?.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0, pointerType: "mouse" }));
+			return !!e;
+		})()`);
+		if (!opened)
+			throw new Error('no button labelled "Backend running locally"');
 		await waitForText("Run the backend on");
 		await page(
 			`(document.activeElement ?? document.body).dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))`,
@@ -647,7 +654,7 @@ await step("Done takes a task off the list", async () => {
 	await waitForText(TASK, false);
 });
 
-// Settings is eight fixed screens; each sidebar link and the route it opens.
+// Settings is nine fixed screens; each sidebar link and the route it opens.
 const SETTINGS: [string, string][] = [
 	["Connections", "#/settings/connections"],
 	["Sessions", "#/settings/sessions"],
@@ -657,8 +664,9 @@ const SETTINGS: [string, string][] = [
 	["Appearance", "#/settings/appearance"],
 	["Keyboard", "#/settings/keyboard"],
 	["Advanced", "#/settings/advanced"],
+	["Remote server", "#/settings/remote-server"],
 ];
-await step("Settings: exactly its eight screens, and each opens", async () => {
+await step("Settings: exactly its nine screens, and each opens", async () => {
 	await rail("Settings");
 	await waitForText("profiles");
 	const links = await page<string[]>(
