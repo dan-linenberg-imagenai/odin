@@ -9,6 +9,7 @@ import {
 	rankSessions,
 	type SessionHit,
 	TRANSCRIPT_TIER,
+	TYPO_TIER,
 } from "./search-all";
 
 const row = (
@@ -59,8 +60,44 @@ test("every word has to turn up somewhere, title or extra fields", () => {
 	expect(matchRank("slack", "can you look", ["Slack"])).toBe(3);
 });
 
-test("transcript hits rank below every field match", () => {
-	expect(TRANSCRIPT_TIER).toBeGreaterThan(3);
+test("a typo still finds the row, below every exact match", () => {
+	const rows = [
+		row("Run the migration"),
+		row("Fix the deploy"),
+		row("Migration notes", { person: "Ada" }),
+	];
+	expect(rankRows("migraton", rows)).toEqual([
+		{ item: rows[0], tier: TYPO_TIER },
+		{ item: rows[2], tier: TYPO_TIER },
+	]);
+	expect(titles(rankRows("deplyo fix", rows))).toEqual(["Fix the deploy"]);
+	expect(titles(rankRows("notes ada migraton", rows))).toEqual([
+		"Migration notes",
+	]);
+	expect(TYPO_TIER).toBeGreaterThan(3);
+});
+
+test("a typo while still typing finds the longer word", () => {
+	expect(titles(rankRows("migrta", [row("Run the migration")]))).toEqual([
+		"Run the migration",
+	]);
+});
+
+test("longer words take more typos, words under four letters none", () => {
+	const rows = [row("Push notifications"), row("Fix the login")];
+	expect(titles(rankRows("notfications", rows))).toEqual([
+		"Push notifications",
+	]);
+	expect(titles(rankRows("notfictions", rows))).toEqual(["Push notifications"]);
+	expect(rankRows("fox", rows)).toEqual([]);
+	expect(titles(rankRows("yoam", [row("Hey", { person: "Yotam" })]))).toEqual([
+		"Hey",
+	]);
+	expect(rankRows("lagan", rows)).toEqual([]);
+});
+
+test("transcript hits rank below every field match, typos included", () => {
+	expect(TRANSCRIPT_TIER).toBeGreaterThan(TYPO_TIER);
 });
 
 test("best tier first, then open before done, then the order given", () => {

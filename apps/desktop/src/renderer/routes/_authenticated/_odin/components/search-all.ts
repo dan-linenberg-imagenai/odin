@@ -1,3 +1,4 @@
+import Fuse from "fuse.js";
 import { profileOf } from "shared/odin-profile";
 import type { Pane, PaneStatus } from "shared/tabs-types";
 import { repoLabel } from "../sessions/row-labels";
@@ -70,8 +71,9 @@ export function boardSessions(
  * How well `needle` (lowercased) names a result - lower is better, null is no
  * match. 0: the title starts with it. 1: a word in the title does. 2: it's
  * somewhere in the title. 3: every typed word turns up in the title or the
- * extra fields (who, where, source, status). Transcript hits, which only the
- * server can score, sit below all of these at TRANSCRIPT_TIER.
+ * extra fields (who, where, source, status). Rows that only match through a
+ * typo sit below these at TYPO_TIER, and transcript hits, which only the
+ * server can score, below all of them at TRANSCRIPT_TIER.
  */
 export function matchRank(
 	needle: string,
@@ -88,7 +90,13 @@ export function matchRank(
 	return needle.split(" ").every((word) => haystack.includes(word)) ? 3 : null;
 }
 
-export const TRANSCRIPT_TIER = 4;
+export const TYPO_TIER = 4;
+export const TRANSCRIPT_TIER = 5;
+
+/** Fuse's score is typos per letter typed: 1 in 4, 2 in 6, 3 in 9. */
+const TYPO_THRESHOLD = 0.34;
+/** Below this a word must be exact: one edit turns "fix" into "six". */
+const MIN_TYPO_WORD = 4;
 
 /** A status that means the work is over - in any source's words. */
 export function isClosedStatus(status: string | null | undefined): boolean {
@@ -116,19 +124,46 @@ export interface Ranked<T> {
 export const normalizeQuery = (query: string) =>
 	query.trim().toLowerCase().replace(/\s+/g, " ");
 
+type Fields<T> = (
+	item: T,
+) => [title: string, extra: (string | null | undefined)[]];
+
 /** Items that match, best tier first; nothing typed matches everything at tier 0. */
-function rankBy<T>(
-	query: string,
-	items: T[],
-	fields: (item: T) => [title: string, extra: (string | null | undefined)[]],
-): Ranked<T>[] {
+function rankBy<T>(query: string, items: T[], fields: Fields<T>): Ranked<T>[] {
 	const needle = normalizeQuery(query);
-	return items
-		.flatMap((item) => {
-			const tier = needle ? matchRank(needle, ...fields(item)) : 0;
-			return tier === null ? [] : [{ item, tier }];
-		})
-		.sort((a, b) => a.tier - b.tier);
+	const exact: Ranked<T>[] = [];
+	const missed: T[] = [];
+	for (const item of items) {
+		const tier = needle ? matchRank(needle, ...fields(item)) : 0;
+		if (tier === null) missed.push(item);
+		else exact.push({ item, tier });
+	}
+	const typos = typoMatches(needle, missed, fields).map((item) => ({
+		item,
+		tier: TYPO_TIER,
+	}));
+	return [...exact, ...typos].sort((a, b) => a.tier - b.tier);
+}
+
+/** Items where every typed word turns up, give or take a typo. */
+function typoMatches<T>(needle: string, items: T[], fields: Fields<T>): T[] {
+	if (!needle || items.length === 0) return [];
+	const texts = items.map((item) => {
+		const [title, extra] = fields(item);
+		return [title, ...extra].join(" ").toLowerCase();
+	});
+	const fuse = new Fuse(texts, {
+		threshold: TYPO_THRESHOLD,
+		ignoreLocation: true,
+	});
+	const matchesPerWord = needle
+		.split(" ")
+		.map((word) =>
+			word.length < MIN_TYPO_WORD
+				? new Set(texts.flatMap((text, i) => (text.includes(word) ? [i] : [])))
+				: new Set(fuse.search(word).map((result) => result.refIndex)),
+		);
+	return items.filter((_, i) => matchesPerWord.every((hits) => hits.has(i)));
 }
 
 /**
