@@ -11,6 +11,16 @@ export interface BriefLink {
 export interface BriefTodo {
 	text: string;
 	done?: boolean;
+	/** The agent's action item it was copied from - still "added" once edited. */
+	from?: string;
+}
+
+/** An action item as plain text: My notes shows no markdown. */
+export function plainText(markdown: string): string {
+	return markdown
+		.replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+		.replace(/(\*\*|__|`)(.+?)\1/g, "$2")
+		.trim();
 }
 
 export const linkUrl = (link: BriefLink | string) =>
@@ -66,6 +76,8 @@ export const usePaneMeta = create<{
 	setBrief: (paneId: string, brief: string) => void;
 	setNotes: (paneId: string, notes: string) => void;
 	addTodo: (paneId: string, text: string) => void;
+	/** Appends the agent's action items, skipping ones already on the list. */
+	addTodos: (paneId: string, texts: string[]) => void;
 	/** Done flips its tick; otherwise the to-do is removed. */
 	updateTodo: (paneId: string, index: number, done?: boolean) => void;
 	/** Empty text keeps the to-do as it was. */
@@ -122,6 +134,18 @@ export const usePaneMeta = create<{
 						{ text: text.trim() },
 					];
 					return { todosByPane: { ...s.todosByPane, [paneId]: todos } };
+				}),
+			addTodos: (paneId, texts) =>
+				set((s) => {
+					const todos = s.todosByPane[paneId] ?? [];
+					const have = new Set(todos.map((t) => t.from ?? t.text));
+					const added = [...new Set(texts.map((t) => t.trim()))]
+						.filter((from) => from && !have.has(from))
+						.map((from) => ({ text: plainText(from), from }));
+					if (!added.length) return {};
+					return {
+						todosByPane: { ...s.todosByPane, [paneId]: [...todos, ...added] },
+					};
 				}),
 			updateTodo: (paneId, index, done) =>
 				set((s) => {
