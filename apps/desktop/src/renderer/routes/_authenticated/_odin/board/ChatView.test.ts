@@ -7,6 +7,7 @@ import {
 	isAnswerItem,
 	isApprovalItem,
 	isDoneItem,
+	isEchoed,
 	isYouOnly,
 	itemOptions,
 	itemReply,
@@ -509,5 +510,20 @@ describe("applyQueue", () => {
 			[{ attachment: { type: "queued_command", prompt: "later" } } as never],
 		);
 		expect(queue).toEqual([]);
+	});
+});
+
+describe("ChatView sent bubble", () => {
+	const old = { kind: "user", id: "a", text: "earlier message" };
+	test("a photo sent alone stays until a new row echoes it", () => {
+		const sent = { text: "", seen: new Set(["a"]) };
+		expect(isEchoed([old], sent)).toBe(false);
+		expect(isEchoed([old, { kind: "user", id: "b", text: "" }], sent)).toBe(
+			true,
+		);
+	});
+	test("an older row with the same words is not the echo", () => {
+		const sent = { text: "ok", seen: new Set(["a"]) };
+		expect(isEchoed([{ ...old, text: "ok then" }], sent)).toBe(false);
 	});
 });
