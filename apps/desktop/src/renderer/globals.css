@@ -62,19 +62,10 @@
 	--fill-selected: color-mix(in oklab, var(--foreground) 10%, transparent);
 
 	/* Two text steps between foreground and muted-foreground: soft (body
-	   copy) and faint (tags, separators, placeholders). Mixed from the live
-	   theme rather than fixed, so Monokai and imported themes get steps in
-	   their own family instead of Graphite's greys. */
-	--soft-foreground: color-mix(
-		in oklab,
-		var(--foreground) 82%,
-		var(--background)
-	);
-	--faint-foreground: color-mix(
-		in oklab,
-		var(--foreground) 50%,
-		var(--background)
-	);
+	   copy) and faint (tags, separators, placeholders). Graphite's own
+	   foreground mixed into its background, at 82% and 50%. */
+	--soft-foreground: #c0bfbb;
+	--faint-foreground: #767572;
 
 	/* Odin's semantic palette - the only colour in the UI. Not theme-store
 	   variables: a theme recolours surfaces, but a state reads the same
@@ -149,16 +140,8 @@
 	--highlight-foreground: #f6f5f1;
 	--fill-hover: color-mix(in oklab, var(--foreground) 5%, transparent);
 	--fill-selected: color-mix(in oklab, var(--foreground) 8%, transparent);
-	--soft-foreground: color-mix(
-		in oklab,
-		var(--foreground) 84%,
-		var(--background)
-	);
-	--faint-foreground: color-mix(
-		in oklab,
-		var(--foreground) 55%,
-		var(--background)
-	);
+	--soft-foreground: #383836;
+	--faint-foreground: #747471;
 	--working: #2261c4;
 	--attention: #975e08;
 	--success: #1d7d4d;

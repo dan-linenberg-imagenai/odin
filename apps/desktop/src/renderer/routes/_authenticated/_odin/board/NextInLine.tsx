@@ -7,11 +7,11 @@ import { cn } from "@odin/ui/utils";
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import {
+	LuArrowDownUp,
 	LuExternalLink,
 	LuLoaderCircle,
 	LuMoon,
 	LuSettings2,
-	LuArrowDownUp,
 } from "react-icons/lu";
 import { electronTrpc } from "renderer/lib/electron-trpc";
 import { emojify } from "renderer/lib/emoji";
