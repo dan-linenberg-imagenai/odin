@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	actionItemList,
 	applyLines,
+	applyQueue,
 	elapsedLabel,
 	isAnswerItem,
 	isApprovalItem,
@@ -18,6 +19,7 @@ import {
 	toolDescription,
 	transcriptPath,
 	userText,
+	yourQueued,
 } from "./ChatView";
 
 describe("ChatView transcript", () => {
@@ -442,5 +444,33 @@ describe("splitEarlier", () => {
 		const first = splitEarlier(file.subarray(0, 3), middle.head, true);
 		expect(first.lines).toEqual(['{"a":1}']);
 		expect(first.head.length).toBe(0);
+	});
+});
+
+describe("applyQueue", () => {
+	const op = (operation: string, content?: string) =>
+		({ type: "queue-operation", operation, content }) as never;
+	test("holds what Claude queued until it takes or drops it", () => {
+		let queue = applyQueue(
+			[],
+			[op("enqueue", "first"), op("enqueue", "second")],
+		);
+		expect(queue).toEqual(["first", "second"]);
+		queue = applyQueue(queue, [op("dequeue")]);
+		expect(queue).toEqual(["second"]);
+		queue = applyQueue(queue, [op("remove", "second")]);
+		expect(queue).toEqual([]);
+		// A task notice holds its place in the queue but is not shown as yours.
+		const withNotice = applyQueue(
+			[],
+			[
+				op("enqueue", "<task-notification>x</task-notification>"),
+				op("enqueue", "mine"),
+			],
+		);
+		expect(yourQueued(withNotice)).toEqual(["mine"]);
+		expect(applyQueue(withNotice, [op("dequeue")])).toEqual(["mine"]);
+		// Esc pulls everything back into the input.
+		expect(applyQueue(withNotice, [op("popAll", "mine")])).toEqual([]);
 	});
 });
