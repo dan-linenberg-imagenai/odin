@@ -4705,6 +4705,7 @@ function DevBoardPage() {
 										drawerCard.pane.type === "terminal" ? (
 										<DiffView
 											key={drawerCard.pane.id}
+											paneId={drawerCard.pane.id}
 											cwd={sessionCwd(drawerCard.pane) ?? null}
 											claudeSessionId={drawerCard.pane.claudeSessionId ?? null}
 											workspaceId={drawerCard.workspaceId}

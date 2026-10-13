@@ -1,9 +1,18 @@
-import { PatchDiff } from "@pierre/diffs/react";
+import { type DiffLineAnnotation, PatchDiff } from "@pierre/diffs/react";
 import { keepPreviousData } from "@tanstack/react-query";
 import { useState } from "react";
 import { electronTrpc } from "renderer/lib/electron-trpc";
 import { DIFF_POOL_RENDER_OPTIONS } from "renderer/screens/main/components/WorkspaceView/utils/code-theme/diff-render-options";
 import { pullRequests } from "./brief";
+import { typeIntoClaude } from "./ChatView";
+import {
+	commentTarget,
+	type ReviewComment,
+	reviewMessage,
+} from "./diff-review";
+
+/** A comment being written: placed on the lines, no text or id yet. */
+type Draft = Omit<ReviewComment, "id" | "text">;
 
 /**
  * "What did this session actually change?" - the diff for the checkout a card
@@ -13,12 +22,20 @@ import { pullRequests } from "./brief";
  * The header picks which diff: the working tree or any PR the session opened -
  * a session that shipped five PRs is five diffs, and the working tree is
  * usually none of them.
+ *
+ * It is also a review: drag the gutter's + over lines to comment on them, then
+ * send every comment on the diff to the session as one message - the agent gets
+ * the file, the lines and the code without a word typed, and the PR on GitHub
+ * gets no review comments.
  */
 export function DiffView({
+	paneId,
 	cwd,
 	claudeSessionId,
 	workspaceId,
 }: {
+	/** The session's terminal - where the review is typed in. */
+	paneId: string;
 	/** Null until the session's terminal has mounted - the main process then
 	 * falls back to the workspace's own checkout. */
 	cwd: string | null;
@@ -64,8 +81,29 @@ export function DiffView({
 		{ enabled: prs.length > 0, retry: false, staleTime: 60_000 },
 	);
 
+	/** The checkout as it was when the last review went out, as a git tree.
+	 * Working tree only: a PR's later commits are on GitHub, not here. */
+	const sinceKey = `odin:diff-review-since:${paneId}`;
+	const [since, setSince] = useState<string | null>(() => {
+		try {
+			return localStorage.getItem(sinceKey);
+		} catch {
+			return null;
+		}
+	});
+	/** Only what the agent changed after the review, not the whole change. */
+	const [showSince, setShowSince] = useState(false);
+	const sinceReview = !pr && showSince ? since : null;
+
 	const { data, error, isFetching, refetch } = electronTrpc.repos.diff.useQuery(
-		{ cwd, claudeSessionId, workspaceId, pr, wholeFile: !pr && wholeFile },
+		{
+			cwd,
+			claudeSessionId,
+			workspaceId,
+			pr,
+			wholeFile: !pr && wholeFile,
+			since: sinceReview,
+		},
 		{
 			refetchOnWindowFocus: false,
 			retry: false,
@@ -74,8 +112,87 @@ export function DiffView({
 		},
 	);
 
+	/** Review comments, sent or not. Kept per session on the machine, so a
+	 * closed drawer or an app restart does not lose them. */
+	const storageKey = `odin:diff-review:${paneId}`;
+	const [comments, setComments] = useState<ReviewComment[]>(() => {
+		try {
+			return JSON.parse(localStorage.getItem(storageKey) ?? "[]");
+		} catch {
+			return [];
+		}
+	});
+	const saveComments = (next: ReviewComment[]) => {
+		setComments(next);
+		try {
+			if (next.length) localStorage.setItem(storageKey, JSON.stringify(next));
+			else localStorage.removeItem(storageKey);
+		} catch {}
+	};
+	const [draft, setDraft] = useState<Draft | null>(null);
+	const [sendError, setSendError] = useState<string | null>(null);
+	const write = electronTrpc.terminal.write.useMutation();
+	const snapshot = electronTrpc.repos.reviewSnapshot.useMutation();
+
 	const files = data?.files ?? [];
 	const current = files[Math.min(selected, files.length - 1)];
+
+	const review = comments.filter((comment) => comment.pr === pr);
+	const unsent = review.filter((comment) => !comment.sent);
+	const annotations: DiffLineAnnotation<{ id: string | null }>[] = current
+		? [
+				...review
+					.filter((comment) => comment.path === current.path)
+					.map((comment) => ({
+						side: comment.side,
+						lineNumber: comment.lineNumber,
+						metadata: { id: comment.id },
+					})),
+				...(draft?.pr === pr && draft.path === current.path
+					? [
+							{
+								side: draft.side,
+								lineNumber: draft.lineNumber,
+								metadata: { id: null },
+							},
+						]
+					: []),
+			]
+		: [];
+
+	const sendReview = async () => {
+		setSendError(null);
+		try {
+			// Before the message, so the snapshot is the code the review is about.
+			if (!pr) {
+				const { tree } = await snapshot.mutateAsync({
+					cwd,
+					claudeSessionId,
+					workspaceId,
+				});
+				setSince(tree);
+				try {
+					localStorage.setItem(sinceKey, tree);
+				} catch {}
+			}
+			await typeIntoClaude(
+				write.mutateAsync,
+				paneId,
+				reviewMessage(unsent, pr),
+			);
+			saveComments(
+				comments.map((comment) =>
+					comment.pr === pr ? { ...comment, sent: true } : comment,
+				),
+			);
+		} catch (sendFailure) {
+			setSendError(
+				sendFailure instanceof Error
+					? sendFailure.message
+					: String(sendFailure),
+			);
+		}
+	};
 
 	const total = files.reduce(
 		(sum, file) => ({
@@ -128,6 +245,23 @@ export function DiffView({
 							: `${data.cwd.split("/").pop()} · ${data.source}`
 						: "…"}
 				</span>
+				{!pr && since && (
+					<button
+						type="button"
+						onClick={() => {
+							setShowSince(!showSince);
+							setSelected(0);
+						}}
+						title={
+							showSince
+								? "Showing only what changed after the last review - click to show all the changes"
+								: "Showing all the changes - click to show only what changed after the last review"
+						}
+						className={`ml-auto normal-case tracking-normal hover:underline ${showSince ? "text-primary" : "text-muted-foreground"}`}
+					>
+						{showSince ? "◷ since review" : "± all changes"}
+					</button>
+				)}
 				{!pr && (
 					<button
 						type="button"
@@ -137,7 +271,7 @@ export function DiffView({
 								? "Showing the whole file - click to show only the changes"
 								: "Showing only the changes - click to scroll the whole file"
 						}
-						className={`ml-auto normal-case tracking-normal hover:underline ${wholeFile ? "text-primary" : "text-muted-foreground"}`}
+						className={`${since ? "" : "ml-auto "}normal-case tracking-normal hover:underline ${wholeFile ? "text-primary" : "text-muted-foreground"}`}
 					>
 						{wholeFile ? "≡ whole file" : "± changes only"}
 					</button>
@@ -161,10 +295,36 @@ export function DiffView({
 				>
 					{isFetching ? "reading…" : "↻ refresh"}
 				</button>
+				{review.length > 0 && (
+					<>
+						{unsent.length > 0 && (
+							<button
+								type="button"
+								onClick={() => void sendReview()}
+								disabled={write.isPending || snapshot.isPending}
+								title="Type every new comment on this diff into the session as one message"
+								className="rounded bg-primary px-1.5 py-0.5 normal-case tracking-normal text-primary-foreground hover:opacity-90 disabled:opacity-50"
+							>
+								➤ send {unsent.length}{" "}
+								{unsent.length === 1 ? "comment" : "comments"} to agent
+							</button>
+						)}
+						<button
+							type="button"
+							onClick={() =>
+								saveComments(comments.filter((comment) => comment.pr !== pr))
+							}
+							title="Drop every comment on this diff, sent or not"
+							className="normal-case tracking-normal text-muted-foreground hover:underline"
+						>
+							× clear
+						</button>
+					</>
+				)}
 			</div>
-			{error && (
+			{(error || sendError) && (
 				<div className="select-text cursor-text border-b border-border px-4 py-2 text-[12px] text-danger">
-					{error.message}
+					{error?.message ?? sendError}
 				</div>
 			)}
 			<div className="flex min-h-0 flex-1">
@@ -180,6 +340,9 @@ export function DiffView({
 							{files.map((file, index) => {
 								const slash = file.path.lastIndexOf("/");
 								const binary = file.binary;
+								const commented = review.filter(
+									(comment) => comment.path === file.path,
+								).length;
 								return (
 									<button
 										key={file.path}
@@ -220,6 +383,14 @@ export function DiffView({
 											{file.removed > 0 && (
 												<span className="text-danger">−{file.removed}</span>
 											)}
+											{commented > 0 && (
+												<span
+													title={`${commented} review ${commented === 1 ? "comment" : "comments"} not sent yet`}
+													className="ml-1 text-primary"
+												>
+													✎{commented}
+												</span>
+											)}
 										</span>
 									</button>
 								);
@@ -246,6 +417,43 @@ export function DiffView({
 								// Unclipped, this panel's own box - one screen tall - scrolls.
 								unsafeCSS:
 									"[data-code] { overflow-x: visible; contain: none; }",
+								// GitHub's +: click it for one line, drag it for several.
+								enableGutterUtility: true,
+								onGutterUtilityClick: (range) =>
+									setDraft({
+										pr,
+										path: current.path,
+										...commentTarget(current.patch, current.path, range),
+									}),
+							}}
+							lineAnnotations={annotations}
+							renderAnnotation={(annotation) => {
+								const id = annotation.metadata?.id;
+								if (!id)
+									return (
+										<DraftBox
+											onCancel={() => setDraft(null)}
+											onSave={(text) => {
+												if (draft)
+													saveComments([
+														...comments,
+														{ ...draft, id: crypto.randomUUID(), text },
+													]);
+												setDraft(null);
+											}}
+										/>
+									);
+								const comment = comments.find((each) => each.id === id);
+								return (
+									comment && (
+										<CommentCard
+											comment={comment}
+											onDelete={() =>
+												saveComments(comments.filter((each) => each.id !== id))
+											}
+										/>
+									)
+								);
 							}}
 						/>
 					) : (
@@ -253,12 +461,102 @@ export function DiffView({
 							<div className="px-4 py-3 text-[12px] text-muted-foreground">
 								{pr
 									? "This PR has no changes."
-									: "Nothing from this session - no changes of its own here, and the last commit is not its."}
+									: sinceReview
+										? "No changes since the last review was sent."
+										: "Nothing from this session - no changes of its own here, and the last commit is not its."}
 							</div>
 						)
 					)}
 				</div>
 			</div>
+		</div>
+	);
+}
+
+/** The box under the picked lines. ⌘↵ saves, Esc drops it. Its own state, so
+ * a keystroke re-renders the box, not the diff. */
+function DraftBox({
+	onSave,
+	onCancel,
+}: {
+	onSave: (text: string) => void;
+	onCancel: () => void;
+}) {
+	const [text, setText] = useState("");
+	const save = () => text.trim() && onSave(text.trim());
+	return (
+		<div className="m-2 rounded-md border border-border bg-card p-2 font-sans">
+			<textarea
+				// biome-ignore lint/a11y/noAutofocus: the box opens because you asked to type in it
+				autoFocus
+				value={text}
+				onChange={(event) => setText(event.target.value)}
+				onKeyDown={(event) => {
+					if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+						event.preventDefault();
+						save();
+					} else if (event.key === "Escape") {
+						event.preventDefault();
+						onCancel();
+					}
+				}}
+				placeholder="What should the agent change here?"
+				rows={3}
+				className="w-full resize-y rounded border border-border bg-background px-2 py-1 text-[12.5px] text-soft-foreground outline-none focus:border-input"
+			/>
+			<div className="mt-1 flex justify-end gap-2 text-[11.5px]">
+				<button
+					type="button"
+					onClick={onCancel}
+					className="text-muted-foreground hover:underline"
+				>
+					Cancel
+				</button>
+				<button
+					type="button"
+					onClick={save}
+					disabled={!text.trim()}
+					className="rounded bg-primary px-2 py-0.5 text-primary-foreground disabled:opacity-50"
+				>
+					Add comment ⌘↵
+				</button>
+			</div>
+		</div>
+	);
+}
+
+function CommentCard({
+	comment,
+	onDelete,
+}: {
+	comment: ReviewComment;
+	onDelete: () => void;
+}) {
+	return (
+		<div
+			className={`m-2 flex items-start gap-2 rounded-md border border-border bg-card px-3 py-2 font-sans text-[12.5px] ${comment.sent ? "opacity-60" : ""}`}
+		>
+			<div className="min-w-0 flex-1">
+				<div className="text-[10.5px] text-faint-foreground">
+					{comment.location}
+					{comment.sent && (
+						<span className="ml-2 rounded-[4px] border border-border px-1 text-muted-foreground">
+							✓ sent
+						</span>
+					)}
+				</div>
+				<div className="select-text cursor-text whitespace-pre-wrap text-soft-foreground">
+					{comment.text}
+				</div>
+			</div>
+			<button
+				type="button"
+				onClick={onDelete}
+				title="Delete this comment"
+				className="shrink-0 text-muted-foreground hover:text-danger"
+			>
+				×
+			</button>
 		</div>
 	);
 }

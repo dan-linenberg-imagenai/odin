@@ -1887,7 +1887,7 @@ export function ChatView({
  * (Ctrl+X Ctrl+S) instead: mid-turn it lands right away, not after the turn.
  * Ctrl+Enter itself can't cross a PTY - it arrives as a plain Enter.
  */
-async function typeIntoClaude(
+export async function typeIntoClaude(
 	write: (input: { paneId: string; data: string }) => Promise<unknown>,
 	paneId: string,
 	text: string,

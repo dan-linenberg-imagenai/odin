@@ -8,7 +8,9 @@ import {
 	detectReposFolder,
 	renderDiff,
 	renderPullRequestDiff,
+	renderSinceDiff,
 	scanRepos,
+	snapshotTree,
 	splitPatch,
 } from "./repos";
 
@@ -207,4 +209,37 @@ test("detectReposFolder picks the home folder holding the most repos", () => {
 	expect(
 		detectReposFolder(["/Users/x/dotfiles", "/opt/repo"], home),
 	).toBeNull();
+});
+
+test("renderSinceDiff shows only what changed after the snapshot, and the snapshot touches nothing", async () => {
+	const repo = mkdtempSync(join(tmpdir(), "odin-since-"));
+	const git = (...args: string[]) =>
+		execFileSync("git", args, { cwd: repo, encoding: "utf8" });
+	git("init", "-q");
+	git("config", "user.email", "test@example.com");
+	git("config", "user.name", "test");
+	writeFileSync(join(repo, "a.txt"), "one\n");
+	git("add", "a.txt");
+	git("commit", "-qm", "add a");
+	writeFileSync(join(repo, "a.txt"), "one\ntwo\n");
+	writeFileSync(join(repo, "new.txt"), "fresh\n");
+
+	const status = git("status", "--porcelain");
+	const since = await snapshotTree(repo);
+	expect(git("status", "--porcelain")).toBe(status);
+
+	expect((await renderSinceDiff(repo, since)).files).toEqual([]);
+
+	writeFileSync(join(repo, "a.txt"), "one\nTWO\n");
+	const fixed = await renderSinceDiff(repo, since);
+	expect(fixed.source).toBe("since review");
+	expect(fixed.files.map((file) => file.path)).toEqual(["a.txt"]);
+	expect(fixed.files[0].patch).toContain("-two");
+	expect(fixed.files[0].patch).toContain("+TWO");
+	expect(fixed.files[0].patch).not.toContain("+one");
+
+	writeFileSync(join(repo, "b.txt"), "other session\n");
+	const owned = await renderSinceDiff(repo, since, "edited a.txt");
+	expect(owned.files.map((file) => file.path)).toEqual(["a.txt"]);
+	expect(owned.note).toContain("1 file(s) changed by other sessions");
 });
