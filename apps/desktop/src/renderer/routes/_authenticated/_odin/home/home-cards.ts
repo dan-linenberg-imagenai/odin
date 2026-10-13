@@ -7,8 +7,10 @@ export interface HomeCard {
 
 /**
  * The sessions Home shows: the board's Needs you and Working cards, in the
- * order given. `columnOf` is the board's own (useBoardColumns), and `alive`
- * its agent set, which also keeps the board's completed panes off.
+ * order given, with a live Claude to show. `columnOf` is the board's own
+ * (useBoardColumns), and `alive` its agent set. A session the board closed
+ * for sitting idle keeps its Needs you column there, but has nothing live to
+ * show here, so it stays on the board.
  */
 export function homeCards(
 	panes: Pane[],
@@ -17,7 +19,7 @@ export function homeCards(
 ): HomeCard[] {
 	const picked: HomeCard[] = [];
 	for (const pane of panes) {
-		if (pane.completed && !alive.has(pane.id)) continue;
+		if (!alive.has(pane.id)) continue;
 		const column = columnOf(pane);
 		if (column === "permission" || column === "working")
 			picked.push({ pane, column });

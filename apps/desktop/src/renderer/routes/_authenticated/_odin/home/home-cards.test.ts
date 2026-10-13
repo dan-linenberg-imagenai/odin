@@ -39,6 +39,15 @@ describe("homeCards", () => {
 		expect(cards).toEqual([]);
 	});
 
+	it("leaves out a closed session the board keeps in Needs you", () => {
+		const cards = homeCards(
+			[pane("closed", { status: "idle", odinClosedIn: "permission" })],
+			() => "permission",
+			new Set(),
+		);
+		expect(cards).toEqual([]);
+	});
+
 	it("leaves out a completed session the board keeps off", () => {
 		const cards = homeCards(
 			[pane("gone", { status: "permission", completed: true })],
