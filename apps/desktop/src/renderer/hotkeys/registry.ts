@@ -50,7 +50,7 @@ export const HOTKEYS_REGISTRY = {
 		key: { mac: L("l"), windows: L("l"), linux: L("l") },
 		label: "Sessions",
 		category: "Navigation",
-		description: "Open the live terminals of every session working or waiting",
+		description: "Open every working or waiting session as a live card",
 	},
 	ODIN_BOARD: {
 		key: { mac: L("d"), windows: L("d"), linux: L("d") },
