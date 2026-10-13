@@ -1,9 +1,36 @@
+import type { Pane, PaneStatus } from "renderer/stores/tabs/types";
+
+export interface HomeCard {
+	pane: Pane;
+	column: "permission" | "working";
+}
+
 /**
- * Where the cards sit: the saved order for the ones still in the grid, then
- * any new arrival at the end, in the order they're listed. One that left drops
+ * The sessions Home shows: the board's Needs you and Working cards, in the
+ * order given. `columnOf` is the board's own (useBoardColumns), and `alive`
+ * its agent set, which also keeps the board's completed panes off.
+ */
+export function homeCards(
+	panes: Pane[],
+	columnOf: (pane: Pane) => PaneStatus,
+	alive: Set<string>,
+): HomeCard[] {
+	const picked: HomeCard[] = [];
+	for (const pane of panes) {
+		if (pane.completed && !alive.has(pane.id)) continue;
+		const column = columnOf(pane);
+		if (column === "permission" || column === "working")
+			picked.push({ pane, column });
+	}
+	return picked;
+}
+
+/**
+ * Where the cards sit: the saved order for the ones still on Home, then any
+ * new arrival at the end, in the order they're listed. One that left drops
  * out, so coming back puts it at the end too. A status change moves nothing.
  */
-export function gridOrder(saved: string[], present: string[]): string[] {
+export function homeOrder(saved: string[], present: string[]): string[] {
 	const here = new Set(present);
 	const kept = saved.filter((id) => here.has(id));
 	const known = new Set(kept);
@@ -32,7 +59,7 @@ export const GRID_COLUMNS = 6;
  * its place in the order. Up to 3 share one row, 4 make 2x2, 5 are 3 over 2,
  * and 6 or more are 3 a row - past six the rows keep that height and scroll.
  */
-export function gridLayout(count: number): { rows: number; spans: number[] } {
+export function homeGrid(count: number): { rows: number; spans: number[] } {
 	const rows = count <= 3 ? 1 : 2;
 	const spans = Array.from({ length: count }, (_, index) => {
 		if (count <= 3) return GRID_COLUMNS / count;

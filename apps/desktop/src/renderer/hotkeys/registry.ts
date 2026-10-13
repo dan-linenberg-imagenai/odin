@@ -46,6 +46,12 @@ export const HOTKEYS_REGISTRY = {
 	// Odin's own shortcuts - a bare key per tab in the shell's rail, plus quick
 	// capture. These are the only ones the settings page lists (see
 	// settings/keyboard/page.tsx).
+	ODIN_HOME: {
+		key: { mac: L("l"), windows: L("l"), linux: L("l") },
+		label: "Sessions",
+		category: "Navigation",
+		description: "Open every working or waiting session as a live card",
+	},
 	ODIN_BOARD: {
 		key: { mac: L("d"), windows: L("d"), linux: L("d") },
 		label: "Dev Board",
@@ -332,14 +338,6 @@ export const HOTKEYS_REGISTRY = {
 		label: "Previous Session",
 		category: "Navigation",
 		description: "Open the session above in the drawer's session list",
-	},
-	// A bare key, like the rail's: off in text boxes and terminals.
-	ODIN_BOARD_GRID: {
-		key: { mac: L("l"), windows: L("l"), linux: L("l") },
-		label: "Sessions Grid",
-		category: "Navigation",
-		description:
-			"Switch the Dev Board between its columns and a grid of every working or waiting session",
 	},
 	// A bare key, like the rail's: off in text boxes and terminals.
 	ODIN_OPEN_SESSIONS: {

@@ -7,6 +7,7 @@ import type { HotkeyId } from "./registry";
  */
 export const LISTED_HOTKEYS: HotkeyId[] = [
 	// Screens
+	"ODIN_HOME",
 	"ODIN_BOARD",
 	"ODIN_ALL",
 	"ODIN_TASKS",
@@ -31,7 +32,6 @@ export const LISTED_HOTKEYS: HotkeyId[] = [
 	// Board
 	"ODIN_BOARD_UNDO",
 	"ODIN_OPEN_SESSIONS",
-	"ODIN_BOARD_GRID",
 	"PREV_SESSION",
 	"NEXT_SESSION",
 	// Terminal
