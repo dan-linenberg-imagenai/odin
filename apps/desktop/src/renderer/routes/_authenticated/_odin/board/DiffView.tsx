@@ -1,6 +1,7 @@
 import { type DiffLineAnnotation, PatchDiff } from "@pierre/diffs/react";
 import { keepPreviousData } from "@tanstack/react-query";
 import { useState } from "react";
+import { isHotkey, useHotkeyDisplay } from "renderer/hotkeys";
 import { electronTrpc } from "renderer/lib/electron-trpc";
 import { DIFF_POOL_RENDER_OPTIONS } from "renderer/screens/main/components/WorkspaceView/utils/code-theme/diff-render-options";
 import { pullRequests } from "./brief";
@@ -473,7 +474,7 @@ export function DiffView({
 	);
 }
 
-/** The box under the picked lines. ⌘↵ saves, Esc drops it. Its own state, so
+/** The box under the picked lines. The Send hotkey saves, Esc drops it. Its own state, so
  * a keystroke re-renders the box, not the diff. */
 function DraftBox({
 	onSave,
@@ -483,6 +484,7 @@ function DraftBox({
 	onCancel: () => void;
 }) {
 	const [text, setText] = useState("");
+	const sendKeys = useHotkeyDisplay("SUBMIT").text;
 	const save = () => text.trim() && onSave(text.trim());
 	return (
 		<div className="m-2 rounded-md border border-border bg-card p-2 font-sans">
@@ -492,7 +494,7 @@ function DraftBox({
 				value={text}
 				onChange={(event) => setText(event.target.value)}
 				onKeyDown={(event) => {
-					if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+					if (isHotkey("SUBMIT", event.nativeEvent)) {
 						event.preventDefault();
 						save();
 					} else if (event.key === "Escape") {
@@ -518,7 +520,7 @@ function DraftBox({
 					disabled={!text.trim()}
 					className="rounded bg-primary px-2 py-0.5 text-primary-foreground disabled:opacity-50"
 				>
-					Add comment ⌘↵
+					Add comment {sendKeys}
 				</button>
 			</div>
 		</div>
