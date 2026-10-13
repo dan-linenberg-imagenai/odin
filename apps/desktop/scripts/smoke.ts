@@ -337,7 +337,6 @@ await step("boots straight onto the Dev Board, no sign-in", async () => {
 
 // Each rail entry and a line only its screen prints.
 const SCREENS: [string, string][] = [
-	["Sessions", "nothing is running"],
 	["Tasks", "waiting on you"],
 	["Review", "sweep now"],
 	["Automations", "add automation"],
@@ -351,6 +350,13 @@ for (const [label, line] of SCREENS) {
 		await waitForText(line);
 	});
 }
+
+await step("Dev Board: Grid view toggles", async () => {
+	await click("button", "Grid");
+	await waitForText("nothing is running");
+	await click("button", "Grid");
+	await waitForText("next in line");
+});
 
 await step("Tasks: every feed tab opens", async () => {
 	await rail("Tasks");

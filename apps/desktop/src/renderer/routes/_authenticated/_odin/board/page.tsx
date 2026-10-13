@@ -36,6 +36,7 @@ import {
 	LuGitMerge,
 	LuGitPullRequest,
 	LuHourglass,
+	LuLayoutGrid,
 	LuMessageSquare,
 	LuMoon,
 	LuPanelLeft,
@@ -58,6 +59,7 @@ import { canClaimKeyboard } from "renderer/lib/keyboard";
 import { coldRestoreState } from "renderer/screens/main/components/WorkspaceView/ContentView/TabsContent/Terminal/state";
 import { Terminal } from "renderer/screens/main/components/WorkspaceView/ContentView/TabsContent/Terminal/Terminal";
 import * as terminalCache from "renderer/screens/main/components/WorkspaceView/ContentView/TabsContent/Terminal/v1-terminal-cache";
+import { useBoardGrid } from "renderer/stores/board-grid";
 import { claudeCli } from "renderer/stores/claude-command";
 import { useIdleClose } from "renderer/stores/idle-close";
 import { useSessionView } from "renderer/stores/session-view";
@@ -134,6 +136,7 @@ import {
 	remindSession,
 	SessionReminders,
 } from "./SessionReminders";
+import { SessionsGrid } from "./SessionsGrid";
 import { visibleScreen } from "./visible-screen";
 
 /**
@@ -3054,6 +3057,18 @@ function DevBoardPage() {
 		},
 		{ enableOnFormTags: false, enableOnContentEditable: false },
 	);
+	const isGridOn = useBoardGrid((s) => s.isOn);
+	const setGridOn = useBoardGrid((s) => s.setOn);
+	const { text: gridKey } = useHotkey(
+		"ODIN_BOARD_GRID",
+		() => {
+			if (!drawerCard) setGridOn(!isGridOn);
+		},
+		{ enableOnFormTags: false, enableOnContentEditable: false },
+	);
+	const gridCards = (["permission", "working"] as const).flatMap(
+		(status) => cardsByStatus.get(status) ?? [],
+	);
 	const { text: prevSessionKey } = useHotkey("PREV_SESSION", () =>
 		stepSession(-1),
 	);
@@ -3202,30 +3217,51 @@ function DevBoardPage() {
 					<LuPanelLeft className="size-3.5" aria-hidden />
 					Open sessions
 				</button>
-				{/* A view toggle, not a filter - kept apart from search and the dropdown. */}
+				{/* View toggles, not filters - kept apart from search and the dropdown. */}
 				<button
 					type="button"
-					onClick={toggleNext}
-					aria-pressed={isNextOpen}
+					onClick={() => setGridOn(!isGridOn)}
+					aria-pressed={isGridOn}
 					title={
-						isNextOpen
-							? "Hide the Next in line column"
-							: "Show the tasks worth starting next"
+						isGridOn
+							? `Back to the columns (${gridKey})`
+							: `Every working or waiting session side by side, live (${gridKey})`
 					}
 					className={cn(
 						"flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[12px] font-medium",
-						isNextOpen
+						isGridOn
 							? "border-primary bg-primary/15 text-foreground"
 							: "border-border bg-card text-muted-foreground hover:text-foreground",
 					)}
 				>
-					{isNextOpen ? (
-						<LuEye className="size-3.5" aria-hidden />
-					) : (
-						<LuEyeOff className="size-3.5" aria-hidden />
-					)}
-					Next in line
+					<LuLayoutGrid className="size-3.5" aria-hidden />
+					Grid
 				</button>
+				{!isGridOn && (
+					<button
+						type="button"
+						onClick={toggleNext}
+						aria-pressed={isNextOpen}
+						title={
+							isNextOpen
+								? "Hide the Next in line column"
+								: "Show the tasks worth starting next"
+						}
+						className={cn(
+							"flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[12px] font-medium",
+							isNextOpen
+								? "border-primary bg-primary/15 text-foreground"
+								: "border-border bg-card text-muted-foreground hover:text-foreground",
+						)}
+					>
+						{isNextOpen ? (
+							<LuEye className="size-3.5" aria-hidden />
+						) : (
+							<LuEyeOff className="size-3.5" aria-hidden />
+						)}
+						Next in line
+					</button>
+				)}
 			</div>
 
 			<SessionReminders />
@@ -3256,504 +3292,531 @@ function DevBoardPage() {
 				/>
 			)}
 
-			<div className="flex min-h-0 flex-1 gap-3 overflow-x-auto px-[18px] pb-[18px] pt-1">
-				{COLUMNS.map((column) => {
-					const cards = cardsByStatus.get(column.status) ?? [];
-					// ponytail: re-sorted on the board's next render, not on the
-					// minute the 10m runs out - the pane polls re-render it often.
-					const sections = bySection(
-						cards,
-						(card) =>
-							(column.status === "review" || column.status === "permission") &&
-							justDoneLeft(
-								statusSinceRef.current.get(card.pane.id)?.at,
-								focusedAt,
-							) > 0,
-					);
-					// One section is just the column - don't label it, unless it says
-					// something on its own (Starred, Parked: "you put these down").
-					const labelled =
-						sections.length > 1 ||
-						sections[0]?.[0] === "starred" ||
-						sections[0]?.[0] === "recent" ||
-						sections[0]?.[0] === "parked" ||
-						sections[0]?.[0] === "queued";
-					const isDropTarget = column.status === "idle";
-					// Needs you and Done are the two columns you clear: walk either one
-					// card at a time - once there are more than five, fewer you just scan.
-					const canCatchUp =
-						(column.status === "permission" || column.status === "review") &&
-						cards.length > 5;
-					return (
-						// biome-ignore lint/a11y/noStaticElementInteractions: drop zone - drag is the mouse-only shortcut for parking a card in Idle
-						<div
-							key={column.status}
-							onDragOver={
-								isDropTarget
-									? (event) => {
-											event.preventDefault();
-											setDragOverIdle(true);
-										}
-									: undefined
-							}
-							onDragLeave={
-								isDropTarget ? () => setDragOverIdle(false) : undefined
-							}
-							onDrop={
-								isDropTarget
-									? (event) => {
-											event.preventDefault();
-											setDragOverIdle(false);
-											const paneId = event.dataTransfer.getData("text/plain");
-											const card = [...cardsByStatus.values()]
-												.flat()
-												.find((item) => item.pane.id === paneId);
-											if (card) void parkCard(card);
-										}
-									: undefined
-							}
-							className={cn(
-								// The column wears its status: a hairline of the hue along the
-								// top and a wash that fades out under the header. The cards
-								// stay neutral - the colour says where they are, not what.
-								BOARD_COLUMN_MIN_W,
-								"relative flex flex-1 flex-col overflow-hidden rounded-xl border bg-tertiary/85 bg-[linear-gradient(to_bottom,color-mix(in_oklab,var(--col)_9%,transparent),transparent_160px)]",
-								isDropTarget && dragOverIdle
-									? "border-primary bg-primary/15"
-									: "border-border",
-							)}
-							style={
-								{ "--col": PANE_STATUS[column.status].dot } as CSSProperties
-							}
-						>
-							<span
-								aria-hidden
-								className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-(--col) via-(--col)/40 to-transparent"
-							/>
-							<div className="flex items-center gap-2 px-3 py-2.5 text-xs font-semibold uppercase tracking-[.4px] text-soft-foreground">
-								<span className="size-2 rounded-full bg-(--col) shadow-[0_0_8px_var(--col)]" />
-								{PANE_STATUS[column.status].label}
-								{canCatchUp && (
-									<button
-										type="button"
-										title="Catch up - go through these one at a time"
-										onClick={() => {
-											const queue = sections.flatMap(([, group]) => group);
-											setCatchUp(queue.map((card) => card.pane.id));
-											openDrawer(queue[0]);
-										}}
-										// Solid, with a play icon: the dim pill read as a tag beside
-										// the count, not as something to press. Wears the column's hue.
+			{isGridOn ? (
+				daemonSessions !== undefined &&
+				!isProfileLoading && (
+					<SessionsGrid
+						cards={gridCards}
+						agentPaneIds={agentPaneIds}
+						drawerPaneId={drawerCard?.pane.id}
+						activeProfileId={activeProfileId}
+						onOpen={(paneId) => {
+							const card = gridCards.find((c) => c.pane.id === paneId);
+							if (card) openDrawer(card);
+						}}
+					/>
+				)
+			) : (
+				<div className="flex min-h-0 flex-1 gap-3 overflow-x-auto px-[18px] pb-[18px] pt-1">
+					{COLUMNS.map((column) => {
+						const cards = cardsByStatus.get(column.status) ?? [];
+						// ponytail: re-sorted on the board's next render, not on the
+						// minute the 10m runs out - the pane polls re-render it often.
+						const sections = bySection(
+							cards,
+							(card) =>
+								(column.status === "review" ||
+									column.status === "permission") &&
+								justDoneLeft(
+									statusSinceRef.current.get(card.pane.id)?.at,
+									focusedAt,
+								) > 0,
+						);
+						// One section is just the column - don't label it, unless it says
+						// something on its own (Starred, Parked: "you put these down").
+						const labelled =
+							sections.length > 1 ||
+							sections[0]?.[0] === "starred" ||
+							sections[0]?.[0] === "recent" ||
+							sections[0]?.[0] === "parked" ||
+							sections[0]?.[0] === "queued";
+						const isDropTarget = column.status === "idle";
+						// Needs you and Done are the two columns you clear: walk either one
+						// card at a time - once there are more than five, fewer you just scan.
+						const canCatchUp =
+							(column.status === "permission" || column.status === "review") &&
+							cards.length > 5;
+						return (
+							// biome-ignore lint/a11y/noStaticElementInteractions: drop zone - drag is the mouse-only shortcut for parking a card in Idle
+							<div
+								key={column.status}
+								onDragOver={
+									isDropTarget
+										? (event) => {
+												event.preventDefault();
+												setDragOverIdle(true);
+											}
+										: undefined
+								}
+								onDragLeave={
+									isDropTarget ? () => setDragOverIdle(false) : undefined
+								}
+								onDrop={
+									isDropTarget
+										? (event) => {
+												event.preventDefault();
+												setDragOverIdle(false);
+												const paneId = event.dataTransfer.getData("text/plain");
+												const card = [...cardsByStatus.values()]
+													.flat()
+													.find((item) => item.pane.id === paneId);
+												if (card) void parkCard(card);
+											}
+										: undefined
+								}
+								className={cn(
+									// The column wears its status: a hairline of the hue along the
+									// top and a wash that fades out under the header. The cards
+									// stay neutral - the colour says where they are, not what.
+									BOARD_COLUMN_MIN_W,
+									"relative flex flex-1 flex-col overflow-hidden rounded-xl border bg-tertiary/85 bg-[linear-gradient(to_bottom,color-mix(in_oklab,var(--col)_9%,transparent),transparent_160px)]",
+									isDropTarget && dragOverIdle
+										? "border-primary bg-primary/15"
+										: "border-border",
+								)}
+								style={
+									{ "--col": PANE_STATUS[column.status].dot } as CSSProperties
+								}
+							>
+								<span
+									aria-hidden
+									className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-(--col) via-(--col)/40 to-transparent"
+								/>
+								<div className="flex items-center gap-2 px-3 py-2.5 text-xs font-semibold uppercase tracking-[.4px] text-soft-foreground">
+									<span className="size-2 rounded-full bg-(--col) shadow-[0_0_8px_var(--col)]" />
+									{PANE_STATUS[column.status].label}
+									{canCatchUp && (
+										<button
+											type="button"
+											title="Catch up - go through these one at a time"
+											onClick={() => {
+												const queue = sections.flatMap(([, group]) => group);
+												setCatchUp(queue.map((card) => card.pane.id));
+												openDrawer(queue[0]);
+											}}
+											// Solid, with a play icon: the dim pill read as a tag beside
+											// the count, not as something to press. Wears the column's hue.
+											className={cn(
+												"ml-auto flex items-center gap-1 rounded-md bg-gradient-to-b to-(--col) px-2.5 py-1 text-[11px] font-semibold normal-case tracking-normal text-background shadow-[0_2px_10px_-3px_color-mix(in_oklab,var(--col)_75%,transparent)] hover:brightness-110",
+												column.status === "review"
+													? "from-success-ink"
+													: "from-attention-ink",
+											)}
+										>
+											<LuPlay className="size-2.5 fill-current" />
+											Catch up
+										</button>
+									)}
+									<span
 										className={cn(
-											"ml-auto flex items-center gap-1 rounded-md bg-gradient-to-b to-(--col) px-2.5 py-1 text-[11px] font-semibold normal-case tracking-normal text-background shadow-[0_2px_10px_-3px_color-mix(in_oklab,var(--col)_75%,transparent)] hover:brightness-110",
-											column.status === "review"
-												? "from-success-ink"
-												: "from-attention-ink",
+											"rounded-[10px] bg-secondary px-2 font-medium",
+											!canCatchUp && "ml-auto",
 										)}
 									>
-										<LuPlay className="size-2.5 fill-current" />
-										Catch up
-									</button>
-								)}
-								<span
-									className={cn(
-										"rounded-[10px] bg-secondary px-2 font-medium",
-										!canCatchUp && "ml-auto",
-									)}
-								>
-									{cards.length}
-								</span>
-							</div>
-							<div className="flex flex-col gap-2 overflow-y-auto px-2 pt-0.5 pb-2.5">
-								{cards.length === 0 ? (
-									<div className="px-2 py-6 text-center text-xs text-muted-foreground">
-										Nothing here
-									</div>
-								) : (
-									sections.map(([section, group]) => {
-										const Icon = SECTION_ICON[section];
-										return (
-											<Fragment key={section}>
-												{labelled && (
-													<div className="flex items-center gap-1.5 px-1 pt-1 text-[10px] font-semibold uppercase tracking-[.5px] text-muted-foreground">
-														<Icon className="size-3" aria-hidden />
-														{SECTION_LABEL[section]}
-														<span className="opacity-70">{group.length}</span>
-														<span className="ml-1 h-px flex-1 bg-accent" />
-													</div>
-												)}
-												{group.map((card) => (
-													<HoverCard key={card.pane.id} openDelay={350}>
-														<HoverCardTrigger asChild>
-															{/* biome-ignore lint/a11y/useSemanticElements: a real <button> can't nest the reply <input>, so the card is a div with button semantics */}
-															<div
-																role="button"
-																tabIndex={0}
-																draggable
-																onDragStart={(event) => {
-																	event.dataTransfer.setData(
-																		"text/plain",
-																		card.pane.id,
-																	);
-																	event.dataTransfer.effectAllowed = "move";
-																}}
-																onDragEnd={() => setDragOverIdle(false)}
-																onKeyDown={(event) => {
-																	if (
-																		event.key === "Enter" ||
-																		event.key === " "
-																	) {
-																		openDrawer(card);
-																	}
-																}}
-																onClick={() => openDrawer(card)}
-																onContextMenu={(event) => {
-																	// Right-click → star or tag this session.
-																	event.preventDefault();
-																	setTagMenu({
-																		paneId: card.pane.id,
-																		x: event.clientX,
-																		y: event.clientY,
-																	});
-																}}
-																className={cn(
-																	// A lit top edge, and a lift with a violet halo under the
-																	// pointer - the board's one bit of motion you cause. The
-																	// whole hover look (fill, violet edge, halo) is an ::after
-																	// that only fades in: background, border and shadow can't
-																	// animate on the compositor, so they repainted every frame
-																	// and stuttered whenever the board was busy rendering.
-																	"group relative isolate cursor-pointer rounded-[10px] border bg-card px-3 py-2.5 text-left shadow-[inset_0_1px_0_rgb(255_255_255/0.04)] transition-[translate] duration-200 ease-out hover:-translate-y-px",
-																	"after:pointer-events-none after:absolute after:-inset-px after:-z-10 after:rounded-[inherit] after:border after:border-primary/40 after:bg-secondary after:opacity-0 after:shadow-[inset_0_1px_0_rgb(255_255_255/0.05),0_10px_24px_-12px_color-mix(in_oklab,var(--primary)_55%,transparent)] after:transition-opacity after:duration-200 after:ease-out hover:after:opacity-100",
-																	// Cards are neutral - the column header already says the
-																	// status. Only a failure earns its red edge.
-																	card.pane.status === "failed"
-																		? "border-danger/40"
-																		: "border-border",
-																)}
-															>
-																<div className="flex items-start gap-2">
-																	<div className="min-w-0 flex-1 break-words text-[12.5px] font-semibold">
-																		<OverdueMark
-																			itemKey={`session:${card.pane.id}`}
-																		/>
-																		{cardTitle(card)}
-																	</div>
-																	<button
-																		type="button"
-																		title={
-																			card.pane.odinStarred
-																				? "Unstar"
-																				: "Star - pin to the top"
+										{cards.length}
+									</span>
+								</div>
+								<div className="flex flex-col gap-2 overflow-y-auto px-2 pt-0.5 pb-2.5">
+									{cards.length === 0 ? (
+										<div className="px-2 py-6 text-center text-xs text-muted-foreground">
+											Nothing here
+										</div>
+									) : (
+										sections.map(([section, group]) => {
+											const Icon = SECTION_ICON[section];
+											return (
+												<Fragment key={section}>
+													{labelled && (
+														<div className="flex items-center gap-1.5 px-1 pt-1 text-[10px] font-semibold uppercase tracking-[.5px] text-muted-foreground">
+															<Icon className="size-3" aria-hidden />
+															{SECTION_LABEL[section]}
+															<span className="opacity-70">{group.length}</span>
+															<span className="ml-1 h-px flex-1 bg-accent" />
+														</div>
+													)}
+													{group.map((card) => (
+														<HoverCard key={card.pane.id} openDelay={350}>
+															<HoverCardTrigger asChild>
+																{/* biome-ignore lint/a11y/useSemanticElements: a real <button> can't nest the reply <input>, so the card is a div with button semantics */}
+																<div
+																	role="button"
+																	tabIndex={0}
+																	draggable
+																	onDragStart={(event) => {
+																		event.dataTransfer.setData(
+																			"text/plain",
+																			card.pane.id,
+																		);
+																		event.dataTransfer.effectAllowed = "move";
+																	}}
+																	onDragEnd={() => setDragOverIdle(false)}
+																	onKeyDown={(event) => {
+																		if (
+																			event.key === "Enter" ||
+																			event.key === " "
+																		) {
+																			openDrawer(card);
 																		}
-																		aria-pressed={!!card.pane.odinStarred}
-																		onClick={(event) => {
-																			event.stopPropagation();
-																			toggleStar(card.pane.id);
-																		}}
-																		className={cn(
-																			"shrink-0 rounded-[5px] px-1 text-[12px] text-attention transition-opacity hover:bg-attention/15",
-																			!card.pane.odinStarred &&
-																				"opacity-0 group-hover:opacity-100",
-																		)}
-																	>
-																		{card.pane.odinStarred ? "★" : "☆"}
-																	</button>
-																	<button
-																		type="button"
-																		title="Done - remove from the board"
-																		onClick={(event) => {
-																			event.stopPropagation();
-																			markDone(card);
-																		}}
-																		className={cn(
-																			"shrink-0 whitespace-nowrap",
-																			// Final review is where a card waits for you to close it,
-																			// so Done is the always-visible green pill there.
-																			card.status === "review"
-																				? `rounded-[7px] px-2.5 py-1 text-xs font-semibold transition-colors ${BUTTON.done}`
-																				: "rounded-[5px] px-1.5 text-[11px] text-muted-foreground opacity-0 transition-opacity hover:bg-success/15 hover:text-success group-hover:opacity-100",
-																		)}
-																	>
-																		✓ Done
-																	</button>
-																	<RemindButton
-																		onPick={(day) => remindMe(card, day)}
-																		className="rounded-[5px] px-1.5 text-[11px] text-muted-foreground opacity-0 transition-opacity hover:bg-attention/15 hover:text-attention group-hover:opacity-100"
-																	/>
-																</div>
-																{/* Facts are one grey text line; chips are left only for flags that ask
+																	}}
+																	onClick={() => openDrawer(card)}
+																	onContextMenu={(event) => {
+																		// Right-click → star or tag this session.
+																		event.preventDefault();
+																		setTagMenu({
+																			paneId: card.pane.id,
+																			x: event.clientX,
+																			y: event.clientY,
+																		});
+																	}}
+																	className={cn(
+																		// A lit top edge, and a lift with a violet halo under the
+																		// pointer - the board's one bit of motion you cause. The
+																		// whole hover look (fill, violet edge, halo) is an ::after
+																		// that only fades in: background, border and shadow can't
+																		// animate on the compositor, so they repainted every frame
+																		// and stuttered whenever the board was busy rendering.
+																		"group relative isolate cursor-pointer rounded-[10px] border bg-card px-3 py-2.5 text-left shadow-[inset_0_1px_0_rgb(255_255_255/0.04)] transition-[translate] duration-200 ease-out hover:-translate-y-px",
+																		"after:pointer-events-none after:absolute after:-inset-px after:-z-10 after:rounded-[inherit] after:border after:border-primary/40 after:bg-secondary after:opacity-0 after:shadow-[inset_0_1px_0_rgb(255_255_255/0.05),0_10px_24px_-12px_color-mix(in_oklab,var(--primary)_55%,transparent)] after:transition-opacity after:duration-200 after:ease-out hover:after:opacity-100",
+																		// Cards are neutral - the column header already says the
+																		// status. Only a failure earns its red edge.
+																		card.pane.status === "failed"
+																			? "border-danger/40"
+																			: "border-border",
+																	)}
+																>
+																	<div className="flex items-start gap-2">
+																		<div className="min-w-0 flex-1 break-words text-[12.5px] font-semibold">
+																			<OverdueMark
+																				itemKey={`session:${card.pane.id}`}
+																			/>
+																			{cardTitle(card)}
+																		</div>
+																		<button
+																			type="button"
+																			title={
+																				card.pane.odinStarred
+																					? "Unstar"
+																					: "Star - pin to the top"
+																			}
+																			aria-pressed={!!card.pane.odinStarred}
+																			onClick={(event) => {
+																				event.stopPropagation();
+																				toggleStar(card.pane.id);
+																			}}
+																			className={cn(
+																				"shrink-0 rounded-[5px] px-1 text-[12px] text-attention transition-opacity hover:bg-attention/15",
+																				!card.pane.odinStarred &&
+																					"opacity-0 group-hover:opacity-100",
+																			)}
+																		>
+																			{card.pane.odinStarred ? "★" : "☆"}
+																		</button>
+																		<button
+																			type="button"
+																			title="Done - remove from the board"
+																			onClick={(event) => {
+																				event.stopPropagation();
+																				markDone(card);
+																			}}
+																			className={cn(
+																				"shrink-0 whitespace-nowrap",
+																				// Final review is where a card waits for you to close it,
+																				// so Done is the always-visible green pill there.
+																				card.status === "review"
+																					? `rounded-[7px] px-2.5 py-1 text-xs font-semibold transition-colors ${BUTTON.done}`
+																					: "rounded-[5px] px-1.5 text-[11px] text-muted-foreground opacity-0 transition-opacity hover:bg-success/15 hover:text-success group-hover:opacity-100",
+																			)}
+																		>
+																			✓ Done
+																		</button>
+																		<RemindButton
+																			onPick={(day) => remindMe(card, day)}
+																			className="rounded-[5px] px-1.5 text-[11px] text-muted-foreground opacity-0 transition-opacity hover:bg-attention/15 hover:text-attention group-hover:opacity-100"
+																		/>
+																	</div>
+																	{/* Facts are one grey text line; chips are left only for flags that ask
     something of you. A pill that renders nothing drops out, so the dots
     between the rest stay right. */}
-																<div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1.5 text-[11.5px] text-muted-foreground [&>*+*]:before:inline-block [&>*+*]:before:mr-1.5 [&>*+*]:before:text-faint-foreground [&>*+*]:before:content-['·']">
-																	{(droppedPaneIds.has(card.pane.id) ||
-																		reviewMergedPaneIds.has(card.pane.id)) && (
-																		<span className="font-medium text-danger">
-																			{reviewMergedPaneIds.has(card.pane.id)
-																				? "Dropped: PR merged"
-																				: "Dropped: PR closed"}
-																		</span>
-																	)}
-																	{cardContact(card) && (
-																		<span className="inline-flex min-w-0 items-center gap-1 font-medium text-soft-foreground">
-																			<span
-																				className="size-1.5 shrink-0 rounded-full"
-																				style={{
-																					backgroundColor: personColor(
-																						cardContact(card) as string,
-																					).fg,
-																				}}
-																			/>
-																			<span className="truncate">
-																				{cardContact(card)}
+																	<div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1.5 text-[11.5px] text-muted-foreground [&>*+*]:before:inline-block [&>*+*]:before:mr-1.5 [&>*+*]:before:text-faint-foreground [&>*+*]:before:content-['·']">
+																		{(droppedPaneIds.has(card.pane.id) ||
+																			reviewMergedPaneIds.has(
+																				card.pane.id,
+																			)) && (
+																			<span className="font-medium text-danger">
+																				{reviewMergedPaneIds.has(card.pane.id)
+																					? "Dropped: PR merged"
+																					: "Dropped: PR closed"}
 																			</span>
-																		</span>
-																	)}
-																	<RepoPill card={card} />
-																	<PrPill
-																		card={card}
-																		live={card.status === "working"}
-																	/>
-																	{ciChecksByPane.has(card.pane.id) && (
-																		<span
-																			title={`CI running: ${ciChecksByPane.get(card.pane.id)?.join(", ")}`}
-																			className="inline-flex items-center gap-1 font-medium text-working"
-																		>
-																			<span className="size-1.5 shrink-0 animate-pulse rounded-full bg-working" />
-																			CI running
-																		</span>
-																	)}
-																	<NotionPill
-																		card={card}
-																		live={card.status === "working"}
-																	/>
-																	<AgePill
-																		card={card}
-																		live={card.status === "working"}
-																		fallback={
-																			statusSinceRef.current.get(card.pane.id)
-																				?.at
-																		}
-																	/>
-																</div>
-																<DropPill pane={card.pane} />
-																<DuplicateHint
-																	other={duplicateOf.get(card.pane.id)}
-																	titleOf={cardTitle}
-																/>
-																<div className="mt-1 flex flex-wrap items-center gap-1.5">
-																	<ReviewPill card={card} />
-																	<MergeOnlyPill card={card} />
-																	{(card.status === "review" ||
-																		card.status === "permission") && (
-																		<JustDonePill
-																			focusedAt={focusedAt}
-																			since={
+																		)}
+																		{cardContact(card) && (
+																			<span className="inline-flex min-w-0 items-center gap-1 font-medium text-soft-foreground">
+																				<span
+																					className="size-1.5 shrink-0 rounded-full"
+																					style={{
+																						backgroundColor: personColor(
+																							cardContact(card) as string,
+																						).fg,
+																					}}
+																				/>
+																				<span className="truncate">
+																					{cardContact(card)}
+																				</span>
+																			</span>
+																		)}
+																		<RepoPill card={card} />
+																		<PrPill
+																			card={card}
+																			live={card.status === "working"}
+																		/>
+																		{ciChecksByPane.has(card.pane.id) && (
+																			<span
+																				title={`CI running: ${ciChecksByPane.get(card.pane.id)?.join(", ")}`}
+																				className="inline-flex items-center gap-1 font-medium text-working"
+																			>
+																				<span className="size-1.5 shrink-0 animate-pulse rounded-full bg-working" />
+																				CI running
+																			</span>
+																		)}
+																		<NotionPill
+																			card={card}
+																			live={card.status === "working"}
+																		/>
+																		<AgePill
+																			card={card}
+																			live={card.status === "working"}
+																			fallback={
 																				statusSinceRef.current.get(card.pane.id)
 																					?.at
 																			}
 																		/>
-																	)}
-																	{boardTags(
-																		card.pane.odinTags,
-																		customTags,
-																	).some((tag) => !PILL_TAGS.includes(tag)) && (
-																		<span className="font-mono text-[10.5px] text-faint-foreground">
-																			{boardTags(card.pane.odinTags, customTags)
-																				.filter(
-																					(tag) => !PILL_TAGS.includes(tag),
-																				)
-																				.map((tag) => `#${tag}`)
-																				.join(" ")}
-																		</span>
-																	)}
-																	{boardTags(
-																		card.pane.odinTags,
-																		customTags,
-																	).includes("automation") && (
-																		// Violet and a clock, the pair the Tasks list gives a scheduled row:
-																		// the one tag that answers "who started this?" on a board you
-																		// otherwise started yourself.
-																		<span
-																			title="Started by a schedule, not by you"
-																			className={cn(
-																				"inline-flex items-center gap-1 rounded-[5px] px-[7px] text-[11px] font-medium",
-																				PILL.brand,
-																			)}
-																		>
-																			<LuClock className="size-3" />
-																			Automation
-																		</span>
-																	)}
-																	{card.pane.odinTags?.includes(
-																		"off-hours",
-																	) && (
-																		// Violet and a moon: the overnight run's work,
-																		// picked out from a board you otherwise started yourself.
-																		<span
-																			title="Started overnight by Night Agent, while you were away"
-																			className={cn(
-																				"inline-flex items-center gap-1 rounded-[5px] px-[7px] text-[11px] font-medium",
-																				PILL.brand,
-																			)}
-																		>
-																			<LuMoon className="size-3" />
-																			Night Agent
-																		</span>
-																	)}
-																	{card.pane.odinTags?.includes(
-																		"auto-started",
-																	) && (
-																		<span
-																			title="Started by your Slack reaction, not a click"
-																			className={cn(
-																				"inline-flex items-center gap-1 rounded-[5px] px-[7px] text-[11px] font-medium",
-																				PILL.brand,
-																			)}
-																		>
-																			{launchEmoji} Auto-started
-																		</span>
-																	)}
-																	{agentPaneIds.has(card.pane.id) && (
-																		<LoopPill card={card} />
-																	)}
-																	<LoadPill card={card} />
-																	{shellPaneOf(card) && daemonSessions && (
-																		<ShellChip
-																			shellPaneId={shellPaneOf(card)?.id ?? ""}
-																			alive={alivePaneIds.has(
-																				shellPaneOf(card)?.id ?? "",
-																			)}
-																		/>
-																	)}
-																	{/* Last, and blank until you set one: a deadline is yours, not
-	    something the session reports about itself. */}
-																	<DueChip
-																		itemKey={`session:${card.pane.id}`}
-																		title={cardTitle(card)}
-																	/>
-																</div>
-																{card.status === "working" && (
-																	<div className="mt-1.5 flex items-center gap-1.5 text-[11.5px] text-muted-foreground">
-																		<span
-																			className="size-[9px] animate-spin rounded-full border"
-																			style={{
-																				borderColor: PANE_STATUS.working.dot,
-																				borderTopColor: "transparent",
-																			}}
-																		/>
-																		agent running
 																	</div>
-																)}
-																{/* ponytail: the "Needs you"/"Final Review" headers already say
+																	<DropPill pane={card.pane} />
+																	<DuplicateHint
+																		other={duplicateOf.get(card.pane.id)}
+																		titleOf={cardTitle}
+																	/>
+																	<div className="mt-1 flex flex-wrap items-center gap-1.5">
+																		<ReviewPill card={card} />
+																		<MergeOnlyPill card={card} />
+																		{(card.status === "review" ||
+																			card.status === "permission") && (
+																			<JustDonePill
+																				focusedAt={focusedAt}
+																				since={
+																					statusSinceRef.current.get(
+																						card.pane.id,
+																					)?.at
+																				}
+																			/>
+																		)}
+																		{boardTags(
+																			card.pane.odinTags,
+																			customTags,
+																		).some(
+																			(tag) => !PILL_TAGS.includes(tag),
+																		) && (
+																			<span className="font-mono text-[10.5px] text-faint-foreground">
+																				{boardTags(
+																					card.pane.odinTags,
+																					customTags,
+																				)
+																					.filter(
+																						(tag) => !PILL_TAGS.includes(tag),
+																					)
+																					.map((tag) => `#${tag}`)
+																					.join(" ")}
+																			</span>
+																		)}
+																		{boardTags(
+																			card.pane.odinTags,
+																			customTags,
+																		).includes("automation") && (
+																			// Violet and a clock, the pair the Tasks list gives a scheduled row:
+																			// the one tag that answers "who started this?" on a board you
+																			// otherwise started yourself.
+																			<span
+																				title="Started by a schedule, not by you"
+																				className={cn(
+																					"inline-flex items-center gap-1 rounded-[5px] px-[7px] text-[11px] font-medium",
+																					PILL.brand,
+																				)}
+																			>
+																				<LuClock className="size-3" />
+																				Automation
+																			</span>
+																		)}
+																		{card.pane.odinTags?.includes(
+																			"off-hours",
+																		) && (
+																			// Violet and a moon: the overnight run's work,
+																			// picked out from a board you otherwise started yourself.
+																			<span
+																				title="Started overnight by Night Agent, while you were away"
+																				className={cn(
+																					"inline-flex items-center gap-1 rounded-[5px] px-[7px] text-[11px] font-medium",
+																					PILL.brand,
+																				)}
+																			>
+																				<LuMoon className="size-3" />
+																				Night Agent
+																			</span>
+																		)}
+																		{card.pane.odinTags?.includes(
+																			"auto-started",
+																		) && (
+																			<span
+																				title="Started by your Slack reaction, not a click"
+																				className={cn(
+																					"inline-flex items-center gap-1 rounded-[5px] px-[7px] text-[11px] font-medium",
+																					PILL.brand,
+																				)}
+																			>
+																				{launchEmoji} Auto-started
+																			</span>
+																		)}
+																		{agentPaneIds.has(card.pane.id) && (
+																			<LoopPill card={card} />
+																		)}
+																		<LoadPill card={card} />
+																		{shellPaneOf(card) && daemonSessions && (
+																			<ShellChip
+																				shellPaneId={
+																					shellPaneOf(card)?.id ?? ""
+																				}
+																				alive={alivePaneIds.has(
+																					shellPaneOf(card)?.id ?? "",
+																				)}
+																			/>
+																		)}
+																		{/* Last, and blank until you set one: a deadline is yours, not
+	    something the session reports about itself. */}
+																		<DueChip
+																			itemKey={`session:${card.pane.id}`}
+																			title={cardTitle(card)}
+																		/>
+																	</div>
+																	{card.status === "working" && (
+																		<div className="mt-1.5 flex items-center gap-1.5 text-[11.5px] text-muted-foreground">
+																			<span
+																				className="size-[9px] animate-spin rounded-full border"
+																				style={{
+																					borderColor: PANE_STATUS.working.dot,
+																					borderTopColor: "transparent",
+																				}}
+																			/>
+																			agent running
+																		</div>
+																	)}
+																	{/* ponytail: the "Needs you"/"Final Review" headers already say
 															    the rest - only a failure adds anything. pane.status is
 															    the raw one; the column merges prompts and failures. */}
-																{card.status === "permission" &&
-																	card.pane.status === "failed" && (
-																		<div className="mt-1.5 text-xs text-danger">
-																			✗ failed - click to see what broke
-																		</div>
-																	)}
-																{card.status === "idle" &&
-																	!agentPaneIds.has(card.pane.id) &&
-																	resumingPaneIds.includes(card.pane.id) && (
-																		<div className="mt-1.5 flex items-center gap-1.5 text-[11.5px] text-working">
-																			<span className="size-[9px] animate-spin rounded-full border border-working border-t-transparent" />
-																			{card.pane.odinQueued
-																				? "starting…"
-																				: "resuming…"}
-																		</div>
-																	)}
-																{/* Never started - it's waiting on the machine, not
+																	{card.status === "permission" &&
+																		card.pane.status === "failed" && (
+																			<div className="mt-1.5 text-xs text-danger">
+																				✗ failed - click to see what broke
+																			</div>
+																		)}
+																	{card.status === "idle" &&
+																		!agentPaneIds.has(card.pane.id) &&
+																		resumingPaneIds.includes(card.pane.id) && (
+																			<div className="mt-1.5 flex items-center gap-1.5 text-[11.5px] text-working">
+																				<span className="size-[9px] animate-spin rounded-full border border-working border-t-transparent" />
+																				{card.pane.odinQueued
+																					? "starting…"
+																					: "resuming…"}
+																			</div>
+																		)}
+																	{/* Never started - it's waiting on the machine, not
 																    on you. Says what for, and lets you overrule it. */}
-																{card.pane.odinQueued &&
-																	!resumingPaneIds.includes(card.pane.id) && (
-																		<div className="mt-1.5 flex items-center gap-2">
-																			<span className="text-[11.5px] text-attention">
-																				⏳ {card.pane.odinQueued.reason}
-																			</span>
-																			<button
-																				type="button"
-																				title="Start this session now, gate or no gate"
-																				onClick={(event) => {
-																					event.stopPropagation();
-																					void resumeCard(card);
-																				}}
-																				className={cn(
-																					"ml-auto shrink-0 whitespace-nowrap rounded-[7px] px-2.5 py-1 text-xs font-semibold",
-																					BUTTON.secondary,
-																				)}
-																			>
-																				Start now
-																			</button>
-																		</div>
-																	)}
-																{card.status === "idle" &&
-																	!card.pane.odinQueued &&
-																	!agentPaneIds.has(card.pane.id) &&
-																	!resumingPaneIds.includes(card.pane.id) && (
-																		<div className="mt-1.5 flex items-center gap-2">
-																			{/* ponytail: the button says "resume" - only a
-																		    failure is worth spelling out. */}
-																			{card.pane.status === "failed" && (
-																				<span className="text-[11.5px] text-danger">
-																					✗ failed
-																				</span>
-																			)}
-																			{/* Resume does more here than on the other
-																		    cards - it puts the agent back to work
-																		    instead of handing you a prompt. */}
-																			{card.pane.status === "working" && (
+																	{card.pane.odinQueued &&
+																		!resumingPaneIds.includes(card.pane.id) && (
+																			<div className="mt-1.5 flex items-center gap-2">
 																				<span className="text-[11.5px] text-attention">
-																					⏸ died mid-turn
+																					⏳ {card.pane.odinQueued.reason}
 																				</span>
-																			)}
-																			{card.pane.status !== "working" &&
-																				card.pane.odinExitCause && (
-																					<span className="select-text cursor-text truncate text-[11.5px] text-danger">
-																						✗ {card.pane.odinExitCause}
+																				<button
+																					type="button"
+																					title="Start this session now, gate or no gate"
+																					onClick={(event) => {
+																						event.stopPropagation();
+																						void resumeCard(card);
+																					}}
+																					className={cn(
+																						"ml-auto shrink-0 whitespace-nowrap rounded-[7px] px-2.5 py-1 text-xs font-semibold",
+																						BUTTON.secondary,
+																					)}
+																				>
+																					Start now
+																				</button>
+																			</div>
+																		)}
+																	{card.status === "idle" &&
+																		!card.pane.odinQueued &&
+																		!agentPaneIds.has(card.pane.id) &&
+																		!resumingPaneIds.includes(card.pane.id) && (
+																			<div className="mt-1.5 flex items-center gap-2">
+																				{/* ponytail: the button says "resume" - only a
+																		    failure is worth spelling out. */}
+																				{card.pane.status === "failed" && (
+																					<span className="text-[11.5px] text-danger">
+																						✗ failed
 																					</span>
 																				)}
-																			<button
-																				type="button"
-																				onClick={(event) => {
-																					event.stopPropagation();
-																					void resumeCard(card);
-																				}}
-																				className={cn(
-																					"rounded-[7px] px-2.5 py-1 text-xs font-semibold",
-																					BUTTON.secondary,
+																				{/* Resume does more here than on the other
+																		    cards - it puts the agent back to work
+																		    instead of handing you a prompt. */}
+																				{card.pane.status === "working" && (
+																					<span className="text-[11.5px] text-attention">
+																						⏸ died mid-turn
+																					</span>
 																				)}
-																			>
-																				Resume
-																			</button>
-																		</div>
-																	)}
-															</div>
-														</HoverCardTrigger>
-														<HoverCardContent
-															side="right"
-															align="start"
-															className="max-h-[70vh] w-[400px] overflow-y-auto border-input bg-secondary p-3 shadow-[0_12px_40px_rgba(0,0,0,0.75)]"
-														>
-															<CardHoverContent
-																card={card}
-																text={cardText(card)}
-															/>
-														</HoverCardContent>
-													</HoverCard>
-												))}
-											</Fragment>
-										);
-									})
-								)}
+																				{card.pane.status !== "working" &&
+																					card.pane.odinExitCause && (
+																						<span className="select-text cursor-text truncate text-[11.5px] text-danger">
+																							✗ {card.pane.odinExitCause}
+																						</span>
+																					)}
+																				<button
+																					type="button"
+																					onClick={(event) => {
+																						event.stopPropagation();
+																						void resumeCard(card);
+																					}}
+																					className={cn(
+																						"rounded-[7px] px-2.5 py-1 text-xs font-semibold",
+																						BUTTON.secondary,
+																					)}
+																				>
+																					Resume
+																				</button>
+																			</div>
+																		)}
+																</div>
+															</HoverCardTrigger>
+															<HoverCardContent
+																side="right"
+																align="start"
+																className="max-h-[70vh] w-[400px] overflow-y-auto border-input bg-secondary p-3 shadow-[0_12px_40px_rgba(0,0,0,0.75)]"
+															>
+																<CardHoverContent
+																	card={card}
+																	text={cardText(card)}
+																/>
+															</HoverCardContent>
+														</HoverCard>
+													))}
+												</Fragment>
+											);
+										})
+									)}
+								</div>
 							</div>
-						</div>
-					);
-				})}
-				{/* Last, so it opens under its toggle at the header's right end. */}
-				{isNextOpen && <NextInLine />}
-			</div>
+						);
+					})}
+					{/* Last, so it opens under its toggle at the header's right end. */}
+					{isNextOpen && <NextInLine />}
+				</div>
+			)}
 
 			{/* No Completed strip and no link to one: the Session History pane in the
 			    sidebar already searches and resumes finished sessions. */}
