@@ -15,6 +15,7 @@ import { useState } from "react";
 import {
 	HOTKEYS,
 	type HotkeyId,
+	LISTED_HOTKEYS,
 	type ShortcutBinding,
 	useFormatBinding,
 	useHotkeyDisplay,
@@ -28,31 +29,6 @@ import {
 	SettingsPage,
 	SettingsSection,
 } from "../components/SettingsPage";
-
-/**
- * Every screen this shell can open, and nothing else - the upstream
- * workspace/terminal/layout hotkeys stay registered (other code binds them) but
- * this shell has no UI for them, so showing them here was noise.
- */
-const LISTED_HOTKEYS: HotkeyId[] = [
-	"ODIN_HOME",
-	"ODIN_BOARD",
-	"ODIN_BOARD_SEARCH",
-	"ODIN_ALL",
-	"ODIN_TASKS",
-	"ODIN_AUTOMATIONS",
-	"ODIN_REVIEW",
-	"ODIN_SLACK",
-	"ODIN_JIRA",
-	"ODIN_PRS",
-	"ODIN_NOTION",
-	"ODIN_SESSIONS",
-	"ODIN_INSIGHTS",
-	"ODIN_NEW_TASK",
-	"ODIN_QUICK_QUESTION",
-	"ODIN_COPY_LINK",
-	"OPEN_SETTINGS",
-];
 
 function HotkeyRow({
 	id,
@@ -180,6 +156,13 @@ export const Route = createFileRoute("/_authenticated/settings/keyboard/")({
 
 function KeyboardShortcutsPage() {
 	const [recordingId, setRecordingId] = useState<HotkeyId | null>(null);
+	const [search, setSearch] = useState("");
+	const query = search.trim().toLowerCase();
+	const shownHotkeys = LISTED_HOTKEYS.filter((id) =>
+		`${HOTKEYS[id].label} ${HOTKEYS[id].description ?? ""}`
+			.toLowerCase()
+			.includes(query),
+	);
 	const [pendingConflict, setPendingConflict] = useState<{
 		targetId: HotkeyId;
 		binding: ShortcutBinding;
@@ -254,9 +237,24 @@ function KeyboardShortcutsPage() {
 				</Button>
 			}
 		>
-			{/* One row per tab in the rail */}
+			<input
+				type="search"
+				value={search}
+				onChange={(e) => setSearch(e.target.value)}
+				onKeyDown={(e) => {
+					if (e.key === "Escape") setSearch("");
+				}}
+				placeholder="Search shortcuts"
+				aria-label="Search shortcuts"
+				className="mb-4 w-full rounded-md border border-border bg-card px-3 py-1.5 text-sm text-foreground outline-none placeholder:text-faint-foreground focus:border-primary"
+			/>
 			<SettingsSection title="Shortcuts">
-				{LISTED_HOTKEYS.map((id) => (
+				{shownHotkeys.length === 0 && (
+					<p className="px-4 py-3 text-sm text-muted-foreground">
+						No shortcut matches "{search.trim()}"
+					</p>
+				)}
+				{shownHotkeys.map((id) => (
 					<HotkeyRow
 						key={id}
 						id={id}

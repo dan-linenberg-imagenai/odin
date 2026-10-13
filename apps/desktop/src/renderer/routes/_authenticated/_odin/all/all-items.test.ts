@@ -1,5 +1,14 @@
 import { expect, test } from "bun:test";
-import { allItems, urgencyOf } from "./all-items";
+import {
+	type AllItem,
+	agoLabel,
+	allItems,
+	bandOf,
+	matchesStatus,
+	plainText,
+	reasonOf,
+	urgencyOf,
+} from "./all-items";
 
 const iso = (day: number) => new Date(Date.UTC(2026, 0, day)).toISOString();
 
@@ -239,4 +248,102 @@ test("tickets I only filed stay on the Jira tab", () => {
 	const filed = { ...feeds.jira[0], key: "BUGT-3", role: "reported" };
 	const items = allItems({ ...feeds, jira: [filed] });
 	expect(items.some((item) => item.source === "Jira")).toBe(false);
+});
+
+test("everything keeps what All leaves out, for Search all", () => {
+	const filed = { ...feeds.jira[0], key: "BUGT-3", role: "reported" };
+	const items = allItems(
+		{ ...feeds, jira: [...feeds.jira, filed] },
+		{ everything: true },
+	);
+	const titles = items.map((item) => item.title);
+	expect(titles).toContain("already on it");
+	expect(titles).toContain("odin#8: Bump lockfile");
+	expect(titles).toContain("odin#9: My own change");
+	expect(titles).toContain("BUGT-3: It breaks");
+	// A started Slack row says so; an un-started one stays blank, as in All.
+	expect(items.find((item) => item.key === "slack:s2")?.status).toBe(
+		"In progress",
+	);
+	expect(items.find((item) => item.key === "slack:s1")?.status).toBeNull();
+});
+
+test("a Slack row is created when it was queued, not when it was posted", () => {
+	const queued = Date.UTC(2026, 0, 9);
+	const [row] = allItems({
+		...feeds,
+		tasks: [],
+		jira: [],
+		pulls: [],
+		notion: [],
+		slack: [{ ...feeds.slack[0], firstSeenAt: queued }],
+	});
+	expect(row?.at).toBe(Date.parse(iso(5)));
+	expect(row?.createdAt).toBe(queued);
+});
+
+test("the status picker shows only one status, or hides one", () => {
+	const rows = allItems(feeds);
+	const jira = rows.filter((item) => item.source === "Jira");
+	const status = jira[0]?.status ?? "";
+	expect(rows.filter((item) => matchesStatus(item, `only:${status}`))).toEqual(
+		jira,
+	);
+	expect(
+		rows.filter((item) => matchesStatus(item, `hide:${status}`)),
+	).not.toContainEqual(jira[0]);
+	// Rows with no status are their own option, not dropped by every pick.
+	expect(rows.some((item) => matchesStatus(item, "only:No status"))).toBe(true);
+	expect(rows.every((item) => matchesStatus(item, ""))).toBe(true);
+});
+
+const HOUR = 3_600_000;
+
+test("bands: due wins, a fresh ask is Now, older asks and reviews Today, the rest Later", () => {
+	const now = Date.UTC(2026, 0, 10, 12);
+	const ask = (kind: AllItem["ask"]["kind"], hoursAgo: number) => ({
+		ask: { kind, at: now - hoursAgo * HOUR },
+		urgency: null,
+	});
+	expect(bandOf(ask("asked", 1), false, now)).toBe("now");
+	expect(bandOf(ask("asked", 5), false, now)).toBe("today");
+	expect(bandOf(ask("mentioned", 3), false, now)).toBe("now");
+	expect(bandOf(ask("review", 30), false, now)).toBe("today");
+	expect(bandOf(ask("assigned", 1), false, now)).toBe("later");
+	expect(bandOf({ ...ask("assigned", 1), urgency: "high" }, false, now)).toBe(
+		"today",
+	);
+	expect(bandOf(ask("assigned", 1), true, now)).toBe("now");
+	expect(bandOf(ask("asked", 1), false, now, true)).toBe("later");
+});
+
+test("a row says why it is here", () => {
+	const now = Date.UTC(2026, 0, 10, 12);
+	const at = (hoursAgo: number) => now - hoursAgo * HOUR;
+	expect(reasonOf({ ask: { kind: "asked", at: at(2) } }, now)).toBe("Ask 2h");
+	expect(reasonOf({ ask: { kind: "review", at: at(26) } }, now)).toBe(
+		"Review 1d",
+	);
+	expect(reasonOf({ ask: { kind: "unread", at: at(48) } }, now)).toBe(
+		"Unread 2d",
+	);
+	expect(reasonOf({ ask: { kind: "own", at: now } }, now)).toBe("Yours");
+	expect(agoLabel(30_000)).toBe("now");
+});
+
+test("every source records what it asks of you", () => {
+	const by = (source: string) =>
+		allItems(feeds).find((item) => item.source === source);
+	expect(by("Slack")?.ask.kind).toBe("asked");
+	expect(by("GitHub")?.ask.kind).toBe("review");
+	expect(by("Jira")?.ask.kind).toBe("assigned");
+	expect(by("Tasks")?.ask.kind).toBe("own");
+});
+
+test("a body preview drops markdown marks", () => {
+	expect(
+		plainText(
+			"## What\n- **Prod import** blocks `FeatureFlag` [docs](https://x)\n```ts\ncode\n```",
+		),
+	).toBe("What Prod import blocks FeatureFlag docs");
 });

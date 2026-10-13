@@ -26,6 +26,8 @@ import {
 } from "react";
 import type { IconType } from "react-icons";
 import {
+	LuChevronLeft,
+	LuChevronRight,
 	LuCircleCheck,
 	LuClock,
 	LuEye,
@@ -36,14 +38,19 @@ import {
 	LuHourglass,
 	LuMessageSquare,
 	LuMoon,
+	LuPanelLeft,
 	LuPause,
 	LuPlay,
 	LuRepeat,
+	LuStar,
 	LuTerminal,
 } from "react-icons/lu";
 import { SiJira, SiNotion, SiSlack } from "react-icons/si";
 import { useLaunchTaskSession } from "renderer/hooks/useLaunchTaskSession";
-import { startQueuedPane } from "renderer/hooks/useTaskQueue";
+import {
+	currentLaunchBlocker,
+	startQueuedPane,
+} from "renderer/hooks/useTaskQueue";
 import { useHotkey } from "renderer/hotkeys";
 import { electronTrpc } from "renderer/lib/electron-trpc";
 import { emojify } from "renderer/lib/emoji";
@@ -53,10 +60,10 @@ import { Terminal } from "renderer/screens/main/components/WorkspaceView/Content
 import * as terminalCache from "renderer/screens/main/components/WorkspaceView/ContentView/TabsContent/Terminal/v1-terminal-cache";
 import { claudeCli } from "renderer/stores/claude-command";
 import { useIdleClose } from "renderer/stores/idle-close";
-import { launchLimits, useLaunchLimits } from "renderer/stores/launch-limits";
 import { useSessionView } from "renderer/stores/session-view";
 import { useTabsStore } from "renderer/stores/tabs/store";
 import type { Pane, PaneStatus } from "renderer/stores/tabs/types";
+import { lastAgentHookAt } from "renderer/stores/tabs/useAgentHookListener";
 import { boardColumn } from "shared/board-column";
 import {
 	type BoardSection,
@@ -64,7 +71,7 @@ import {
 	SECTION_LABEL,
 } from "shared/board-section";
 import { duplicateSessions } from "shared/duplicate-sessions";
-import { claimedCheckout, launchBlocker } from "shared/launch-gate";
+import { claimedCheckout } from "shared/launch-gate";
 import { sessionUsageLabel } from "shared/machine-load";
 import { profileOf } from "shared/odin-profile";
 import { agentOnScreen, escIsHandledOnScreen } from "shared/odin-screen-status";
@@ -74,6 +81,8 @@ import { BOARD_TAGS, boardTags, normalizeTag } from "shared/odin-tags";
 const PILL_TAGS = ["automation", "auto-started", "off-hours"];
 
 import { openUrl, useInAppBrowser } from "renderer/stores/in-app-browser";
+import { useSearchableItems } from "../all/use-all-items";
+import { paneWorksOn } from "../all/use-start-item";
 import { DropHint } from "../components/DropHint";
 import { useSearchHotkey } from "../components/FeedChrome";
 import { NewSessionDialog } from "../components/NewSessionDialog";
@@ -90,16 +99,13 @@ import { DueChip, OverdueMark, useReminders } from "../components/Reminders";
 import { TranscriptView } from "../components/TranscriptView";
 import { useBacklogReview, useReview } from "../hooks/useBacklogReview";
 import { ANSI_RE, useBoardColumns } from "../hooks/useBoardColumns";
-import { endSession } from "../hooks/useDone";
+import { CROW_TAG } from "../hooks/useCrow";
+import { endSession, useDone } from "../hooks/useDone";
 import { useOdinFeeds } from "../hooks/useOdinFeeds";
 import { useOdinProfile } from "../hooks/useOdinProfile";
 import { useOdinWorkspace } from "../hooks/useOdinWorkspace";
 import { usePaneMeta } from "../hooks/usePaneMeta";
 import { usePendingFocus } from "../hooks/usePendingFocus";
-import {
-	QUESTION_TAG,
-	useQuickQuestionDialog,
-} from "../hooks/useQuickQuestion";
 import { PANE_STATUS } from "../pane-status";
 import { sessionFor } from "../review/verdicts";
 import {
@@ -120,8 +126,8 @@ import {
 import { ChatView } from "./ChatView";
 import { DiffView } from "./DiffView";
 import { interruptPane } from "./interrupt";
-import { NextInLine } from "./NextInLine";
-import { HoverBrief, SessionBrief } from "./SessionBrief";
+import { BOARD_COLUMN_MIN_W, NextInLine } from "./NextInLine";
+import { HoverBrief, MyTodos, SessionBrief } from "./SessionBrief";
 import {
 	PREFIX as REMIND_PREFIX,
 	RemindButton,
@@ -136,6 +142,8 @@ import { visibleScreen } from "./visible-screen";
  * imported by the main process, which has no business loading React icons.
  */
 const SECTION_ICON: Record<BoardSection, IconType> = {
+	// Not a source - the sessions you marked as the ones that matter.
+	starred: LuStar,
 	// Not a source - its turn ended in the last JUST_DONE_MS.
 	recent: LuCircleCheck,
 	// Not a source - a task that exists but hasn't started.
@@ -150,6 +158,15 @@ const SECTION_ICON: Record<BoardSection, IconType> = {
 	// Not from a feed - a session you opened yourself.
 	normal: LuTerminal,
 };
+
+/** The drawer session list's sort options - value to menu label. */
+const SWITCH_SORTS = {
+	status: "Needs you first",
+	updated: "Last update",
+	oldest: "Waiting longest",
+	name: "Name",
+} as const;
+type SwitchSort = keyof typeof SWITCH_SORTS;
 
 export const Route = createFileRoute("/_authenticated/_odin/board/")({
 	component: DevBoardPage,
@@ -240,7 +257,16 @@ const MIN_DRAWER_W = 480;
  * draws in the alternate screen, so its scrollback is hundreds of cursor-placed
  * repaints that read as run-together words once the escapes are stripped.
  */
-function HistoryView({ card, live }: { card: BoardCard; live: boolean }) {
+function HistoryView({
+	card,
+	live,
+	onDo,
+}: {
+	card: BoardCard;
+	live: boolean;
+	/** Resume the session with this as its opening message. */
+	onDo?: (text: string) => void;
+}) {
 	const sessionId = useCardSessionId(card);
 	// Same query the card's pills run, so this is a cache hit. Claude prunes old
 	// transcripts; when the file is gone, the saved screen is all that's left.
@@ -253,9 +279,14 @@ function HistoryView({ card, live }: { card: BoardCard; live: boolean }) {
 				sessionId={sessionId}
 				cwd={sessionCwd(card.pane) ?? card.repoPath}
 				workspaceId={card.workspaceId}
+				onResumeWith={onDo}
 			/>
 		);
 	}
+	// A fresh launch: the conversation file isn't written until Claude's first
+	// turn, and the daemon poll hasn't seen the PTY yet.
+	if (error && card.pane.status === "working")
+		return <StartingView label="Starting session…" />;
 	if (sessionId && !live && !error) {
 		return (
 			<div className="flex min-h-0 flex-1 flex-col">
@@ -267,6 +298,16 @@ function HistoryView({ card, live }: { card: BoardCard; live: boolean }) {
 		);
 	}
 	return <ScrollbackView card={card} live={live} />;
+}
+
+/** Spinner for the gap before a session has anything to show. */
+function StartingView({ label }: { label: string }) {
+	return (
+		<div className="flex flex-1 items-center justify-center gap-2 text-[13px] text-working">
+			<span className="size-[12px] animate-spin rounded-full border-2 border-working border-t-transparent" />
+			{label}
+		</div>
+	);
 }
 
 /** The persisted PTY output, for panes with no Claude conversation behind them. */
@@ -389,6 +430,8 @@ function CatchUpCard({
 				),
 			),
 		);
+	// The notes you submitted - the question you saved for when it finished.
+	const hasTodos = usePaneMeta((s) => !!s.todosByPane[card.pane.id]);
 	const label = "mb-1.5 text-[11px] font-semibold uppercase tracking-[.4px]";
 	return (
 		<div className="flex min-h-0 flex-1 select-text cursor-text flex-col gap-6 overflow-y-auto px-8 py-7">
@@ -423,6 +466,12 @@ function CatchUpCard({
 					</div>
 				)}
 			</div>
+			{hasTodos && (
+				<div>
+					<div className={cn(label, "text-attention")}>Your to-dos</div>
+					<MyTodos paneId={card.pane.id} />
+				</div>
+			)}
 			{written?.status && (
 				<div>
 					<div className={cn(label, "text-muted-foreground")}>
@@ -512,7 +561,7 @@ function useDropFor(pane: Pane | undefined) {
 
 function DropPill({ pane }: { pane: Pane }) {
 	const row = useDropFor(pane);
-	return row ? <DropHint evidence={row.evidence} /> : null;
+	return row ? <DropHint row={row} /> : null;
 }
 
 /** Another live card is on the same ask. The click opens it, to Done one. */
@@ -809,6 +858,31 @@ function ShellPlaceMenu({ card, shell }: { card: BoardCard; shell: Pane }) {
 	const { data, here, inside, shellsIn } = useShellPlace(card, shell);
 	const write = electronTrpc.terminal.write.useMutation();
 	const updatePaneCwd = useTabsStore((s) => s.updatePaneCwd);
+	const openInApp = electronTrpc.external.openInApp.useMutation();
+	const copyText = electronTrpc.external.copyPath.useMutation();
+	/**
+	 * VS Code where the shell is, with the command that joins this
+	 * conversation on the clipboard for VS Code's terminal. Forked, so the two
+	 * don't both write into the live session.
+	 */
+	const openInVsCode = async (dir: string) => {
+		try {
+			await openInApp.mutateAsync({ path: dir, app: "vscode" });
+		} catch (error) {
+			return toast.error(`Couldn't open VS Code: ${String(error)}`);
+		}
+		const sessionId =
+			card.pane.claudeSessionId ??
+			usePaneMeta.getState().sessionIdByPane[card.pane.id];
+		if (!sessionId) return;
+		await copyText.mutateAsync(
+			`${claudeCli()} --resume ${sessionId} --fork-session`,
+		);
+		toast.success("Opened in VS Code", {
+			description:
+				"Paste in VS Code's terminal (⌃`) to join this session's conversation.",
+		});
+	};
 	const cd = (dir: string) => {
 		write.mutate({
 			paneId: shell.id,
@@ -886,6 +960,22 @@ function ShellPlaceMenu({ card, shell }: { card: BoardCard; shell: Pane }) {
 						<ShellsDot {...shellsIn(target.dir)} />
 					</DropdownMenuItem>
 				))}
+				{(here ?? targets[0]?.dir) && (
+					<>
+						<DropdownMenuSeparator />
+						<DropdownMenuItem
+							title="Open this folder in VS Code, with this conversation's resume command on the clipboard"
+							onSelect={() => {
+								const dir = here ?? targets[0]?.dir;
+								if (dir) void openInVsCode(dir);
+							}}
+							className="flex items-center gap-2 text-xs"
+						>
+							<span className="w-3" />
+							Open in VS Code
+						</DropdownMenuItem>
+					</>
+				)}
 			</DropdownMenuContent>
 		</DropdownMenu>
 	);
@@ -1831,19 +1921,23 @@ function DevBoardPage() {
 	 * session, so closing the drawer and coming back reattaches to that shell
 	 * (with its history) instead of leaving a new one behind every time.
 	 */
+	const claudeSessionIdOf = (card: BoardCard) =>
+		card.pane.claudeSessionId ??
+		usePaneMeta.getState().sessionIdByPane[card.pane.id];
+	/** Where the work is - the PR's worktree - not where the session launched. */
+	const workDirOf = async (card: BoardCard) => {
+		const sessionId = claudeSessionIdOf(card);
+		const repo = sessionId
+			? await utils.repos.workingRepoName
+					.fetch({ claudeSessionId: sessionId }, { staleTime: 60_000 })
+					.catch(() => null)
+			: null;
+		return repo?.worktree ?? repo?.checkout ?? sessionCwd(card.pane);
+	};
 	const openShell = async (card: BoardCard) => {
 		if (!shellPaneOf(card)) {
-			// Open where the work is - the PR's worktree - not where it launched.
-			const sessionId =
-				card.pane.claudeSessionId ??
-				usePaneMeta.getState().sessionIdByPane[card.pane.id];
-			const repo = sessionId
-				? await utils.repos.workingRepoName
-						.fetch({ claudeSessionId: sessionId }, { staleTime: 60_000 })
-						.catch(() => null)
-				: null;
 			const { paneId } = useTabsStore.getState().addTab(card.workspaceId, {
-				initialCwd: repo?.worktree ?? repo?.checkout ?? sessionCwd(card.pane),
+				initialCwd: await workDirOf(card),
 			});
 			// No odinTaskTitle: a shell you opened isn't a task, so it gets no card
 			// of its own on the board - same rule the session list uses.
@@ -2101,6 +2195,82 @@ function DevBoardPage() {
 		isProfileLoading,
 		customTags,
 	]);
+	// The drawer's session list: what's in flight. Idle is out - those are put
+	// down, not in progress. Starred first, then the picked sort; a turn ending
+	// or a question stamps odinStatusAt.
+	const [switchSort, setSwitchSort] = useState<SwitchSort>(() => {
+		try {
+			const saved = localStorage.getItem("odin:drawer-sessions-sort");
+			return saved && saved in SWITCH_SORTS ? (saved as SwitchSort) : "updated";
+		} catch {
+			return "updated";
+		}
+	});
+	const pickSwitchSort = (sort: SwitchSort) => {
+		setSwitchSort(sort);
+		try {
+			localStorage.setItem("odin:drawer-sessions-sort", sort);
+		} catch {}
+	};
+	// Grouped by status, Needs you comes first, then Final Review, then Working.
+	const [isSwitchGrouped, setIsSwitchGrouped] = useState(() => {
+		try {
+			return localStorage.getItem("odin:drawer-sessions-group") !== "0";
+		} catch {
+			return true;
+		}
+	});
+	const toggleSwitchGrouped = () => {
+		const next = !isSwitchGrouped;
+		setIsSwitchGrouped(next);
+		try {
+			localStorage.setItem("odin:drawer-sessions-group", next ? "1" : "0");
+		} catch {}
+	};
+	const statusRank = { permission: 0, review: 0, working: 1 } as const;
+	const groupRank = { permission: 0, review: 1, working: 2 } as const;
+	// Last update = the newest hook (every tool call fires one) or status change.
+	// odinStatusAt alone stays put for a whole turn, so an hour of work read as
+	// an hour stale. ponytail: hook times live in memory and reset on reload.
+	const updatedAt = (card: { pane: { id: string; odinStatusAt?: number } }) =>
+		Math.max(
+			card.pane.odinStatusAt ?? 0,
+			lastAgentHookAt.get(card.pane.id) ?? 0,
+		);
+	const switchCards = (["permission", "review", "working"] as const)
+		.flatMap((status) => cardsByStatus.get(status) ?? [])
+		.toSorted(
+			(a, b) =>
+				(isSwitchGrouped
+					? groupRank[a.status as keyof typeof groupRank] -
+						groupRank[b.status as keyof typeof groupRank]
+					: 0) ||
+				Number(!!b.pane.odinStarred) - Number(!!a.pane.odinStarred) ||
+				(switchSort === "status"
+					? statusRank[a.status as keyof typeof statusRank] -
+						statusRank[b.status as keyof typeof statusRank]
+					: 0) ||
+				(switchSort === "name"
+					? cardTitle(a).localeCompare(cardTitle(b))
+					: switchSort === "oldest"
+						? updatedAt(a) - updatedAt(b)
+						: updatedAt(b) - updatedAt(a)),
+		);
+	// Minimized to a rail of status dots; remembered per machine.
+	const [isSwitchListMin, setIsSwitchListMin] = useState(() => {
+		try {
+			return localStorage.getItem("odin:drawer-sessions-min") === "1";
+		} catch {
+			return false;
+		}
+	});
+	const toggleSwitchList = () => {
+		const next = !isSwitchListMin;
+		setIsSwitchListMin(next);
+		try {
+			localStorage.setItem("odin:drawer-sessions-min", next ? "1" : "0");
+		} catch {}
+	};
 	// Two cards on this board working the same ask: each names the other.
 	const duplicateOf = useMemo(() => {
 		const cards = [...cardsByStatus.values()].flat();
@@ -2120,6 +2290,15 @@ function DevBoardPage() {
 	// re-firing this is cheap.
 	const warmBriefs =
 		electronTrpc.terminal.warmClaudeSessionBriefs.useMutation();
+	// Each brief's STATUS line by session id - the drawer's session list shows
+	// it under the title. Comes back with every warm, so no call of its own.
+	const [briefStatus, setBriefStatus] = useState<Record<string, string>>({});
+	const switchStatus = (card: BoardCard) => {
+		const id =
+			card.pane.claudeSessionId ??
+			usePaneMeta.getState().sessionIdByPane[card.pane.id];
+		return id ? briefStatus[id] : undefined;
+	};
 	const { data: autoRename } =
 		electronTrpc.settings.getOdinAutoRenameSessions.useQuery();
 	// Each id carries whether its card stopped working, so a session finishing
@@ -2155,6 +2334,8 @@ function DevBoardPage() {
 				{
 					onSuccess: (r) => {
 						applyAutoTags(r.tags);
+						// Missing until main restarts onto the procedure that returns it.
+						setBriefStatus(r.statuses ?? {});
 						if (autoRename) applyAutoTitles(r.titles);
 					},
 				},
@@ -2167,11 +2348,11 @@ function DevBoardPage() {
 		return () => clearInterval(timer);
 	}, [briefSessionIds, autoRename]);
 
-	/** A quick question is no card, but its answer still opens in the drawer. */
-	const questionCard = (paneId: string): BoardCard | undefined => {
+	/** The crow's conversation is no card, but it still opens in the drawer. */
+	const crowCard = (paneId: string): BoardCard | undefined => {
 		const pane = panes[paneId];
 		const tab = tabs.find((t) => t.id === pane?.tabId);
-		if (!pane?.odinTags?.includes(QUESTION_TAG) || !tab) return undefined;
+		if (!pane?.odinTags?.includes(CROW_TAG) || !tab) return undefined;
 		const projectId = workspaceById.get(tab.workspaceId)?.projectId ?? "";
 		return {
 			pane,
@@ -2186,20 +2367,31 @@ function DevBoardPage() {
 	// A session just launched from the Tasks view → open its drawer here.
 	const pendingPaneId = usePendingFocus((s) => s.paneId);
 	const clearPendingFocus = usePendingFocus((s) => s.clear);
-	// biome-ignore lint/correctness/useExhaustiveDependencies: openDrawer and questionCard are new each render; the pending pane and the cards are the trigger
+	// biome-ignore lint/correctness/useExhaustiveDependencies: openDrawer and crowCard are new each render; the pending pane and the cards are the trigger
 	useEffect(() => {
 		if (!pendingPaneId) return;
 		const card =
 			[...cardsByStatus.values()]
 				.flat()
 				.concat(completedCards)
-				.find((c) => c.pane.id === pendingPaneId) ??
-			questionCard(pendingPaneId);
+				.find((c) => c.pane.id === pendingPaneId) ?? crowCard(pendingPaneId);
 		if (card) {
 			openDrawer(card);
 			clearPendingFocus();
+		} else if (panes[pendingPaneId] && (boardFilter || search)) {
+			// The board's filter or search hides it: asked for by name, so lift
+			// them and let this run again on the unfiltered cards.
+			setBoardFilter("");
+			setSearch("");
 		}
-	}, [pendingPaneId, cardsByStatus, completedCards, clearPendingFocus]);
+	}, [
+		pendingPaneId,
+		cardsByStatus,
+		completedCards,
+		clearPendingFocus,
+		boardFilter,
+		search,
+	]);
 
 	/**
 	 * Open a session's drawer. For a LIVE pane, purge the pane's cached xterm
@@ -2287,12 +2479,12 @@ function DevBoardPage() {
 	}, [drawerCard, alivePaneIds]);
 
 	/**
-	 * Type "Continue" at a live agent's prompt. Text and Enter go in separate
+	 * Type "Continue" (or `text`) at a live agent's prompt. Text and Enter go in separate
 	 * writes: claude's TUI reads a chunk ending in a newline as a paste and
 	 * inserts it instead of submitting.
 	 */
-	const sendContinue = async (paneId: string) => {
-		await terminalWrite.mutateAsync({ paneId, data: "Continue" });
+	const sendContinue = async (paneId: string, text = "Continue") => {
+		await terminalWrite.mutateAsync({ paneId, data: text });
 		await new Promise((resolve) => setTimeout(resolve, 50));
 		await terminalWrite.mutateAsync({ paneId, data: "\r" });
 	};
@@ -2312,19 +2504,18 @@ function DevBoardPage() {
 	 * What a Resume has to wait for - the same gate a launch waits on, since a
 	 * resumed agent takes a slot on the Mac like a new one. The card itself is
 	 * left out: a session that died mid-turn still reads "working" and would
-	 * otherwise hold its own checkout. A failed read lets it through.
+	 * otherwise hold its own checkout. A failed read lets it through. Huginn
+	 * never waits: he's how you free the Mac, not a session that loads it.
 	 */
 	const resumeBlocker = async (pane: Pane, cwd: string | undefined) => {
+		if (pane.odinTags?.includes(CROW_TAG)) return null;
 		try {
-			return launchBlocker(
-				await utils.client.resourceMetrics.getSnapshot.query(),
-				Object.values(useTabsStore.getState().panes).filter(
-					(other) => other.id !== pane.id,
-				),
+			return await currentLaunchBlocker(
+				utils.client,
 				pane.odinCwd ??
 					claimedCheckout(undefined, cwd ?? "", workConfig?.odinRepoPath),
 				workConfig?.odinRepoPath,
-				launchLimits(useLaunchLimits.getState()),
+				pane.id,
 			);
 		} catch {
 			return null;
@@ -2351,8 +2542,11 @@ function DevBoardPage() {
 		}));
 	};
 
-	/** Ctrl+C the turn. Shared by the drawer's Interrupt and the chat's stop. */
-	const resumeCard = async (card: BoardCard, auto = false) => {
+	/**
+	 * `prompt` replaces the opening "Continue" (or the idle prompt): a "Do it"
+	 * on an ended session reopens it already working on that item.
+	 */
+	const resumeCard = async (card: BoardCard, auto = false, prompt?: string) => {
 		if (resumingPaneIds.includes(card.pane.id)) return;
 		// Never started: there's no conversation to resume, only the launch that
 		// was held back. Run it now - that's what "Start now" meant on the toast
@@ -2384,6 +2578,9 @@ function DevBoardPage() {
 		// "Continue" typed at zsh is a command-not-found, not a resume.
 		const screen = visibleScreen(card.pane.id);
 		const shellOnScreen = screen.trim() !== "" && !agentOnScreen(screen);
+		const opening = prompt
+			? `'${prompt.replaceAll("'", "'\\''")}'`
+			: "Continue";
 		if (agentPaneIds.has(card.pane.id) && !shellOnScreen) {
 			if (!auto) openDrawer(card);
 			const blocker = await resumeBlocker(card.pane, sessionCwd(card.pane));
@@ -2398,13 +2595,13 @@ function DevBoardPage() {
 				}
 				queueResume(
 					card.pane,
-					`cd '${cwd}' && ${claudeCli()} --resume ${id} Continue`,
+					`cd '${cwd}' && ${claudeCli()} --resume ${id} ${opening}`,
 					blocker,
 				);
 				return;
 			}
 			try {
-				await sendContinue(card.pane.id);
+				await sendContinue(card.pane.id, prompt);
 			} catch (error) {
 				toast.error(error instanceof Error ? error.message : String(error));
 			}
@@ -2501,7 +2698,7 @@ function DevBoardPage() {
 			sessionId
 				? `${claudeCli()} --resume ${sessionId}`
 				: `${claudeCli()} --continue`
-		}${diedWorking ? " Continue" : ""}`;
+		}${diedWorking || prompt ? ` ${opening}` : ""}`;
 		// You resumed it to work in it - bring it up. The drawer swaps its
 		// read-only history for the live terminal once the PTY is back, and that
 		// terminal takes the keyboard. Auto-resume never steals the screen.
@@ -2509,7 +2706,8 @@ function DevBoardPage() {
 		// Only a Resume that goes back to work waits on the gate. One reopening
 		// at an idle prompt takes no working slot and holds no checkout - queuing
 		// it parked you behind every task in line, looking at the board.
-		const blocker = diedWorking ? await resumeBlocker(card.pane, cwd) : null;
+		const blocker =
+			diedWorking || prompt ? await resumeBlocker(card.pane, cwd) : null;
 		if (blocker) {
 			queueResume(
 				card.pane,
@@ -2730,6 +2928,17 @@ function DevBoardPage() {
 		toast.success("Parked in Idle - session still open", undoAction(undo));
 	};
 
+	const toggleStar = (paneId: string) =>
+		useTabsStore.setState((state) => ({
+			panes: {
+				...state.panes,
+				[paneId]: {
+					...state.panes[paneId],
+					odinStarred: !state.panes[paneId]?.odinStarred,
+				},
+			},
+		}));
+
 	/**
 	 * Done = end it and off the board. removePane kills the PTY and drops the
 	 * pane (and its tab, when it's the only one). There used to be a separate
@@ -2745,10 +2954,30 @@ function DevBoardPage() {
 		toast.success("Done - removed from board", undoAction(undo));
 	};
 
+	// The drawer's Done stays in the drawer: the next session opens and the
+	// finished row fades out of the side list before it ends.
+	const [leavingPaneId, setLeavingPaneId] = useState<string | null>(null);
+	const markDoneInDrawer = (card: BoardCard) => {
+		const at = switchCards.findIndex((c) => c.pane.id === card.pane.id);
+		const next = switchCards[at + 1] ?? switchCards[at - 1];
+		if (!next) return markDone(card);
+		setLeavingPaneId(card.pane.id);
+		openDrawer(next);
+		setTimeout(() => {
+			const undo = endCard(card);
+			setLeavingPaneId(null);
+			toast.success("Done - removed from board", undoAction(undo));
+		}, 450);
+	};
+
 	/**
 	 * Done, undoable: the PTY dies with the pane, so undo resumes the same
 	 * conversation (`claude --resume`) into a fresh pane, like Session History.
 	 */
+	// Every row, not just All's queue: a started Slack row has left the queue,
+	// and missing it here left it un-Done - back as new after a Slack reconnect.
+	const allTasks = useSearchableItems();
+	const { set: setRowDone } = useDone();
 	const endCard = (card: BoardCard) => {
 		const sessionId =
 			card.pane.claudeSessionId ??
@@ -2756,9 +2985,13 @@ function DevBoardPage() {
 		const cwd = sessionCwd(card.pane) ?? card.repoPath;
 		const title = cardTitle(card);
 		const brief = usePaneMeta.getState().briefByPane[card.pane.id];
+		// The feed row this session was started on is finished with it.
+		const row = allTasks.find((item) => paneWorksOn(card.pane, item));
+		if (row) setRowDone(row, true);
 		endSession(card.pane.id);
 		if (!sessionId) return;
 		return pushUndo(async () => {
+			if (row) setRowDone(row, false);
 			const result = await launch({
 				workspaceId: card.workspaceId,
 				title,
@@ -2799,6 +3032,34 @@ function DevBoardPage() {
 		enableOnFormTags: false,
 		enableOnContentEditable: false,
 	});
+	// ⌘⌥↑/↓ walk the drawer's session list; stops at either end.
+	const stepSession = (step: 1 | -1) => {
+		if (!drawerCard || inCatchUp) return;
+		const at = switchCards.findIndex(
+			(card) => card.pane.id === drawerCard.pane.id,
+		);
+		const card = switchCards[at + step];
+		if (card) openDrawer(card);
+	};
+	// The drawer + session list without hunting for a card: needs-you first.
+	const openSessions = () => {
+		const [first] = switchCards;
+		if (!first) return void toast.info("No sessions in flight");
+		openDrawer(first);
+	};
+	const { text: openSessionsKey } = useHotkey(
+		"ODIN_OPEN_SESSIONS",
+		() => {
+			if (!drawerCard) openSessions();
+		},
+		{ enableOnFormTags: false, enableOnContentEditable: false },
+	);
+	const { text: prevSessionKey } = useHotkey("PREV_SESSION", () =>
+		stepSession(-1),
+	);
+	const { text: nextSessionKey } = useHotkey("NEXT_SESSION", () =>
+		stepSession(1),
+	);
 
 	/** Catch up's next card (✓ Done ends this one first), or all caught up. */
 	const catchUpNext = (done: boolean) => {
@@ -2859,17 +3120,6 @@ function DevBoardPage() {
 					)}
 				>
 					+ New Session
-				</button>
-				<button
-					type="button"
-					title="Ask a Claude that's already running - no start-up wait (⌘⇧I)"
-					onClick={() => useQuickQuestionDialog.getState().setOpen(true)}
-					className={cn(
-						"rounded-lg px-2.5 py-1 text-[12px] font-semibold transition-colors",
-						BUTTON.secondary,
-					)}
-				>
-					Quick question
 				</button>
 				{isLaunching && (
 					<span className="text-xs text-muted-foreground">starting…</span>
@@ -2942,6 +3192,16 @@ function DevBoardPage() {
 					</select>
 				)}
 
+				<button
+					type="button"
+					onClick={openSessions}
+					disabled={switchCards.length === 0}
+					title={`Open the first session in flight, with the session list beside it (${openSessionsKey})`}
+					className="ml-auto flex items-center gap-1.5 rounded-full border border-border bg-card px-2.5 py-1 text-[12px] font-medium text-muted-foreground hover:text-foreground disabled:opacity-50"
+				>
+					<LuPanelLeft className="size-3.5" aria-hidden />
+					Open sessions
+				</button>
 				{/* A view toggle, not a filter - kept apart from search and the dropdown. */}
 				<button
 					type="button"
@@ -2953,7 +3213,7 @@ function DevBoardPage() {
 							: "Show the tasks worth starting next"
 					}
 					className={cn(
-						"ml-auto flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[12px] font-medium",
+						"flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[12px] font-medium",
 						isNextOpen
 							? "border-primary bg-primary/15 text-foreground"
 							: "border-border bg-card text-muted-foreground hover:text-foreground",
@@ -2990,17 +3250,7 @@ function DevBoardPage() {
 										.keep(activeProfileId, tagMenuDrop.key)
 							: undefined
 					}
-					onStar={() =>
-						useTabsStore.setState((state) => ({
-							panes: {
-								...state.panes,
-								[tagMenu.paneId]: {
-									...state.panes[tagMenu.paneId],
-									odinStarred: !state.panes[tagMenu.paneId]?.odinStarred,
-								},
-							},
-						}))
-					}
+					onStar={() => toggleStar(tagMenu.paneId)}
 					onToggle={(tag) => toggleTag(tagMenu.paneId, tag)}
 					onClose={() => setTagMenu(null)}
 				/>
@@ -3020,10 +3270,11 @@ function DevBoardPage() {
 								focusedAt,
 							) > 0,
 					);
-					// One section is just the column - don't label it, unless it's
-					// Parked: "you put these down" is worth saying on its own.
+					// One section is just the column - don't label it, unless it says
+					// something on its own (Starred, Parked: "you put these down").
 					const labelled =
 						sections.length > 1 ||
+						sections[0]?.[0] === "starred" ||
 						sections[0]?.[0] === "recent" ||
 						sections[0]?.[0] === "parked" ||
 						sections[0]?.[0] === "queued";
@@ -3065,7 +3316,8 @@ function DevBoardPage() {
 								// The column wears its status: a hairline of the hue along the
 								// top and a wash that fades out under the header. The cards
 								// stay neutral - the colour says where they are, not what.
-								"relative flex min-w-[240px] flex-1 flex-col overflow-hidden rounded-xl border bg-tertiary/85 bg-[linear-gradient(to_bottom,color-mix(in_oklab,var(--col)_9%,transparent),transparent_160px)]",
+								BOARD_COLUMN_MIN_W,
+								"relative flex flex-1 flex-col overflow-hidden rounded-xl border bg-tertiary/85 bg-[linear-gradient(to_bottom,color-mix(in_oklab,var(--col)_9%,transparent),transparent_160px)]",
 								isDropTarget && dragOverIdle
 									? "border-primary bg-primary/15"
 									: "border-border",
@@ -3182,14 +3434,6 @@ function DevBoardPage() {
 															>
 																<div className="flex items-start gap-2">
 																	<div className="min-w-0 flex-1 break-words text-[12.5px] font-semibold">
-																		{card.pane.odinStarred && (
-																			<span
-																				title="Starred"
-																				className="mr-1 text-attention"
-																			>
-																				★
-																			</span>
-																		)}
 																		<OverdueMark
 																			itemKey={`session:${card.pane.id}`}
 																		/>
@@ -3197,14 +3441,41 @@ function DevBoardPage() {
 																	</div>
 																	<button
 																		type="button"
+																		title={
+																			card.pane.odinStarred
+																				? "Unstar"
+																				: "Star - pin to the top"
+																		}
+																		aria-pressed={!!card.pane.odinStarred}
+																		onClick={(event) => {
+																			event.stopPropagation();
+																			toggleStar(card.pane.id);
+																		}}
+																		className={cn(
+																			"shrink-0 rounded-[5px] px-1 text-[12px] text-attention transition-opacity hover:bg-attention/15",
+																			!card.pane.odinStarred &&
+																				"opacity-0 group-hover:opacity-100",
+																		)}
+																	>
+																		{card.pane.odinStarred ? "★" : "☆"}
+																	</button>
+																	<button
+																		type="button"
 																		title="Done - remove from the board"
 																		onClick={(event) => {
 																			event.stopPropagation();
 																			markDone(card);
 																		}}
-																		className="shrink-0 rounded-[5px] px-1.5 text-[11px] text-muted-foreground opacity-0 transition-opacity hover:bg-success/15 hover:text-success group-hover:opacity-100"
+																		className={cn(
+																			"shrink-0 whitespace-nowrap",
+																			// Final review is where a card waits for you to close it,
+																			// so Done is the always-visible green pill there.
+																			card.status === "review"
+																				? `rounded-[7px] px-2.5 py-1 text-xs font-semibold transition-colors ${BUTTON.done}`
+																				: "rounded-[5px] px-1.5 text-[11px] text-muted-foreground opacity-0 transition-opacity hover:bg-success/15 hover:text-success group-hover:opacity-100",
+																		)}
 																	>
-																		✓ done
+																		✓ Done
 																	</button>
 																	<RemindButton
 																		onPick={(day) => remindMe(card, day)}
@@ -3437,6 +3708,12 @@ function DevBoardPage() {
 																					⏸ died mid-turn
 																				</span>
 																			)}
+																			{card.pane.status !== "working" &&
+																				card.pane.odinExitCause && (
+																					<span className="select-text cursor-text truncate text-[11.5px] text-danger">
+																						✗ {card.pane.odinExitCause}
+																					</span>
+																				)}
 																			<button
 																				type="button"
 																				onClick={(event) => {
@@ -3544,7 +3821,7 @@ function DevBoardPage() {
 					    traffic lights, and the native buttons eat the click. */}
 					<div
 						className={cn(
-							"absolute z-50 flex flex-col bg-tertiary",
+							"@container absolute z-50 flex flex-col bg-tertiary",
 							inCatchUp
 								? // Two cards peeking out underneath: the rest of the pile.
 									"bottom-[92px] left-1/2 top-12 w-[min(760px,calc(100%-32px))] -translate-x-1/2 overflow-hidden rounded-[26px] border border-border shadow-[0_8px_0_-3px_var(--card),0_16px_0_-6px_var(--tertiary)]"
@@ -3578,14 +3855,14 @@ function DevBoardPage() {
 								›
 							</button>
 						)}
-						<div className="border-b border-border px-4 py-3.5">
+						<div className="border-b border-border px-4 py-2">
 							<div className="flex items-center gap-2">
 								{renameDraft === null ? (
 									<button
 										type="button"
 										title="Click to rename this session"
 										onClick={() => setRenameDraft(cardTitle(drawerCard))}
-										className="min-w-0 flex-1 truncate text-left text-sm font-semibold hover:text-primary"
+										className="min-w-0 truncate text-left text-sm font-semibold hover:text-primary"
 									>
 										{cardTitle(drawerCard)}
 									</button>
@@ -3604,6 +3881,49 @@ function DevBoardPage() {
 										className="min-w-0 flex-1 rounded-md border border-primary bg-background px-2 py-1 text-sm font-semibold text-foreground outline-none"
 									/>
 								)}
+								<div className="mr-auto flex min-w-0 items-center gap-1.5 overflow-hidden whitespace-nowrap">
+									{cardContact(drawerCard) && (
+										<PersonChip name={cardContact(drawerCard) as string} />
+									)}
+									{drawerLink && (
+										<button
+											type="button"
+											title={drawerLink.url}
+											onClick={() => openUrl(drawerLink.url)}
+											className={cn(
+												"rounded-[5px] px-[7px] text-[11px] font-medium hover:underline",
+												PILL.brand,
+											)}
+										>
+											{drawerLink.label} ↗
+										</button>
+									)}
+									{sessionCwd(drawerCard.pane) && (
+										<span
+											title={sessionCwd(drawerCard.pane)}
+											className="rounded-[5px] bg-secondary px-[7px] text-[11px] text-muted-foreground"
+										>
+											{sessionCwd(drawerCard.pane)?.split("/").slice(-1)[0]}
+										</span>
+									)}
+									<span className="rounded-[5px] bg-secondary px-[7px] text-[11px] text-muted-foreground">
+										{PANE_STATUS[drawerCard.status].label}
+									</span>
+									<button
+										type="button"
+										title={
+											drawerCard.pane.odinStarred
+												? "Unstar"
+												: "Star - pin to the top"
+										}
+										aria-label={drawerCard.pane.odinStarred ? "Unstar" : "Star"}
+										aria-pressed={!!drawerCard.pane.odinStarred}
+										onClick={() => toggleStar(drawerCard.pane.id)}
+										className="shrink-0 rounded-[5px] px-1 text-[13px] text-attention hover:bg-attention/15"
+									>
+										{drawerCard.pane.odinStarred ? "★" : "☆"}
+									</button>
+								</div>
 								{drawerCard.pane.type === "terminal" && !inCatchUp && (
 									<button
 										type="button"
@@ -3692,35 +4012,6 @@ function DevBoardPage() {
 									</button>
 								)}
 							</div>
-							<div className="mt-1.5 flex flex-wrap gap-1.5">
-								{cardContact(drawerCard) && (
-									<PersonChip name={cardContact(drawerCard) as string} />
-								)}
-								{drawerLink && (
-									<button
-										type="button"
-										title={drawerLink.url}
-										onClick={() => openUrl(drawerLink.url)}
-										className={cn(
-											"rounded-[5px] px-[7px] text-[11px] font-medium hover:underline",
-											PILL.brand,
-										)}
-									>
-										{drawerLink.label} ↗
-									</button>
-								)}
-								{sessionCwd(drawerCard.pane) && (
-									<span
-										title={sessionCwd(drawerCard.pane)}
-										className="rounded-[5px] bg-secondary px-[7px] text-[11px] text-muted-foreground"
-									>
-										{sessionCwd(drawerCard.pane)?.split("/").slice(-1)[0]}
-									</span>
-								)}
-								<span className="rounded-[5px] bg-secondary px-[7px] text-[11px] text-muted-foreground">
-									{PANE_STATUS[drawerCard.status].label}
-								</span>
-							</div>
 						</div>
 						{catchUpLean ? (
 							<CatchUpCard
@@ -3732,17 +4023,193 @@ function DevBoardPage() {
 						) : (
 							/* terminal on the left, "what's going on" brief on the right */
 							<div className="flex min-h-0 flex-1">
+								{/* The other sessions in flight, one click away - no Minimize
+								    and hunt for the card on the board. Hidden on a narrow
+								    drawer, where the chat needs the room. */}
+								{!inCatchUp && switchCards.length > 1 && (
+									<nav
+										aria-label="Sessions"
+										className={cn(
+											"hidden shrink-0 flex-col overflow-y-auto border-r border-border py-1.5 @3xl:flex",
+											isSwitchListMin ? "w-8" : "w-[210px]",
+										)}
+									>
+										<button
+											type="button"
+											title={
+												isSwitchListMin
+													? "Show session list"
+													: "Minimize session list"
+											}
+											aria-label={
+												isSwitchListMin
+													? "Show session list"
+													: "Minimize session list"
+											}
+											onClick={toggleSwitchList}
+											className={cn(
+												"mb-1 flex h-6 shrink-0 items-center text-muted-foreground hover:text-foreground",
+												isSwitchListMin ? "justify-center" : "justify-end px-2",
+											)}
+										>
+											{isSwitchListMin ? (
+												<LuChevronRight className="size-3.5" />
+											) : (
+												<LuChevronLeft className="size-3.5" />
+											)}
+										</button>
+										{!isSwitchListMin && (
+											<div className="mb-1 flex items-center gap-1.5 px-3 text-[11px] text-muted-foreground">
+												<select
+													value={switchSort}
+													onChange={(e) =>
+														pickSwitchSort(e.target.value as SwitchSort)
+													}
+													aria-label="Sort sessions"
+													title="Sort sessions"
+													className="min-w-0 cursor-pointer rounded border border-border bg-card px-1 py-0.5 outline-none hover:text-foreground"
+												>
+													{Object.entries(SWITCH_SORTS).map(
+														([value, label]) => (
+															<option key={value} value={value}>
+																{label}
+															</option>
+														),
+													)}
+												</select>
+												<button
+													type="button"
+													onClick={toggleSwitchGrouped}
+													aria-pressed={isSwitchGrouped}
+													title="Group by status"
+													className={cn(
+														"shrink-0 rounded border px-1 py-0.5 hover:text-foreground",
+														isSwitchGrouped
+															? "border-primary/50 bg-primary/15 text-foreground"
+															: "border-border bg-card",
+													)}
+												>
+													Group
+												</button>
+												<span
+													className="ml-auto shrink-0 font-mono"
+													title={`Previous session ${prevSessionKey} - next session ${nextSessionKey}`}
+												>
+													{prevSessionKey} {nextSessionKey}
+												</span>
+											</div>
+										)}
+										{switchCards.map((card, index) => (
+											<Fragment key={card.pane.id}>
+												{isSwitchGrouped &&
+													card.status !== switchCards[index - 1]?.status &&
+													(isSwitchListMin ? (
+														index > 0 && (
+															<div className="mx-2 my-1 border-t border-border" />
+														)
+													) : (
+														<div className="mt-2 mb-0.5 px-3 text-[10px] font-semibold uppercase tracking-[.4px] text-muted-foreground">
+															{PANE_STATUS[card.status].label}
+														</div>
+													))}
+												<HoverCard openDelay={350}>
+													<HoverCardTrigger asChild>
+														<button
+															type="button"
+															onClick={() => openDrawer(card)}
+															className={cn(
+																"group/switch flex items-center gap-2 py-1.5 text-left text-xs transition-all duration-[450ms]",
+																isSwitchListMin ? "justify-center" : "px-3",
+																card.pane.id === leavingPaneId
+																	? "pointer-events-none -translate-x-6 bg-success/20 text-success-ink opacity-0"
+																	: card.pane.id === drawerCard.pane.id
+																		? "bg-primary/15 font-semibold text-foreground"
+																		: "text-muted-foreground hover:bg-accent hover:text-foreground",
+															)}
+														>
+															<span
+																className="size-2 shrink-0 rounded-full"
+																style={{
+																	background: PANE_STATUS[card.status].dot,
+																}}
+															/>
+															{!isSwitchListMin && (
+																<span className="flex min-w-0 flex-col">
+																	<span className="truncate">
+																		{cardTitle(card)}
+																	</span>
+																	{switchStatus(card) && (
+																		<span className="truncate text-[10.5px] font-normal text-faint-foreground">
+																			{switchStatus(card)}
+																		</span>
+																	)}
+																</span>
+															)}
+															{!isSwitchListMin && (
+																// ponytail: a span, not a button - it sits inside the row's button.
+																// biome-ignore lint/a11y/useSemanticElements: nested in a button
+																<span
+																	role="button"
+																	tabIndex={-1}
+																	title={
+																		card.pane.odinStarred
+																			? "Unstar"
+																			: "Star - pin to the top"
+																	}
+																	aria-label={
+																		card.pane.odinStarred ? "Unstar" : "Star"
+																	}
+																	aria-pressed={!!card.pane.odinStarred}
+																	onClick={(event) => {
+																		event.stopPropagation();
+																		toggleStar(card.pane.id);
+																	}}
+																	onKeyDown={() => {}}
+																	className={cn(
+																		"ml-auto shrink-0 rounded-[4px] px-0.5 text-attention hover:bg-attention/15",
+																		!card.pane.odinStarred &&
+																			"opacity-0 group-hover/switch:opacity-100",
+																	)}
+																>
+																	{card.pane.odinStarred ? "★" : "☆"}
+																</span>
+															)}
+														</button>
+													</HoverCardTrigger>
+													<HoverCardContent
+														side="right"
+														align="start"
+														className="max-h-[70vh] w-[400px] overflow-y-auto border-input bg-secondary p-3 shadow-[0_12px_40px_rgba(0,0,0,0.75)]"
+													>
+														<CardHoverContent
+															card={card}
+															text={cardText(card)}
+														/>
+													</HoverCardContent>
+												</HoverCard>
+											</Fragment>
+										))}
+									</nav>
+								)}
 								<div className="flex min-h-0 min-w-0 flex-1 flex-col">
 									{isShellOpen && drawerShell ? (
 										// A shell in the same checkout, mounted like any other pane -
 										// it spawns on first mount with the session's cwd.
-										<div className="min-h-0 flex-1 bg-background p-2">
-											<Terminal
-												key={drawerShell.id}
-												paneId={drawerShell.id}
-												tabId={drawerShell.tabId}
-												workspaceId={drawerCard.workspaceId}
-											/>
+										<div className="flex min-h-0 flex-1 flex-col bg-background">
+											<div className="flex items-center gap-2 border-b border-border px-4 py-1.5 text-[10px] font-semibold uppercase tracking-[.4px] text-muted-foreground">
+												<span className="rounded bg-primary/15 px-1.5 py-0.5 normal-case tracking-normal text-primary">
+													❯ Shell
+												</span>
+												Your terminal - ❯ Shell again goes back to the session
+											</div>
+											<div className="min-h-0 flex-1 p-2">
+												<Terminal
+													key={drawerShell.id}
+													paneId={drawerShell.id}
+													tabId={drawerShell.tabId}
+													workspaceId={drawerCard.workspaceId}
+												/>
+											</div>
 										</div>
 									) : isDiffOpen &&
 										!inCatchUp &&
@@ -3795,19 +4262,28 @@ function DevBoardPage() {
 												workspaceId={drawerCard.workspaceId}
 											/>
 										</div>
-									) : resumingPaneIds.includes(drawerCard.pane.id) ? (
+									) : resumingPaneIds.includes(drawerCard.pane.id) ||
+										panes[drawerCard.pane.id]?.odinQueued ? (
 										// Between the click and the PTY coming up, "Session ended"
-										// history reads as if Resume did nothing.
-										<div className="flex flex-1 items-center justify-center gap-2 text-[13px] text-working">
-											<span className="size-[12px] animate-spin rounded-full border-2 border-working border-t-transparent" />
-											{drawerCard.pane.odinQueued
-												? "Starting session…"
-												: "Resuming session…"}
-										</div>
+										// history reads as if Resume did nothing. A queued task has
+										// no history at all yet - it's waiting for a free slot.
+										<StartingView
+											label={
+												resumingPaneIds.includes(drawerCard.pane.id)
+													? panes[drawerCard.pane.id]?.odinQueued
+														? "Starting session…"
+														: "Resuming session…"
+													: `Waiting to start - ${panes[drawerCard.pane.id]?.odinQueued?.reason}`
+											}
+										/>
 									) : (
 										// Claude has exited - the PTY is dead, or a bare zsh outlived
 										// the conversation. Show the conversation, read-only.
-										<HistoryView card={drawerCard} live={false} />
+										<HistoryView
+											card={drawerCard}
+											live={false}
+											onDo={(text) => void resumeCard(drawerCard, false, text)}
+										/>
 									)}
 								</div>
 								{isBriefOpen && (
@@ -3819,6 +4295,11 @@ function DevBoardPage() {
 										marker={cardTitle(drawerCard)}
 										live={alivePaneIds.has(drawerCard.pane.id)}
 										launch={drawerCard.pane.odinBrief}
+										starting={
+											!!panes[drawerCard.pane.id]?.odinQueued ||
+											resumingPaneIds.includes(drawerCard.pane.id) ||
+											drawerCard.pane.status === "working"
+										}
 									/>
 								)}
 							</div>
@@ -3925,7 +4406,7 @@ function DevBoardPage() {
 							{!inCatchUp && (
 								<button
 									type="button"
-									onClick={() => markDone(drawerCard)}
+									onClick={() => markDoneInDrawer(drawerCard)}
 									title="Done - end the session and remove it from the board"
 									className={cn(
 										"rounded-[7px] px-3 py-1.5 text-xs font-semibold",

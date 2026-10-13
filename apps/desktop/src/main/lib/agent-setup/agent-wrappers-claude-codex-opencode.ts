@@ -188,7 +188,8 @@ export function getClaudeGlobalSettingsJsonContent(
 			| "PreToolUse"
 			| "PostToolUse"
 			| "PostToolUseFailure"
-			| "PermissionRequest";
+			| "PermissionRequest"
+			| "PreCompact";
 		definition: ClaudeHookDefinition;
 	}> = [
 		{
@@ -256,6 +257,12 @@ export function getClaudeGlobalSettingsJsonContent(
 				hooks: [{ type: "command", command: managedHookCommand }],
 			},
 		},
+		{
+			// The chat view says "Compacting" while it runs - the transcript stays
+			// silent until the summary lands.
+			eventName: "PreCompact",
+			definition: { hooks: [{ type: "command", command: managedHookCommand }] },
+		},
 		// Machine-wide cap on concurrent subagents (templates/subagent-cap.template.sh).
 		{
 			eventName: "PreToolUse",
@@ -289,6 +296,10 @@ export function getClaudeGlobalSettingsJsonContent(
 	if (existing.hooks.SubagentStop.length === 0) {
 		delete existing.hooks.SubagentStop;
 	}
+	// Odin launches Claude with --dangerously-skip-permissions. Without this
+	// key the CLI opens its one-time "Bypass Permissions mode" warning, which
+	// defaults to "No, exit" and leaves a task session stuck on it.
+	existing.skipDangerousModePermissionPrompt = true;
 
 	return JSON.stringify(existing, null, 2);
 }

@@ -9,16 +9,23 @@ import { cn } from "@odin/ui/utils";
 import type { WebviewTag } from "electron";
 import { useEffect, useRef, useState } from "react";
 import {
+	HiArrowDownTray,
 	HiArrowLeft,
 	HiArrowPath,
 	HiArrowRight,
 	HiArrowTopRightOnSquare,
 	HiChevronDown,
 	HiChevronUp,
+	HiKey,
+	HiLink,
 	HiXMark,
 } from "react-icons/hi2";
 import { useZoomFactor } from "renderer/hooks/useZoomFactor";
-import { getDispatchChord, matchesChord } from "renderer/hotkeys";
+import {
+	getDispatchChord,
+	matchesChord,
+	useHotkeyDisplay,
+} from "renderer/hotkeys";
 import { electronTrpc } from "renderer/lib/electron-trpc";
 import {
 	type SlackThread,
@@ -55,6 +62,32 @@ const copyLink = (webview: WebviewTag, copyText: (text: string) => void) => {
 	copyText(webview.getURL());
 	toast("Link copied");
 };
+
+/**
+ * Fills the page's sign-in form. Values go in through the native setter and
+ * an input event, so a framework-controlled field (React) keeps them.
+ */
+const fillLoginScript = ({
+	username,
+	password,
+}: {
+	username: string;
+	password: string;
+}) => `(() => {
+	const password = document.querySelector("input[type=password]");
+	if (!password) return false;
+	const set = (el, value) => {
+		Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(el, value);
+		el.dispatchEvent(new Event("input", { bubbles: true }));
+		el.dispatchEvent(new Event("change", { bubbles: true }));
+	};
+	const user = [...document.querySelectorAll("input")].filter((el) =>
+		["", "text", "email"].includes(el.type) && el.compareDocumentPosition(password) & Node.DOCUMENT_POSITION_FOLLOWING,
+	).at(-1);
+	if (user) set(user, ${JSON.stringify(username)});
+	set(password, ${JSON.stringify(password)});
+	return true;
+})()`;
 
 /** What a page in the panel logs when Esc goes unhandled there. */
 const ESCAPE_SIGNAL = "odin:in-app-browser:escape";
@@ -242,6 +275,12 @@ export function InAppBrowser() {
 	const [resizing, setResizing] = useState(false);
 	const openExternal = electronTrpc.external.openUrl.useMutation();
 	const { mutate: copyText } = electronTrpc.external.copyText.useMutation();
+	const copyLinkKeys = useHotkeyDisplay("ODIN_COPY_LINK").text;
+	const onePassword = electronTrpc.browser.onePasswordLogin.useMutation();
+	const importCookies = electronTrpc.browser.importCookies.useMutation();
+	const { mutate: importOnLaunch } =
+		electronTrpc.browser.importCookiesOnLaunch.useMutation();
+	const askedToImport = useRef(false);
 	// Each site's first link. Its page stays loaded while the panel is
 	// closed, so the next link doesn't start the site over.
 	const [sites, setSites] = useState<Partial<Record<Site, string>>>({});
@@ -251,6 +290,52 @@ export function InAppBrowser() {
 	// `views` alone, each re-render looked like a new site and took the keyboard
 	// back from whatever you were typing in (the chat box, beside the panel).
 	const focusedViews = useRef(new WeakSet<Element>());
+	const reloadAll = () => {
+		for (const webview of Object.values(views.current)) {
+			try {
+				webview?.reload();
+			} catch {
+				// Not attached yet; it loads with the new cookies anyway.
+			}
+		}
+	};
+	// The menu item, and the offer below. Only this one shows macOS's Keychain
+	// prompt, and only the first time per browser.
+	const importSignIns = () =>
+		importCookies.mutate(undefined, {
+			onSuccess: (result) => {
+				if (!result) return;
+				toast(`Signed in like ${result.browser}`, {
+					description: `${result.imported} cookies from ${result.profile}, refreshed each launch.`,
+				});
+				reloadAll();
+			},
+			onError: (error) => toast(error.message),
+		});
+	// Sites open signed in like your everyday browser: once you've imported,
+	// its cookies come over again the first time the panel opens each launch.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: importSignIns and reloadAll only read refs and a stable mutation.
+	useEffect(() => {
+		if (!url || askedToImport.current) return;
+		askedToImport.current = true;
+		importOnLaunch(undefined, {
+			onSuccess: (result) => {
+				if (result === "offer") {
+					toast("Open sites signed in?", {
+						description:
+							"Odin can copy the sign-ins from your browser. macOS asks once for Keychain access - choose Always Allow.",
+						duration: 30_000,
+						action: { label: "Import", onClick: importSignIns },
+					});
+				} else if (result) {
+					toast(`Signed in like ${result.browser}`, {
+						description: `${result.imported} cookies from ${result.profile}, refreshed each launch.`,
+					});
+					reloadAll();
+				}
+			},
+		});
+	}, [url, importOnLaunch]);
 	const [pages, setPages] = useState<
 		Partial<Record<Site, { title: string; url: string }>>
 	>({});
@@ -502,6 +587,33 @@ export function InAppBrowser() {
 					>
 						<HiArrowPath className="size-4" />
 					</button>
+					<button
+						type="button"
+						title="Fill login from 1Password"
+						className={ICON_BUTTON}
+						onClick={() => {
+							const webview = view();
+							if (!webview) return;
+							onePassword.mutate(
+								{ url: webview.getURL() },
+								{
+									onSuccess: async (login) => {
+										if (!login) {
+											toast("No 1Password login for this site");
+											return;
+										}
+										const filled = await webview.executeJavaScript(
+											fillLoginScript(login),
+										);
+										if (!filled) toast("No password field on this page");
+									},
+									onError: (error) => toast(error.message),
+								},
+							);
+						}}
+					>
+						<HiKey className="size-4" />
+					</button>
 					<span
 						title={page.url}
 						className="min-w-0 flex-1 truncate px-2 text-[13px] text-muted-foreground"
@@ -563,6 +675,21 @@ export function InAppBrowser() {
 							</button>
 						</div>
 					)}
+					<button
+						type="button"
+						title={
+							copyLinkKeys === "Unassigned"
+								? "Copy link"
+								: `Copy link (${copyLinkKeys})`
+						}
+						className={ICON_BUTTON}
+						onClick={() => {
+							const webview = view();
+							if (webview) copyLink(webview, copyText);
+						}}
+					>
+						<HiLink className="size-4" />
+					</button>
 					<div className="flex">
 						<button
 							type="button"
@@ -603,6 +730,10 @@ export function InAppBrowser() {
 								>
 									<HiArrowTopRightOnSquare className="size-3.5" />
 									Always open links in your browser
+								</DropdownMenuItem>
+								<DropdownMenuItem onSelect={importSignIns}>
+									<HiArrowDownTray className="size-3.5" />
+									Import sign-ins from your browser
 								</DropdownMenuItem>
 							</DropdownMenuContent>
 						</DropdownMenu>

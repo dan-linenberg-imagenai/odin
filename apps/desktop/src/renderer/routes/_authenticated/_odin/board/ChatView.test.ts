@@ -2,9 +2,20 @@ import { describe, expect, test } from "bun:test";
 import {
 	actionItemList,
 	applyLines,
-	groupSummary,
+	elapsedLabel,
+	isAnswerItem,
+	isApprovalItem,
+	isDoneItem,
+	isYouOnly,
+	itemOptions,
+	launchAttachments,
+	launchRequest,
+	outputTokens,
 	segments,
 	splitActionItems,
+	splitEarlier,
+	tokenLabel,
+	toolDescription,
 	transcriptPath,
 	userText,
 } from "./ChatView";
@@ -29,7 +40,7 @@ describe("ChatView transcript", () => {
 		).toBe("ok\n\nwarn");
 	});
 
-	test("a message sent mid-turn shows as yours", () => {
+	test("a message sent mid-turn shows as yours, its image too", () => {
 		const items = applyLines(
 			[],
 			[
@@ -38,12 +49,29 @@ describe("ChatView transcript", () => {
 					uuid: "q1",
 					attachment: {
 						type: "queued_command",
-						prompt: [{ type: "text", text: "also this" }],
+						prompt: [
+							{ type: "text", text: "also this[Image #1]" },
+							{
+								type: "image",
+								source: {
+									type: "base64",
+									media_type: "image/png",
+									data: "AAAA",
+								},
+							},
+						],
 					},
 				},
 			],
 		);
-		expect(items).toEqual([{ kind: "user", id: "q1", text: "also this" }]);
+		expect(items).toEqual([
+			{
+				kind: "user",
+				id: "q1:0",
+				text: "also this",
+				images: ["data:image/png;base64,AAAA"],
+			},
+		]);
 	});
 
 	test("a pasted image shows in its bubble, minus the [Image #N] tag", () => {
@@ -76,6 +104,38 @@ describe("ChatView transcript", () => {
 				id: "u2",
 				text: "",
 				images: ["data:image/png;base64,AAAA"],
+			},
+		]);
+	});
+
+	test("a compaction is one row with its summary folded in, not a message", () => {
+		const items = applyLines(
+			[],
+			[
+				{
+					type: "system",
+					subtype: "compact_boundary",
+					uuid: "b",
+					timestamp: "2026-10-08T09:32:51.520Z",
+					compactMetadata: { preTokens: 378462, postTokens: 41000 },
+				},
+				{
+					type: "user",
+					uuid: "s",
+					isCompactSummary: true,
+					message: { content: "Summary: long" },
+				},
+			],
+		);
+		expect(items).toEqual([
+			{
+				kind: "compact",
+				id: "b",
+				at: Date.parse("2026-10-08T09:32:51.520Z"),
+				preTokens: 378462,
+				postTokens: 41000,
+				durationMs: undefined,
+				summary: "Summary: long",
 			},
 		]);
 	});
@@ -119,7 +179,7 @@ describe("ChatView transcript", () => {
 		expect(done[0]).toBe(items[0]);
 	});
 
-	test("tool runs fold into one group with a counted summary", () => {
+	test("tool runs fold into one group", () => {
 		const tool = (id: string, name: string) =>
 			({ kind: "tool", id, name, input: {} }) as const;
 		const out = segments([
@@ -130,7 +190,30 @@ describe("ChatView transcript", () => {
 			{ kind: "text", id: "b", text: "done" },
 		]);
 		expect(out.length).toBe(3);
-		expect(groupSummary(out[1] as never)).toBe("Ran 2 commands, read 1 file");
+		expect((out[1] as unknown[]).length).toBe(3);
+	});
+
+	test("narration between two runs stays visible; only tools fold", () => {
+		const tool = (id: string, name: string) =>
+			({ kind: "tool", id, name, input: {} }) as const;
+		const out = segments([
+			{ kind: "text", id: "a", text: "first" },
+			tool("1", "Bash"),
+			{ kind: "text", id: "b", text: "next" },
+			tool("2", "Bash"),
+			{ kind: "text", id: "c", text: "and" },
+			tool("3", "Write"),
+			{ kind: "text", id: "d", text: "done" },
+		]);
+		expect(out.map((s) => (Array.isArray(s) ? s.length : s.id))).toEqual([
+			"a",
+			1,
+			"b",
+			1,
+			"c",
+			1,
+			"d",
+		]);
 	});
 
 	test("action items split off in the shapes agents write them", () => {
@@ -155,5 +238,209 @@ describe("ChatView transcript", () => {
 		]);
 		expect(actionItemList("- a\n* b")).toEqual(["a", "b"]);
 		expect(actionItemList("none - all shipped")).toEqual([]);
+	});
+
+	test("an item asking you to approve something gets the Approve button", () => {
+		expect(
+			isApprovalItem("Approve a commit and PR, or tell me to hold. (you only)"),
+		).toBe(true);
+		expect(isApprovalItem("**Approve** the plan")).toBe(true);
+		expect(isApprovalItem("Decide whether to approve the PR")).toBe(false);
+		expect(isApprovalItem("Approved PRs need nothing")).toBe(false);
+	});
+
+	test("an item asking you to tell Claude something gets a reply box", () => {
+		expect(isAnswerItem("Tell me the target seniority.")).toBe(true);
+		expect(isAnswerItem("**Pick** a name")).toBe(true);
+		expect(isAnswerItem("Merge PR #12")).toBe(false);
+		expect(
+			isAnswerItem("Tell me when you have authorized, so I can run the test."),
+		).toBe(false);
+		expect(
+			isDoneItem("Tell me when you have authorized, so I can run the test."),
+		).toBe(true);
+		expect(isDoneItem("Let me know once it is merged")).toBe(true);
+		expect(isDoneItem("Tell me the target seniority.")).toBe(false);
+		expect(isDoneItem("Tell me when to ship [today | tomorrow]")).toBe(false);
+	});
+
+	test("trailing [A | B] choices become buttons", () => {
+		expect(itemOptions("Tell me the format [CSV | shareable page].")).toEqual({
+			text: "Tell me the format",
+			options: ["CSV", "shareable page"],
+		});
+		expect(itemOptions("Open [the PR](https://x)").options).toEqual([]);
+		expect(
+			itemOptions(
+				"Update main now. [yes | after [#826](https://x/826) merges]",
+			),
+		).toEqual({
+			text: "Update main now.",
+			options: ["yes", "after #826 merges"],
+		});
+		expect(itemOptions("Tell me the seniority.").options).toEqual([]);
+	});
+});
+
+describe("launchAttachments - the images and videos a launch prompt attached", () => {
+	test("lists image and video paths, skipping other files and the ffmpeg hint", () => {
+		const prompt = [
+			"Task: fix it",
+			"",
+			"Attached files - read them before starting:",
+			"/Users/dan/dev/.odin/attachments/a b.png",
+			"/Users/dan/dev/.odin/attachments/clip.mp4",
+			"/Users/dan/dev/.odin/attachments/notes.txt",
+			"",
+			"Videos can't be read directly - pull frames first.",
+		].join("\n");
+		expect(launchAttachments(prompt)).toEqual([
+			"/Users/dan/dev/.odin/attachments/a b.png",
+			"/Users/dan/dev/.odin/attachments/clip.mp4",
+		]);
+		expect(launchAttachments("Task: no files")).toEqual([]);
+	});
+});
+
+describe("launchRequest - the request you typed, without the launcher's scaffolding", () => {
+	test("folds a task prompt to its title, before the attachment list", () => {
+		const prompt = [
+			"Task: improve text formatting",
+			"",
+			"Attached files - read them before starting:",
+			"/Users/dan/dev/.odin/attachments/a.png",
+			"",
+			"Work in the current workspace. Investigate, make the changes.",
+		].join("\n");
+		expect(launchRequest(prompt)).toBe("Task: improve text formatting");
+	});
+
+	test("keeps the description and folds at the first scaffold block", () => {
+		const prompt = [
+			"Task: ship the thing",
+			"",
+			"Make it fast.\nAnd small.",
+			"",
+			"Standing rules - follow each one whenever its situation comes up during this session, without being asked:\n- When you open a pull request: auto merge",
+			"",
+			"Work in the current workspace. Investigate.",
+		].join("\n");
+		expect(launchRequest(prompt)).toBe(
+			"Task: ship the thing\n\nMake it fast.\nAnd small.",
+		);
+	});
+
+	test("folds a skill launch at the guidelines the person added", () => {
+		const prompt = [
+			"/triage ODIN-12",
+			"",
+			"Context and guidelines from me for this session - keep them in mind throughout:\nUse the staging DB.",
+		].join("\n");
+		expect(launchRequest(prompt)).toBe("/triage ODIN-12");
+	});
+
+	test("returns null for a typed message with no scaffolding", () => {
+		expect(launchRequest("Can you check the build?\n\nThanks")).toBeNull();
+		expect(launchRequest("Task: only a title")).toBeNull();
+	});
+});
+
+describe("isYouOnly", () => {
+	test("a plain (you only) item gets no button", () => {
+		expect(isYouOnly("Reload the Odin window (you only).")).toBe(true);
+	});
+	test("an item Claude can do, or one asking for an answer, still gets one", () => {
+		expect(isYouOnly("Look at #740 if CI fails.")).toBe(false);
+		expect(isYouOnly("Tell me which repo to use (you only).")).toBe(false);
+	});
+});
+
+describe("toolDescription", () => {
+	test("a command reads as the description Claude gave it", () => {
+		expect(
+			toolDescription({
+				name: "Bash",
+				input: { command: "gh pr checks 768 --watch", description: "Watch CI" },
+			}),
+		).toBe("Watch CI");
+	});
+	test("a file tool reads as the file it touched", () => {
+		expect(
+			toolDescription({
+				name: "Edit",
+				input: { file_path: "/a/b/ChatView.tsx" },
+			}),
+		).toBe("Edited ChatView.tsx");
+	});
+	test("a command with no description falls back to the command", () => {
+		expect(toolDescription({ name: "Bash", input: { command: "ls" } })).toBe(
+			"Bash ls",
+		);
+	});
+});
+
+test("output tokens count each message once, at its largest", () => {
+	const line = (id: string, out: number, block: object) => ({
+		type: "assistant",
+		uuid: `${id}-${out}`,
+		message: { id, usage: { output_tokens: out }, content: [block] },
+	});
+	const items = applyLines(
+		[],
+		[
+			line("m1", 3, { type: "text", text: "Looking" }),
+			line("m1", 400, { type: "tool_use", id: "t1", name: "Bash", input: {} }),
+			line("m2", 1800, { type: "text", text: "Done" }),
+		],
+	);
+	expect(outputTokens(items)).toBe(2200);
+	expect(tokenLabel(840)).toBe("840");
+	expect(tokenLabel(2200)).toBe("2.2k");
+	expect(tokenLabel(12_400)).toBe("12k");
+});
+
+describe("elapsedLabel", () => {
+	test("seconds, then minutes, then hours", () => {
+		expect(elapsedLabel(42_000)).toBe("42s");
+		expect(elapsedLabel(185_000)).toBe("3m 05s");
+		expect(elapsedLabel(3_720_000)).toBe("1h 02m");
+		expect(elapsedLabel(-5)).toBe("0s");
+	});
+});
+
+test("a user turn keeps when it was sent", () => {
+	const [item] = applyLines(
+		[],
+		[
+			{
+				type: "user",
+				timestamp: "2026-10-10T10:00:00Z",
+				message: { content: "hi" },
+			},
+		],
+	);
+	expect(item).toMatchObject({
+		kind: "user",
+		at: Date.parse("2026-10-10T10:00:00Z"),
+	});
+});
+
+describe("splitEarlier", () => {
+	const bytes = (text: string) => new TextEncoder().encode(text);
+	const text = (data: Uint8Array) => new TextDecoder().decode(data);
+
+	test("joins the cut line back together, and keeps the new cut", () => {
+		// File: {"a":1}\n{"b":"é"}\n{"c":3}\n - the window began inside line two,
+		// mid "é" (two bytes), and the earlier chunk ends at the same byte.
+		const file = bytes('{"a":1}\n{"b":"é"}\n{"c":3}\n');
+		const cut = file.indexOf(0xa9); // second byte of é
+		const window = file.subarray(cut);
+		const head = window.subarray(0, window.indexOf(10));
+		const middle = splitEarlier(file.subarray(3, cut), head, false);
+		expect(middle.lines).toEqual(['{"b":"é"}']);
+		expect(text(middle.head)).toBe('":1}');
+		const first = splitEarlier(file.subarray(0, 3), middle.head, true);
+		expect(first.lines).toEqual(['{"a":1}']);
+		expect(first.head.length).toBe(0);
 	});
 });

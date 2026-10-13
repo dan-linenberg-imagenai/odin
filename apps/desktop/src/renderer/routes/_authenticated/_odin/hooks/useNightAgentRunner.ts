@@ -42,6 +42,9 @@ export function nightInstructions(sort: string, offHours: string): string {
  * Asked again before a start whenever the words changed or new rows came in:
  * an edit applies to the very next session.
  *
+ * Odin keeps the computer from idle sleep meanwhile, so no Caffeinate is
+ * needed. It runs only on power: on battery it starts nothing and lets go. A closed laptop lid still sleeps it: no app can stop that.
+ *
  * ponytail: renderer-side and only while Odin is open, same as automations.
  * Move it to main the day it has to run with the window shut.
  */
@@ -56,18 +59,26 @@ export function useNightAgentRunner() {
 
 	useEffect(() => {
 		let running = false;
+		let awake = false;
+		// Idle sleep would stop the tick and the sessions with it, so Odin holds
+		// it off itself for the window, and past it while the last one works.
+		const keepAwake = (next: boolean) => {
+			if (next === awake) return;
+			awake = next;
+			void electronTrpcClient.device.keepAwake.mutate(next).catch(() => {
+				awake = !next;
+			});
+		};
 		const tick = async () => {
 			if (running) return;
-			const { offHours, offHoursStarted, setOffHoursStarted } =
-				useNextInLinePrompt.getState();
-			if (!offHours.enabled) return;
-			if (!inOffHours(new Date(), offHours.start, offHours.end)) {
-				if (offHoursStarted) setOffHoursStarted(0);
-				tried.current.clear();
-				night.current = null;
-				return;
-			}
-			if (offHoursStarted >= offHours.maxSessions) return;
+			const {
+				offHours,
+				offHoursStarted,
+				offHoursFromPicks,
+				setOffHours,
+				setOffHoursStarted,
+				setOffHoursFromPicks,
+			} = useNextInLinePrompt.getState();
 			// Still working, or held by the launch gate: the last one isn't done.
 			const busy = Object.values(useTabsStore.getState().panes).some(
 				(pane) =>
@@ -75,10 +86,56 @@ export function useNightAgentRunner() {
 					pane.odinTags?.includes("off-hours") &&
 					(pane.status === "working" || !!pane.odinQueued),
 			);
+			const inWindow = inOffHours(new Date(), offHours.start, offHours.end);
+			if (!offHours.enabled) return keepAwake(false);
+			// Power only: on battery it starts nothing and lets the computer sleep.
+			const onBattery = await electronTrpcClient.device.onBattery
+				.query()
+				.catch(() => false);
+			keepAwake(!onBattery && (inWindow || busy));
+			if (!inWindow) {
+				if (offHoursStarted) setOffHoursStarted(0);
+				if (offHoursFromPicks) setOffHoursFromPicks(false);
+				tried.current.clear();
+				night.current = null;
+				return;
+			}
+			if (onBattery || offHoursStarted >= offHours.maxSessions) return;
 			if (busy) return;
 			running = true;
 			try {
-				const { waiting, rankInput, prompt } = latest.current;
+				const { waiting, rankInput, prompt, start, duplicateFor } =
+					latest.current;
+				if (offHours.picked.length) {
+					// Picks are yours, so the ranking and its hides don't apply to them.
+					const byKey = new Map(waiting.map((row) => [row.key, row]));
+					// A pick the feed no longer lists is dropped, so it can't hold a cap slot.
+					if (waiting.length && offHours.picked.some((key) => !byKey.has(key)))
+						setOffHours({
+							picked: offHours.picked.filter((key) => byKey.has(key)),
+						});
+					const item = offHours.picked
+						.map((key) => byKey.get(key))
+						.find(
+							(row) => row && !tried.current.has(row.key) && !duplicateFor(row),
+						);
+					if (item) {
+						tried.current.add(item.key);
+						setOffHours({
+							picked: offHours.picked.filter((key) => key !== item.key),
+						});
+						setOffHoursFromPicks(true);
+						setOffHoursStarted(offHoursStarted + 1);
+						await start(item, { instructions: offHours.instructions });
+						return;
+					}
+				}
+				// A night with picks runs only picks, unless you said to go on after them.
+				if (
+					(offHours.picked.length || offHoursFromPicks) &&
+					offHours.afterPicks === "stop"
+				)
+					return;
 				const instructions = nightInstructions(prompt, offHours.instructions);
 				const stale =
 					night.current?.instructions !== instructions ||
@@ -106,7 +163,7 @@ export function useNightAgentRunner() {
 					);
 				}
 				const { order, hidden } = night.current as NightRanking;
-				const { pinned, unpinned, start, duplicateFor } = latest.current;
+				const { pinned, unpinned } = latest.current;
 				const rank = (key: string) => order.get(key) ?? order.size;
 				const item = [
 					...pinned,
@@ -128,6 +185,9 @@ export function useNightAgentRunner() {
 			}
 		};
 		const id = setInterval(() => void tick(), TICK_MS);
-		return () => clearInterval(id);
+		return () => {
+			clearInterval(id);
+			keepAwake(false);
+		};
 	}, []);
 }

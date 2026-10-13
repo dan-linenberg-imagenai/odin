@@ -171,7 +171,7 @@ export interface Pane {
 	odinSource?: "slack" | "reactions" | "jira" | "pr" | "notion";
 	/** Free-form labels for filtering the board (right-click a card). */
 	odinTags?: string[];
-	/** Starred from the card's right-click menu: a ★ marks the important ones. */
+	/** Starred from the card's ★ button or right-click menu: pinned to the top section. */
 	odinStarred?: boolean;
 	/**
 	 * The generated tags have been applied to this card once. Set so a tag you
@@ -205,6 +205,11 @@ export interface Pane {
 	 * one Odin closed itself stays where you left it. Cleared once it works again.
 	 */
 	odinClosedIn?: PaneStatus;
+	/**
+	 * Odin fork: why the session's terminal ended on its own ("crashed (exit 1)
+	 * - disk full (0.5 GB free)"), shown on its Idle card. Cleared once it works again.
+	 */
+	odinExitCause?: string;
 	/**
 	 * Odin fork: created but not started - the Mac was flat out, or another
 	 * agent was working in the same checkout. The card sits in Idle under "Queued" with the reason

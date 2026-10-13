@@ -146,6 +146,8 @@ Object.defineProperty(globalThis, "localStorage", {
 // =============================================================================
 
 mock.module("electron", () => ({
+	session: { fromPartition: mock(() => ({})) },
+	safeStorage: { isEncryptionAvailable: mock(() => false) },
 	app: {
 		getPath: mock(() => testTmpDir),
 		getName: mock(() => "test-app"),

@@ -5,6 +5,7 @@ import { Textarea } from "@odin/ui/textarea";
 import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
 import { useNextInLinePrompt } from "renderer/stores/next-in-line-prompt";
+import { useNightAgentIntro } from "../../_odin/board/NightAgentIntro";
 import { useBacklogReview } from "../../_odin/hooks/useBacklogReview";
 import {
 	NumberSetting,
@@ -20,7 +21,7 @@ export const Route = createFileRoute("/_authenticated/settings/backlog/")({
 function BacklogSettingsPage() {
 	return (
 		<SettingsPage
-			title="Backlog"
+			title="Backlog & Night Agent"
 			description="Tasks nobody has started yet: how Next in line orders them, what the Night Agent works through, and how often Review re-checks them."
 		>
 			<SettingsSection
@@ -106,8 +107,10 @@ function NightAgentRows() {
 	const setOffHours = useNextInLinePrompt((s) => s.setOffHours);
 	const started = useNextInLinePrompt((s) => s.offHoursStarted);
 	const [draft, setDraft] = useState(offHours.instructions);
+	const nightIntro = useNightAgentIntro();
 	return (
 		<>
+			{nightIntro.dialog}
 			<SettingRow
 				label="Work the backlog overnight"
 				htmlFor="night-agent"
@@ -115,7 +118,8 @@ function NightAgentRows() {
 					<>
 						Starts the top of Next in line, waits for that session to finish its
 						turn, then starts the next. Their cards wear a Night Agent pill.
-						Odin has to be open and the Mac awake.
+						Odin has to be open; it keeps the computer awake through the window.
+						Runs only while plugged in. On a laptop, leave the lid open.
 						{offHours.enabled && started > 0 && ` ${started} started tonight.`}
 					</>
 				}
@@ -123,7 +127,11 @@ function NightAgentRows() {
 				<Switch
 					id="night-agent"
 					checked={offHours.enabled}
-					onCheckedChange={(enabled) => setOffHours({ enabled })}
+					onCheckedChange={(enabled) =>
+						enabled
+							? nightIntro.gate(() => setOffHours({ enabled }))
+							: setOffHours({ enabled })
+					}
 				/>
 			</SettingRow>
 			<SettingRow

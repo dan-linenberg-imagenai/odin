@@ -36,6 +36,7 @@ describe("launchBlocker", () => {
 		const limits = {
 			hostCpuPercent: 70,
 			minFreeMemoryGb: 2,
+			minFreeDiskPercent: 5,
 			maxWorkingAgents: 2,
 		};
 		const busy = [
@@ -46,6 +47,11 @@ describe("launchBlocker", () => {
 		expect(launchBlocker(snapshot(10), busy, "", ODIN, limits)).toBe(
 			"2 sessions are already working (limit 2)",
 		);
+		// Huginn isn't a session: his working pane takes no slot.
+		const huginn = pane({ id: "h", status: "working", odinTags: ["question"] });
+		expect(
+			launchBlocker(snapshot(10), [huginn, ...busy.slice(1)], "", ODIN, limits),
+		).toBeNull();
 		// Waiting on you doesn't count, and 0 turns the cap off.
 		expect(
 			launchBlocker(snapshot(10), busy.slice(1), "", ODIN, limits),

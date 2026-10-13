@@ -1,9 +1,12 @@
 import { useNavigate } from "@tanstack/react-router";
 import { electronTrpc } from "renderer/lib/electron-trpc";
 import { electronTrpcClient } from "renderer/lib/trpc-client";
+import { useCrowDialog } from "renderer/routes/_authenticated/_odin/hooks/useCrow";
 import { usePendingFocus } from "renderer/routes/_authenticated/_odin/hooks/usePendingFocus";
+import { useCompacting } from "renderer/stores/compacting";
 import { NOTIFICATION_EVENTS } from "shared/constants";
 import { debugLog } from "shared/debug";
+import { CROW_TAG } from "shared/odin-tags";
 import type { PaneStatus } from "shared/tabs-types";
 import { useTabsStore } from "./store";
 import { resolveNotificationTarget } from "./utils/resolve-notification-target";
@@ -14,6 +17,7 @@ import { resolveNotificationTarget } from "./utils/resolve-notification-target";
  *
  * STATUS MAPPING:
  * - Start → "working" (amber pulsing indicator)
+ * - Compacting (PreCompact) → "working", and the chat view says "Compacting"
  * - Stop → "review" (green static) if pane's tab not active, "idle" if tab is active
  * - Failed (StopFailure) → "failed" (red) - the turn died on an API error
  * - PermissionRequest → "permission" (red pulsing indicator)
@@ -126,7 +130,11 @@ export function useAgentHookListener() {
 	electronTrpc.notifications.subscribe.useSubscription(undefined, {
 		onData: (event) => {
 			if (!event.data) return;
-			if (event.type === NOTIFICATION_EVENTS.FOCUS_V2_NOTIFICATION_SOURCE) {
+			// The crow's Odin actions are answered by useCrow.
+			if (
+				event.type === NOTIFICATION_EVENTS.FOCUS_V2_NOTIFICATION_SOURCE ||
+				event.type === NOTIFICATION_EVENTS.ODIN_ACTION
+			) {
 				return;
 			}
 
@@ -144,8 +152,11 @@ export function useAgentHookListener() {
 				if (!lifecycleEvent) return;
 
 				const { eventType } = lifecycleEvent;
+				useCompacting
+					.getState()
+					.mark(paneId, eventType === "Compacting" ? Date.now() : null);
 
-				if (eventType === "Start") {
+				if (eventType === "Start" || eventType === "Compacting") {
 					state.setPaneStatus(paneId, "working");
 				} else if (
 					eventType === "PermissionRequest" ||
@@ -186,6 +197,17 @@ export function useAgentHookListener() {
 				// Clear transient status for unmounted panes (mounted panes handle this via stream subscription)
 				if (!paneId) return;
 				const currentPane = state.panes[paneId];
+				if (currentPane) {
+					useTabsStore.setState((s) => ({
+						panes: {
+							...s.panes,
+							[paneId]: {
+								...s.panes[paneId],
+								odinExitCause: event.data?.cause,
+							},
+						},
+					}));
+				}
 				if (
 					currentPane?.status === "working" ||
 					currentPane?.status === "permission"
@@ -200,6 +222,11 @@ export function useAgentHookListener() {
 			} else if (event.type === NOTIFICATION_EVENTS.FOCUS_TAB) {
 				// A banner names a board card, so clicking it opens that card's
 				// session drawer. The board is where every session lives now.
+				// Huginn's conversation is no card: its banner opens his panel.
+				if (paneId && state.panes[paneId]?.odinTags?.includes(CROW_TAG)) {
+					useCrowDialog.getState().setOpen(true);
+					return;
+				}
 				if (paneId) {
 					usePendingFocus.getState().focus(paneId);
 				}

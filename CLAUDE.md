@@ -17,10 +17,11 @@ Once the PR is merged:
 git worktree remove .worktrees/<name>
 ```
 
-If you forget, Odin runs `scripts/prune-worktrees.sh` every hour over every
-repo with a `.worktrees/` and removes worktrees whose work landed or whose PR
-closed. It never removes one with commits its default branch doesn't have, or
-touched in the last 24h (1h once its PR merged or closed). Uncommitted files
+If you forget, Odin runs `scripts/prune-worktrees.sh` every 10 minutes over
+every repo with a `.worktrees/` and removes worktrees whose work landed or whose
+PR closed (Settings → Sessions turns this off). It never removes one with
+commits its default branch doesn't have, or with no commits and touched in the
+last 24h. Uncommitted files
 keep a worktree for 7 days; after that they're committed to
 `refs/pruned/<name>` first, and `git checkout refs/pruned/<name> -- .` brings
 them back. `--dry-run` shows what it would do.
@@ -35,6 +36,29 @@ shared checkout has no owner.
 
 `git stash` is blocked here by a `reference-transaction` hook for that reason.
 Commit to a branch instead - a commit has an owner and survives a checkout.
+
+## Check main before you build
+
+Before writing any code, check whether the feature or fix already exists on
+`origin/main`. Many sessions work on this repo at once, and a request often
+arrives after another session already shipped it.
+
+- `git fetch origin main`, then search: `git log origin/main --oneline -i
+  --grep=<keyword>` over recent PR titles, and `git grep -i <keyword>
+  origin/main -- apps packages` for the code itself.
+- Check open PRs too: `gh pr list --state open --search <keyword>`.
+
+If it is already on main (or in an open PR), refuse and stop. Tell the user
+which PR or commit has it, where the code lives (`file:line`), and how to reach
+it in the app. If only part of it exists, say which part and offer to build
+the rest. If the user insists after that, do the work as asked.
+
+## Nothing to install but Odin
+
+No feature can be added if it means the user needs to install things to make it
+work: no CLI (`op`, `gh`, `brew` packages), no helper app, no "install X first"
+message or setup guide. Bundle what the feature needs inside Odin, or use an app
+the user already has. If neither works, don't ship the feature.
 
 ## Writing
 

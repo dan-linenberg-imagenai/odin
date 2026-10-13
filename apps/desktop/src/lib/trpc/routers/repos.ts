@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
@@ -34,8 +34,8 @@ const run = promisify(execFile);
  * Desktop/Documents/Downloads are TCC-protected: descending into them makes
  * macOS throw a "would like to access files in your Desktop folder" prompt at
  * launch, three times over. Pruning by name means `find` never opens them, so
- * no prompt. A checkout parked on the Desktop won't be listed - add it through
- * the folder picker, which grants access without a prompt.
+ * no prompt. A checkout parked there is listed once it's added through the
+ * folder picker, which grants access without a prompt - see `projectRepos`.
  *
  * Music/Pictures/Movies are the same story with louder prompts: they hold the
  * Apple Music, Photos and TV libraries, so walking them asks for access to
@@ -84,6 +84,23 @@ export async function scanRepos(home: string = homedir()): Promise<string[]> {
 		.then((result) => result.stdout)
 		.catch((error: { stdout?: string }) => error.stdout ?? "");
 	return [...new Set(stdout.split("\n").filter(Boolean).map(dirname))].sort();
+}
+
+/**
+ * The folders added as projects. The scan can't see a checkout under a
+ * TCC-protected folder (~/Documents/GitHub/...), so without these the picker
+ * never offers it. Read per call, so a folder added a moment ago shows up.
+ * Imported lazily: local-db pulls in Electron, which the tests don't have.
+ */
+async function projectRepos(): Promise<string[]> {
+	const { projects } = await import("@odin/local-db");
+	const { localDb } = await import("main/lib/local-db");
+	return localDb
+		.select({ path: projects.mainRepoPath })
+		.from(projects)
+		.all()
+		.map((row) => row.path)
+		.filter((path) => existsSync(join(path, ".git")));
 }
 
 /**
@@ -164,8 +181,8 @@ export interface RepoDiff {
 	note: string;
 }
 
-function diffOf(patch: string, note: string[] = []) {
-	const { files, dropped } = capped(splitPatch(patch));
+function diffOf(all: DiffFile[], note: string[] = []) {
+	const { files, dropped } = capped(all);
 	if (dropped)
 		note.push(
 			`${dropped} more file(s) past ${MAX_PATCH_BYTES / 1000}kB, not shown`,
@@ -180,14 +197,16 @@ function diffOf(patch: string, note: string[] = []) {
  * commit - an agent that already committed its turn would otherwise show an
  * empty panel. Untracked files are named, not diffed.
  *
- * @param since When the session started (ms). A clean tree is not proof the
- * agent committed its turn: checkouts are shared, so HEAD is usually a
- * stranger's commit from before this session existed. Only claim it when it
- * landed inside the session's window.
+ * @param transcript The session's transcript. Checkouts are shared, so the
+ * tree holds other sessions' edits and HEAD is often a stranger's commit -
+ * made before this session, or by another one while it ran. The session owns
+ * a commit whose sha its transcript printed (`git commit` does), and a file
+ * whose path it named. ponytail: a file the session changed without naming it
+ * (a lockfile from an install) is hidden too - the note counts it.
  */
 export async function renderDiff(
 	cwd: string,
-	since?: number,
+	transcript?: string,
 ): Promise<RepoDiff> {
 	const git = async (args: string[]) =>
 		(
@@ -197,31 +216,47 @@ export async function renderDiff(
 				timeout: 30_000,
 			})
 		).stdout;
+	const nothing = {
+		source: "nothing from this session",
+		cwd,
+		files: [],
+		note: "",
+	};
 
 	let source = "uncommitted changes";
 	let patch = await git(["diff", "--no-color", "HEAD"]);
-	if (!patch.trim()) {
+	const ownsFile = (path: string) =>
+		transcript === undefined || transcript.includes(path);
+	if (!patch.trim() || !splitPatch(patch).some((file) => ownsFile(file.path))) {
 		// Empty on a repo with no commits at all - same answer as a commit that
-		// predates the session: there is nothing of this session's to show.
-		const committedAt =
-			Number(await git(["log", "-1", "--format=%ct"]).catch(() => "")) * 1000;
-		if (since && !(committedAt >= since)) {
-			return { source: "nothing from this session", cwd, files: [], note: "" };
+		// isn't this session's: there is nothing of its to show.
+		const sha = (await git(["rev-parse", "HEAD"]).catch(() => "")).trim();
+		if (
+			!sha ||
+			(transcript !== undefined && !transcript.includes(sha.slice(0, 7)))
+		) {
+			return nothing;
 		}
 		source = "last commit";
 		patch = await git(["show", "--no-color", "HEAD"]);
 	}
 
+	const all = splitPatch(patch);
+	const files =
+		source === "last commit" ? all : all.filter((file) => ownsFile(file.path));
 	const untracked = (await git(["ls-files", "--others", "--exclude-standard"]))
 		.split("\n")
-		.filter(Boolean);
+		.filter((path) => path && ownsFile(path));
 	const note = untracked.length
 		? [
 				`${untracked.length} untracked file(s), not shown: ${untracked.slice(0, 3).join(", ")}${untracked.length > 3 ? ", …" : ""}`,
 			]
 		: [];
+	const others = all.length - files.length;
+	if (others)
+		note.push(`${others} file(s) changed by other sessions, not shown`);
 
-	return { ...diffOf(patch, note), source, cwd };
+	return { ...diffOf(files, note), source, cwd };
 }
 
 /**
@@ -246,16 +281,20 @@ export async function renderPullRequestDiff(
 	// https://github.com/<owner>/<repo>/pull/<n>
 	const [, , , , repo, , number] = url.split("/");
 	return {
-		...diffOf(patch),
+		...diffOf(splitPatch(patch)),
 		source: `${repo} PR #${number}`,
 		cwd: url,
 	};
 }
 
-export const createReposRouter = () => {
+export const createReposRouter = (
+	added: () => Promise<string[]> = projectRepos,
+) => {
 	const repos = scanRepos();
 	return router({
-		list: publicProcedure.query(() => repos),
+		list: publicProcedure.query(async () =>
+			[...new Set([...(await repos), ...(await added())])].sort(),
+		),
 
 		/**
 		 * The checkout a session starts in when nothing else names one. Set in
@@ -284,6 +323,45 @@ export const createReposRouter = () => {
 				// `undefined` deletes the key - that's what clearing it means.
 				updateOdinConfig({ defaultRepo: input.path ?? undefined });
 				return { ok: true };
+			}),
+
+		/** Settings → Sessions: remove a worktree once its PR merges. */
+		getPruneMerged: publicProcedure.query(
+			() => readOdinConfig().pruneMergedWorktrees !== false,
+		),
+
+		setPruneMerged: publicProcedure
+			.input(z.object({ enabled: z.boolean() }))
+			.mutation(({ input }) => {
+				updateOdinConfig({ pruneMergedWorktrees: input.enabled });
+				return { ok: true };
+			}),
+
+		/** Settings → Storage: every session worktree, its size and the pruner's verdict. */
+		worktrees: publicProcedure.query(async () => {
+			const { listWorktrees } = await import("main/lib/prune-worktrees");
+			return listWorktrees();
+		}),
+
+		/** Removes what the pruner would, or anything when forced; returns the names it removed. */
+		removeWorktrees: publicProcedure
+			.input(
+				z.array(
+					z.object({
+						repo: z.string(),
+						name: z.string(),
+						force: z.boolean().optional(),
+					}),
+				),
+			)
+			.mutation(async ({ input }) => {
+				const { removeWorktree } = await import("main/lib/prune-worktrees");
+				const removed: string[] = [];
+				// One at a time: each run fetches the repo.
+				for (const { repo, name, force } of input)
+					if (await removeWorktree(repo, name, force))
+						removed.push(`${repo}\0${name}`);
+				return removed;
 			}),
 
 		/**
@@ -354,16 +432,15 @@ export const createReposRouter = () => {
 						message: "No checkout known for this session yet.",
 					});
 				}
-				// When the conversation started, so a commit older than the session
-				// isn't passed off as its work. birthtime is 0 on filesystems that
-				// don't keep one - then the panel behaves as it did before.
+				// What the session did, so another session's work in the same
+				// checkout isn't passed off as its own.
 				const transcript = input.claudeSessionId
 					? await transcriptOf(input.claudeSessionId)
 					: null;
-				const since = transcript
-					? statSync(transcript.path).birthtimeMs || undefined
-					: undefined;
-				return renderDiff(dir, since);
+				return renderDiff(
+					dir,
+					transcript ? await readFile(transcript.path, "utf-8") : undefined,
+				);
 			}),
 	});
 };

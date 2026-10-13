@@ -17,7 +17,8 @@ export interface AgentLifecycleEvent extends NotificationIds {
 		| "Stop"
 		| "PermissionRequest"
 		| "PendingQuestion"
-		| "Failed";
+		| "Failed"
+		| "Compacting";
 }
 
 /** An agent asking Odin to run `command` in its session's Shell pane. */
@@ -25,6 +26,15 @@ export interface RunInShellRequest {
 	/** The agent's own pane - `$ODIN_PANE_ID` in its environment. */
 	paneId: string;
 	command: string;
+}
+
+/** An agent asking Odin itself to do something - the crow's `/odin` API. */
+export interface OdinActionRequest {
+	/** Matches the renderer's reply to the HTTP request waiting on it. */
+	id: string;
+	action: string;
+	/** The rest of the form: `ids`, `text`. */
+	args: Record<string, string>;
 }
 
 export type V2NotificationSource =

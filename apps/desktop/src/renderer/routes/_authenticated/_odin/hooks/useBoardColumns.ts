@@ -10,10 +10,12 @@ import {
 	agentOnScreen,
 	odinScreenStatus,
 	odinScreenWrite,
+	spacesForCursorForward,
 } from "shared/odin-screen-status";
 import type { BriefMessage } from "../board/brief";
 import {
 	ciRunning,
+	claimOpened,
 	mergeCheckUrls,
 	mergeReady,
 	onlyLookLeft,
@@ -250,7 +252,14 @@ export function useBoardColumns({
 			.filter(({ brief, column }, i) => {
 				if (!anyColumn && column !== "permission") return false;
 				const messages = mergeTranscripts[i]?.data?.messages;
-				return !!messages && test(messages, mergeStateQueries[i]?.data, brief);
+				return (
+					!!messages &&
+					test(
+						messages,
+						claimOpened(messages, mergeStateQueries[i]?.data),
+						brief,
+					)
+				);
 			})
 			.map(({ paneId }) => paneId)
 			.join(",");
@@ -285,7 +294,10 @@ export function useBoardColumns({
 	// map only changes when a check starts or ends.
 	const ciKey = mergeCandidates
 		.map(({ paneId }, i) => {
-			const states = mergeStateQueries[i]?.data;
+			const states = claimOpened(
+				mergeTranscripts[i]?.data?.messages ?? [],
+				mergeStateQueries[i]?.data,
+			);
 			const checks = states ? ciRunning(states) : [];
 			return checks.length ? `${paneId}\t${checks.join("\t")}` : "";
 		})
@@ -391,10 +403,8 @@ export function useBoardColumns({
 							snapshot?: { snapshotAnsi?: string };
 							scrollback?: string;
 						};
-						const screen = (
-							result?.snapshot?.snapshotAnsi ??
-							result?.scrollback ??
-							""
+						const screen = spacesForCursorForward(
+							result?.snapshot?.snapshotAnsi ?? result?.scrollback ?? "",
 						)
 							.replace(ANSI_RE, "")
 							.slice(-2500);

@@ -41,6 +41,16 @@ test("scanRepos finds checkouts, skips pruned dirs and nested worktrees", async 
 	]);
 });
 
+test("list adds the folders added as projects, which the scan can't see", async () => {
+	const added = join(
+		mkdtempSync(join(tmpdir(), "odin-added-")),
+		"Documents/GitHub/app",
+	);
+	const caller = createReposRouter(async () => [added, added]).createCaller({});
+	const listed = await caller.list();
+	expect(listed.filter((path) => path === added)).toEqual([added]);
+});
+
 test("the default repo round-trips through the config file, takes a plain folder, and rejects a missing one", async () => {
 	const home = mkdtempSync(join(tmpdir(), "odin-default-repo-"));
 	process.env.ODIN_CONFIG_PATH = join(home, "odin.json");
@@ -49,7 +59,7 @@ test("the default repo round-trips through the config file, takes a plain folder
 	mkdirSync(join(repo, ".git"), { recursive: true });
 	mkdirSync(join(home, "Documents"), { recursive: true });
 
-	const caller = createReposRouter().createCaller({});
+	const caller = createReposRouter(async () => []).createCaller({});
 
 	// Unset: detected from the machine's real checkouts.
 	const detected = detectReposFolder(await caller.list());
@@ -88,11 +98,14 @@ test("renderDiff shows uncommitted work, and the last commit when there is none"
 	expect(clean.source).toBe("last commit");
 	expect(clean.files.map((file) => file.path)).toEqual(["a.txt"]);
 
-	// A session that started after that commit owns none of it - the panel says
-	// so instead of passing a stranger's work off as this session's.
-	const stale = await renderDiff(repo, Date.now() + 1000);
+	// A session whose transcript never printed that commit's sha owns none of
+	// it - the panel says so instead of passing a stranger's work off as its own.
+	const sha = git("rev-parse", "HEAD").trim();
+	const stale = await renderDiff(repo, "a.txt, read but not committed");
 	expect(stale.source).toBe("nothing from this session");
 	expect(stale.files).toEqual([]);
+	const own = await renderDiff(repo, `[main ${sha.slice(0, 7)}] add a`);
+	expect(own.source).toBe("last commit");
 
 	writeFileSync(join(repo, "a.txt"), "two\n");
 	writeFileSync(join(repo, "b.txt"), "untracked\n");
@@ -103,6 +116,13 @@ test("renderDiff shows uncommitted work, and the last commit when there is none"
 		{ path: "a.txt", added: 1, removed: 1, binary: false },
 	]);
 	expect(dirty.files[0].patch).toContain("+two");
+
+	// Another session's edits in the shared tree stay out of this one's diff.
+	writeFileSync(join(repo, "c.txt"), "theirs\n");
+	git("add", "c.txt");
+	const mine = await renderDiff(repo, "edited a.txt");
+	expect(mine.files.map((file) => file.path)).toEqual(["a.txt"]);
+	expect(mine.note).toBe("1 file(s) changed by other sessions, not shown");
 });
 
 test("renderPullRequestDiff reads the PR through gh, and says when nobody can", async () => {

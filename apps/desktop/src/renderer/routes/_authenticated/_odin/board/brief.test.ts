@@ -3,7 +3,9 @@ import {
 	actionItems,
 	artifactLink,
 	type BriefMessage,
+	byRepo,
 	ciRunning,
+	claimOpened,
 	elapsedLabel,
 	emailLink,
 	jiraIssue,
@@ -20,8 +22,10 @@ import {
 	notionPage,
 	onlyLookLeft,
 	onlyMergeLeft,
+	type PrStates,
 	parseLinks,
 	postedMessage,
+	prLabel,
 	projectSlug,
 	prsDropped,
 	pullRequests,
@@ -566,6 +570,20 @@ describe("actionItems", () => {
 			]),
 		).toEqual(["Merge #12", "Restart Odin dev", "Check it"]);
 	});
+	it("turns a heading's sub-items into items that carry it", () => {
+		expect(
+			actionItems([
+				turn(
+					"ACTION ITEMS\n1. **You:** Merge #26\n2. **Still waiting:**\n   - your OK on the PR\n   - your pick\n3. Restart",
+				),
+			]),
+		).toEqual([
+			"**You:** Merge #26",
+			"**Still waiting:** your OK on the PR",
+			"**Still waiting:** your pick",
+			"Restart",
+		]);
+	});
 	it("gives nothing for none or a missing section", () => {
 		expect(
 			actionItems([turn("Done.\n\nACTION ITEMS: none - shipped.")]),
@@ -673,6 +691,25 @@ describe("ciRunning", () => {
 
 	it("counts a PR whose author is unknown", () => {
 		expect(ciRunning({ a: pr("OPEN", ["check"], null) })).toEqual(["check"]);
+	});
+});
+
+describe("claimOpened", () => {
+	const a = "https://github.com/o/r/pull/12";
+	const b = "https://github.com/o/r/pull/13";
+	it("makes a PR the session opened yours, even when a bot's token wrote it", () => {
+		const states = claimOpened(
+			[
+				{ role: "assistant", text: a, at: null, opened: true },
+				{ role: "assistant", text: `Reviewed ${b}.`, at: null },
+			],
+			{
+				[a]: { state: "OPEN", mine: false },
+				[b]: { state: "OPEN", mine: false },
+			} as PrStates,
+		);
+		expect(states[a]?.mine).toBe(true);
+		expect(states[b]?.mine).toBe(false);
 	});
 });
 
@@ -985,5 +1022,32 @@ describe("emailLink", () => {
 	});
 	it("is null with no Gmail link", () => {
 		expect(emailLink(null, [])).toBeNull();
+	});
+});
+
+describe("prLabel", () => {
+	const pr = { repo: "danlinenberg/odin", number: 873 };
+	it("leads with the title once GitHub sent it", () => {
+		expect(prLabel(pr, "Session drawer: newest reply on top")).toBe(
+			"#873 Session drawer: newest reply on top",
+		);
+	});
+	it("falls back to repo and number", () => {
+		expect(prLabel(pr)).toBe("odin #873");
+		expect(prLabel(pr, null)).toBe("odin #873");
+	});
+});
+
+describe("byRepo", () => {
+	it("groups by repo, newest repo first, order kept inside", () => {
+		const prs = [
+			{ repo: "imagenai/skills", number: 55 },
+			{ repo: "danlinenberg/odin", number: 893 },
+			{ repo: "imagenai/skills", number: 54 },
+		];
+		expect(byRepo(prs)).toEqual([
+			["imagenai/skills", [prs[0], prs[2]]],
+			["danlinenberg/odin", [prs[1]]],
+		]);
 	});
 });

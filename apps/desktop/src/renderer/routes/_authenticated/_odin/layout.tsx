@@ -22,7 +22,7 @@ import { ClaudeCommandPicker } from "renderer/components/ClaudeCommandPicker";
 import { ZoomStable } from "renderer/components/ZoomStable/ZoomStable";
 import { useTaskQueue } from "renderer/hooks/useTaskQueue";
 import { useZoomFactor } from "renderer/hooks/useZoomFactor";
-import { useHotkey } from "renderer/hotkeys";
+import { parseBinding, useBinding, useHotkey } from "renderer/hotkeys";
 import { electronTrpc } from "renderer/lib/electron-trpc";
 import { useLaunchLimits } from "renderer/stores/launch-limits";
 import { useTabsStore } from "renderer/stores/tabs/store";
@@ -32,16 +32,17 @@ import {
 	machineLoad,
 } from "shared/machine-load";
 import { ClaudeSignInBanner } from "./components/ClaudeSignInBanner";
+import { CrowButton } from "./components/CrowButton";
 import { FEED_TABS } from "./components/feed-counts";
 import { GettingStarted } from "./components/GettingStarted";
 import { InAppBrowser } from "./components/InAppBrowser";
-import { OdinPromptDialog } from "./components/OdinPromptDialog";
 import { BUTTON, PILL } from "./components/pill";
 import {
 	type UpstreamDue,
 	useDueReminders,
 	useReminders,
 } from "./components/Reminders";
+import { SearchAll } from "./components/SearchAll";
 import { SessionContextDialog } from "./components/SessionContextDialog";
 import { QuickAddTask } from "./components/TaskBox";
 import { UpdateBanner } from "./components/UpdateBanner";
@@ -51,15 +52,11 @@ import {
 	profileLabel,
 	useBoardCountsByProfile,
 } from "./hooks/useBoardCountsByProfile";
+import { crowPane, useCrow, useCrowDialog } from "./hooks/useCrow";
 import { useNightAgentRunner } from "./hooks/useNightAgentRunner";
 import { useOdinFeeds } from "./hooks/useOdinFeeds";
 import { useOdinProfile } from "./hooks/useOdinProfile";
 import { usePendingFocus } from "./hooks/usePendingFocus";
-import {
-	questionPane,
-	useQuickQuestion,
-	useQuickQuestionDialog,
-} from "./hooks/useQuickQuestion";
 import { useSlackAutoLaunch } from "./hooks/useStartReaction";
 
 /**
@@ -161,8 +158,8 @@ const NAV_HOTKEY_OPTIONS = {
  * gets tighter - grey while there's slack, amber when it's filling up, red
  * when agents are queueing or the memory is gone.
  *
- * ponytail: amber is 15% CPU / 1 GB short of the limits that gate a launch,
- * eyeballed - it only picks a colour.
+ * ponytail: amber is 15% CPU / 1 GB / 10 disk points short of the limits that
+ * gate a launch, eyeballed - it only picks a colour.
  */
 function badgeTone(load: MachineLoad, limits: LaunchLimits): string {
 	if (load.busy) {
@@ -170,7 +167,9 @@ function badgeTone(load: MachineLoad, limits: LaunchLimits): string {
 	}
 	if (
 		load.cpuPercent >= limits.hostCpuPercent - 15 ||
-		load.availableMemoryGb < limits.minFreeMemoryGb + 1
+		load.availableMemoryGb < limits.minFreeMemoryGb + 1 ||
+		(load.diskFreePercent !== null &&
+			load.diskFreePercent < limits.minFreeDiskPercent + 10)
 	) {
 		return PILL.attention;
 	}
@@ -241,9 +240,17 @@ function OdinShell() {
 	);
 	const hostCpuPercent = useLaunchLimits((s) => s.hostCpuPercent);
 	const minFreeMemoryGb = useLaunchLimits((s) => s.minFreeMemoryGb);
+	const minFreeDiskPercent = useLaunchLimits((s) => s.minFreeDiskPercent);
 	const maxWorkingAgents = useLaunchLimits((s) => s.maxWorkingAgents);
-	const limits = { hostCpuPercent, minFreeMemoryGb, maxWorkingAgents };
+	const limits = {
+		hostCpuPercent,
+		minFreeMemoryGb,
+		minFreeDiskPercent,
+		maxWorkingAgents,
+	};
 	const load = metrics ? machineLoad(metrics, limits) : null;
+	const disk =
+		load?.diskFreePercent != null ? ` · disk ${load.diskFreePercent}%` : "";
 	// Claude plan usage - the 5-hour window and the week, as /usage shows them.
 	// The endpoint 429s when polled hard (every Claude Code CLI hits it too)
 	// and a failed read comes back null - so poll gently and keep showing the
@@ -398,11 +405,38 @@ function OdinShell() {
 	// inside a session's terminal, which is where most of them occur to you.
 	const [isQuickAddOpen, setIsQuickAddOpen] = useState(false);
 	const newTaskKeys = useHotkey("ODIN_NEW_TASK", () => setIsQuickAddOpen(true));
-	const askQuestion = useQuickQuestion();
-	const isQuestionOpen = useQuickQuestionDialog((s) => s.isOpen);
-	const setQuestionOpen = useQuickQuestionDialog((s) => s.setOpen);
-	const openQuestion = useTabsStore((s) => questionPane(s.panes));
-	useHotkey("ODIN_QUICK_QUESTION", () => setQuestionOpen(true));
+	// The same chord from any other app too: Odin comes forward with the box
+	// open, and steps back once you're done with it.
+	const [hideOnQuickAddClose, setHideOnQuickAddClose] = useState(false);
+	const newTaskBinding = useBinding("ODIN_NEW_TASK");
+	const newTaskChord = newTaskBinding
+		? parseBinding(newTaskBinding).chord
+		: null;
+	const setNewTaskChord = electronTrpc.menu.setNewTaskChord.useMutation();
+	const hideApp = electronTrpc.menu.hideApp.useMutation();
+	// biome-ignore lint/correctness/useExhaustiveDependencies: mutate is stable
+	useEffect(() => {
+		setNewTaskChord.mutate({ chord: newTaskChord });
+	}, [newTaskChord]);
+	electronTrpc.menu.subscribe.useSubscription(undefined, {
+		onData: (event) => {
+			if (event.type !== "new-task") return;
+			setHideOnQuickAddClose(event.data.fromElsewhere);
+			setIsQuickAddOpen(true);
+		},
+	});
+	const closeQuickAdd = () => {
+		setIsQuickAddOpen(false);
+		if (hideOnQuickAddClose) hideApp.mutate();
+		setHideOnQuickAddClose(false);
+	};
+	const askCrow = useCrow();
+	const isCrowOpen = useCrowDialog((s) => s.isOpen);
+	const setCrowOpen = useCrowDialog((s) => s.setOpen);
+	const openCrow = useTabsStore((s) => crowPane(s.panes));
+	const crowKeys = useHotkey("ODIN_ASK_CROW", () => setCrowOpen(true));
+	const [isSearchAllOpen, setIsSearchAllOpen] = useState(false);
+	useHotkey("ODIN_SEARCH_ALL", () => setIsSearchAllOpen(true));
 
 	const renderRailItem = ({
 		to,
@@ -577,13 +611,15 @@ function OdinShell() {
 									>
 										{load.busy
 											? `${load.reason} · launches waiting`
-											: `${load.agentCount} ${load.agentCount === 1 ? "session" : "sessions"} using ${load.agentMemoryGb} GB · ${load.availableMemoryGb} GB free`}
+											: `${load.agentCount} ${load.agentCount === 1 ? "session" : "sessions"} using ${load.agentMemoryGb} GB · ${load.availableMemoryGb} GB free${disk}`}
 									</span>
 								</TooltipTrigger>
 								<TooltipContent side="bottom" className="max-w-[280px]">
 									{load.busy
 										? `${load.reason} - new sessions wait until that clears. ${load.agentCount} session(s) using ${load.agentMemoryGb} GB; this Mac is ${load.cpuPercent}% busy with ${load.availableMemoryGb} GB free.`
 										: `${load.agentCount} session(s) using ${load.agentMemoryGb} GB of memory. This Mac has ${load.availableMemoryGb} GB free. Agents are on ${load.agentCpuPercent}% of the CPU · this Mac is ${load.cpuPercent}% busy.`}
+									{load.diskFreePercent !== null &&
+										` Disk ${load.diskFreePercent}% free; new sessions wait below ${limits.minFreeDiskPercent}% (Settings → Sessions).`}
 								</TooltipContent>
 							</Tooltip>
 						)}
@@ -594,13 +630,27 @@ function OdinShell() {
 			<ClaudeSignInBanner />
 
 			<div className="flex min-h-0 flex-1">
-				{/* icon rail */}
-				<div className="flex w-[52px] shrink-0 flex-col items-center gap-1.5 border-r border-border bg-tertiary/70 py-2.5">
+				{/* icon rail - scrolls when zoomed in past its height, or the bottom
+				    icons (Settings, the raven) clip off with no way back to them. */}
+				<div className="hide-scrollbar flex w-[52px] shrink-0 flex-col items-center gap-1.5 overflow-y-auto border-r border-border bg-tertiary/70 py-2.5 [&>*]:shrink-0">
 					{RAIL_ITEMS.map(renderRailItem)}
 					<div className="flex-1" />
 					{renderRailItem(INSIGHTS_ITEM)}
 					{renderRailItem(HISTORY_ITEM)}
 					{renderRailItem(SETTINGS_ITEM)}
+					<CrowButton
+						open={isCrowOpen}
+						onOpen={() => setCrowOpen(true)}
+						onClose={() => setCrowOpen(false)}
+						onAsk={askCrow}
+						keys={crowKeys.text}
+						conversation={openCrow}
+						onShowOnBoard={(paneId) => {
+							setCrowOpen(false);
+							usePendingFocus.getState().focus(paneId);
+							navigate({ to: "/board" });
+						}}
+					/>
 				</div>
 
 				{/* `relative`: the page drawers anchor to this area, not the viewport,
@@ -618,40 +668,9 @@ function OdinShell() {
 			</div>
 
 			<SessionContextDialog />
-			{isQuickAddOpen && (
-				<QuickAddTask onClose={() => setIsQuickAddOpen(false)} />
-			)}
-			{isQuestionOpen && (
-				<OdinPromptDialog
-					heading="Quick question"
-					note={
-						openQuestion ? (
-							<>
-								Follows up in “{openQuestion.userTitle ?? openQuestion.name}” -
-								✓ Done in its drawer starts a fresh one.{" "}
-								<button
-									type="button"
-									className="underline hover:text-foreground"
-									onClick={() => {
-										setQuestionOpen(false);
-										usePendingFocus.getState().focus(openQuestion.id);
-										navigate({ to: "/board" });
-									}}
-								>
-									Show it
-								</button>
-							</>
-						) : (
-							"Goes to a Claude that's already running in your default repo - no start-up wait."
-						)
-					}
-					placeholder="Ask anything"
-					submitLabel="Ask"
-					onCancel={() => setQuestionOpen(false)}
-					onSubmit={async (question, files) => {
-						if (await askQuestion(question, files)) setQuestionOpen(false);
-					}}
-				/>
+			{isQuickAddOpen && <QuickAddTask onClose={closeQuickAdd} />}
+			{isSearchAllOpen && (
+				<SearchAll onClose={() => setIsSearchAllOpen(false)} />
 			)}
 		</div>
 	);

@@ -7,9 +7,9 @@ import { cn } from "@odin/ui/utils";
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import {
-	LuCheck,
 	LuExternalLink,
 	LuLoaderCircle,
+	LuMoon,
 	LuSettings2,
 	LuSparkles,
 } from "react-icons/lu";
@@ -17,13 +17,17 @@ import { electronTrpc } from "renderer/lib/electron-trpc";
 import { emojify } from "renderer/lib/emoji";
 import { electronTrpcClient } from "renderer/lib/trpc-client";
 import { openUrl } from "renderer/stores/in-app-browser";
-import { useNextInLinePrompt } from "renderer/stores/next-in-line-prompt";
+import {
+	MAX_NIGHT_PICKS,
+	toggleNightPick,
+	useNextInLinePrompt,
+} from "renderer/stores/next-in-line-prompt";
 import { create } from "zustand";
 import type { AllItem } from "../all/all-items";
 import { allItems } from "../all/all-items";
 import { cleanTitle, TaskDetails } from "../all/TaskDetails";
 import { useStartAllItem } from "../all/use-start-item";
-import { DropHint } from "../components/DropHint";
+import { SweepDrop } from "../components/DropHint";
 import { FEED_TABS } from "../components/feed-counts";
 import { BUTTON, PILL } from "../components/pill";
 import {
@@ -38,6 +42,14 @@ import { useOdinFeeds } from "../hooks/useOdinFeeds";
 import { useMyTasks } from "../hooks/useOdinTasks";
 import type { SweptRow } from "../review/verdicts";
 import { duplicateOf, type LedgerRow } from "./duplicates";
+import { useNightAgentIntro } from "./NightAgentIntro";
+
+/**
+ * Every board column's floor, this one included. Low so zooming in (⌘+)
+ * narrows all five columns instead of pushing the last ones off screen;
+ * past it the row scrolls sideways.
+ */
+export const BOARD_COLUMN_MIN_W = "min-w-[120px]";
 
 /**
  * A feed title as something to read: Slack's *bold* and ~strike~ markers
@@ -291,7 +303,12 @@ export function useNextInLineQueue(showHidden = false) {
 
 export function NextInLine() {
 	const { ranking, applied, startedAt, error } = useAiRanking();
+	const picked = useNextInLinePrompt((s) => s.offHours.picked);
+	const afterPicks = useNextInLinePrompt((s) => s.offHours.afterPicks);
+	const nightAgentOn = useNextInLinePrompt((s) => s.offHours.enabled);
+	const setOffHours = useNextInLinePrompt((s) => s.setOffHours);
 	const navigate = useNavigate();
+	const nightIntro = useNightAgentIntro();
 	// The rows your instructions hide, per the model - revealed, dimmed, on ask.
 	const [showHidden, setShowHidden] = useState(false);
 	const {
@@ -310,24 +327,21 @@ export function NextInLine() {
 		pinned,
 		unpinned,
 	} = useNextInLineQueue(showHidden);
+	// Tonight's picks in pick order - the order the Night Agent starts them -
+	// so the column reads top-down the way the night runs. From everything
+	// waiting, not just what's shown: the AI's hides don't apply to your picks.
+	const byKey = new Map(waiting.map((item) => [item.key, item]));
+	const tonight = picked.flatMap((key) => byKey.get(key) ?? []);
+	const notPicked = (item: AllItem) => !picked.includes(item.key);
+	const pinnedRest = pinned.filter(notPicked);
+	const rest = unpinned.filter(notPicked);
 	// Open hands the link to the OS: a Slack permalink goes through Slack's
 	// own hand-off into the desktop app, everything else to the browser.
 	// Same Done as every feed, so a row done here is done there and back.
 	const { markDone } = useDone();
 	const doneWithUndo = (item: AllItem) =>
 		markDone({ ...item, title: cleanTitle(item.title) });
-	// The Review sweep's DROPs, so a row it wants gone says so here too. By key,
-	// or by link for PRs, which Next in line keys by id and the sweep by repo#n.
 	const swept = useReview((review) => review.swept);
-	const dropFor = useMemo(() => {
-		const drops = swept.filter((row) => row.verdict === "DROP");
-		const byKey = new Map(drops.map((row) => [row.key, row]));
-		const byUrl = new Map(
-			drops.flatMap((row) => (row.url ? [[row.url, row] as const] : [])),
-		);
-		return (item: AllItem) =>
-			byKey.get(item.key) ?? (item.url ? byUrl.get(item.url) : undefined);
-	}, [swept]);
 	// Every verdict, not just DROPs: the hover says what the sweep found either way.
 	const sweptFor = useMemo(() => {
 		const byKey = new Map(swept.map((row) => [row.key, row]));
@@ -340,7 +354,12 @@ export function NextInLine() {
 	return (
 		// Dressed like the board's columns, in Odin's own violet: it's the one
 		// column the AI fills rather than a session status.
-		<div className="relative flex min-w-[240px] flex-1 flex-col overflow-hidden rounded-xl border border-border bg-tertiary/85 bg-[linear-gradient(to_bottom,color-mix(in_oklab,var(--primary)_9%,transparent),transparent_160px)]">
+		<div
+			className={cn(
+				BOARD_COLUMN_MIN_W,
+				"relative flex flex-1 flex-col overflow-hidden rounded-xl border border-border bg-tertiary/85 bg-[linear-gradient(to_bottom,color-mix(in_oklab,var(--primary)_9%,transparent),transparent_160px)]",
+			)}
+		>
 			<span
 				aria-hidden
 				className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-primary via-primary/40 to-transparent"
@@ -372,7 +391,7 @@ export function NextInLine() {
 						className="font-normal normal-case tracking-normal"
 					/>
 					<span className="rounded-[10px] bg-secondary px-2 font-medium">
-						{next.length}
+						{tonight.length + pinnedRest.length + rest.length}
 					</span>
 				</span>
 			</div>
@@ -388,27 +407,73 @@ export function NextInLine() {
 				count={waiting.length}
 			/>
 			<div className="flex flex-col gap-2 overflow-y-auto px-2 pb-2.5">
-				{next.length === 0 ? (
+				{next.length + tonight.length === 0 ? (
 					<div className="px-2 py-6 text-center text-xs text-muted-foreground">
 						Nothing waiting to start
 					</div>
 				) : (
 					<>
-						{pinned.length > 0 && (
-							<div className="px-1 pt-0.5 text-[10.5px] font-semibold uppercase tracking-[.4px] text-attention">
-								Due · {pinned.length}
+						{tonight.length > 0 && (
+							<div className="flex items-center gap-1.5 px-1 pt-0.5 text-[10.5px] font-semibold uppercase tracking-[.4px] text-primary">
+								<LuMoon className="size-3" aria-hidden />
+								Tonight · {tonight.length}
+								<button
+									type="button"
+									onClick={() =>
+										setOffHours({
+											afterPicks: afterPicks === "stop" ? "ranked" : "stop",
+										})
+									}
+									title="What the Night Agent does after these. Click to switch."
+									className="ml-auto font-normal normal-case tracking-normal text-muted-foreground hover:text-foreground"
+								>
+									then {afterPicks === "stop" ? "stop" : "the rest below"}
+								</button>
 							</div>
 						)}
-						{pinned.map((item) => card(item, true))}
-						{pinned.length > 0 && unpinned.length > 0 && (
-							<div className="mt-1 border-t border-border px-1 pt-2 text-[10.5px] font-semibold uppercase tracking-[.4px] text-muted-foreground">
-								Everything else
+						{tonight.length === 0 && (
+							<div className="flex items-center gap-1.5 px-1 pt-0.5 text-[11px] text-muted-foreground">
+								<LuMoon className="size-3" aria-hidden />
+								Click the moon on a task to run it tonight
 							</div>
 						)}
-						{unpinned.map((item) => card(item, false))}
+						{tonight.length > 0 && !nightAgentOn && (
+							<button
+								type="button"
+								onClick={() =>
+									nightIntro.gate(() => setOffHours({ enabled: true }))
+								}
+								title="Picks only start while the Night Agent is on"
+								className="mx-1 rounded-md border border-attention/40 bg-attention/10 px-2 py-1 text-left text-[11px] text-attention hover:bg-attention/20"
+							>
+								Night Agent is off, these won't start. Turn on
+							</button>
+						)}
+						{tonight.map((item) => card(item, false))}
+						{pinnedRest.length > 0 && (
+							<div
+								className={cn(
+									"px-1 text-[10.5px] font-semibold uppercase tracking-[.4px] text-attention",
+									tonight.length
+										? "mt-1 border-t border-border pt-2"
+										: "pt-0.5",
+								)}
+							>
+								Due · {pinnedRest.length}
+							</div>
+						)}
+						{pinnedRest.map((item) => card(item, true))}
+						{(tonight.length > 0 || pinnedRest.length > 0) &&
+							rest.length > 0 && (
+								<div className="mt-1 border-t border-border px-1 pt-2 text-[10.5px] font-semibold uppercase tracking-[.4px] text-muted-foreground">
+									Everything else
+								</div>
+							)}
+						{rest.map((item) => card(item, false))}
 					</>
 				)}
 			</div>
+			{nightIntro.dialog}
 		</div>
 	);
 
@@ -416,11 +481,13 @@ export function NextInLine() {
 		const Icon = ICON[item.to];
 		const meta = [item.person, item.context].filter(Boolean).join(" · ");
 		const duplicate = duplicateFor(item);
+		const pickIndex = picked.indexOf(item.key);
+		const pickFull = pickIndex < 0 && picked.length >= MAX_NIGHT_PICKS;
 		return (
 			<div
 				key={item.key}
 				className={cn(
-					"group relative flex items-start gap-2 rounded-[10px] border border-border bg-card px-2.5 py-2 transition-colors hover:border-input hover:bg-secondary",
+					"group relative flex flex-col gap-1 rounded-[10px] border border-border bg-card px-2.5 py-2 transition-colors hover:border-input hover:bg-secondary",
 					(isAiHidden(item) || duplicate) && "opacity-50",
 				)}
 				title={
@@ -431,18 +498,9 @@ export function NextInLine() {
 							: undefined
 				}
 			>
-				{/* A to-do's checkbox, where a to-do's checkbox goes. */}
-				<button
-					type="button"
-					onClick={() => doneWithUndo(item)}
-					title="Mark done - take it off Next in line"
-					aria-label="Mark done"
-					className="mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full border border-input text-transparent transition-colors hover:border-success hover:bg-success/15 hover:text-success"
-				>
-					<LuCheck className="size-2.5" strokeWidth={3} aria-hidden />
-				</button>
-				{/* Title and meta get the card's whole width; the actions only
-								    exist on hover, so they never cost a line of text. */}
+				{/* Title and meta get the card's whole width; the actions are a
+								    row under them that is always laid out and only shown on hover, so they
+								    never cover text and hovering never pushes the cards below. */}
 				<HoverCard openDelay={400} closeDelay={80}>
 					<HoverCardTrigger asChild>
 						<div className="min-w-0 flex-1">
@@ -481,9 +539,7 @@ export function NextInLine() {
 									</span>
 								)}
 							</div>
-							{dropFor(item) && (
-								<DropHint evidence={dropFor(item)?.evidence ?? ""} />
-							)}
+							<SweepDrop itemKey={item.key} url={item.url} inline={false} />
 							{duplicate && (
 								<div
 									className={`mt-1 line-clamp-2 w-full rounded-[5px] px-[7px] py-px text-[11px] font-medium ${PILL.attention}`}
@@ -513,10 +569,38 @@ export function NextInLine() {
 				</HoverCard>
 				<div
 					className={cn(
-						"absolute right-1.5 top-1.5 hidden items-center gap-0.5 rounded-lg border border-border bg-popover p-0.5 shadow-lg group-focus-within:flex group-hover:flex",
-						launchingKey === item.launch.key && "flex",
+						"invisible flex items-center justify-end gap-0.5 group-focus-within:visible group-hover:visible",
+						launchingKey === item.launch.key && "visible",
 					)}
 				>
+					<button
+						type="button"
+						onClick={() =>
+							pickIndex >= 0
+								? toggleNightPick(item.key)
+								: nightIntro.gate(() => toggleNightPick(item.key))
+						}
+						disabled={pickFull}
+						aria-pressed={pickIndex >= 0}
+						aria-label="Pick for tonight"
+						title={
+							pickIndex >= 0
+								? "Take off tonight's picks"
+								: pickFull
+									? `Tonight's picks are full (${MAX_NIGHT_PICKS})`
+									: "Pick for tonight - the Night Agent starts picks first"
+						}
+						// Visible at rest, unlike the actions beside it: hidden behind a
+						// hover, nobody found how to queue a task for tonight.
+						className={cn(
+							"visible rounded-md p-1 hover:bg-accent disabled:opacity-40",
+							pickIndex >= 0
+								? "text-primary"
+								: "text-muted-foreground/60 hover:text-foreground",
+						)}
+					>
+						<LuMoon className="size-3.5" aria-hidden />
+					</button>
 					{item.url && /^https?:\/\//.test(item.url) && (
 						<button
 							type="button"
@@ -532,6 +616,15 @@ export function NextInLine() {
 							<LuExternalLink className="size-3.5" aria-hidden />
 						</button>
 					)}
+					{/* The board card's hover ✓ Done, so Done reads the same everywhere. */}
+					<button
+						type="button"
+						onClick={() => doneWithUndo(item)}
+						title="Mark done - take it off Next in line"
+						className="whitespace-nowrap rounded-md px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-success/15 hover:text-success"
+					>
+						✓ Done
+					</button>
 					<button
 						type="button"
 						disabled={isLaunching}
@@ -637,7 +730,7 @@ function RankStatus({
 			className="ml-auto flex shrink-0 items-center gap-1 rounded-md bg-primary/15 px-2 py-0.5 font-medium text-primary hover:bg-primary/25"
 		>
 			<LuSparkles className="size-3 text-primary" aria-hidden />
-			{applied && ranked ? "Re-rank" : "Apply AI recommendations"}
+			{applied && ranked ? "Re-sort" : "Sort with AI"}
 		</button>
 	);
 	return (
@@ -646,17 +739,17 @@ function RankStatus({
 				{applied && ranked ? (
 					<>
 						<LuSparkles className="size-3 text-primary" aria-hidden />
-						Ranked by AI
+						Sorted by AI
 						<button
 							type="button"
 							onClick={onUndo}
 							className="hover:text-foreground"
 						>
-							· back to All tasks order
+							· undo
 						</button>
 					</>
 				) : (
-					"All tasks order"
+					"Newest first"
 				)}
 				{button}
 			</div>

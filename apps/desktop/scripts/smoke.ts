@@ -44,8 +44,8 @@ const env: Record<string, string | undefined> = {
 // Set inside an Odin terminal; it would boot Electron as plain node.
 delete env.ELECTRON_RUN_AS_NODE;
 
-// A Quick question conversation an earlier run left open: it has to survive
-// the restart and take the next question.
+// A crow conversation an earlier run left open: it has to survive the
+// restart and take the next ask.
 const QUESTION = "Smoke question";
 mkdirSync(join(home, ".odin"));
 writeFileSync(
@@ -97,7 +97,9 @@ mkdirSync(join(home, "bin"));
 writeFileSync(
 	join(home, "bin", "claude"),
 	// One file per run, named by pid (exec keeps it), moved into place whole.
-	`#!/bin/sh\nprintf '%s %s' "$ODIN_PORT" "$ODIN_PANE_ID" > "$HOME/pane-$$"\nprintf '%s\\n' "$@" > "$HOME/.claude-$$"\nmv "$HOME/.claude-$$" "$HOME/claude-$$.args"\necho "fake claude is working"\nexec sleep 600\n`,
+	// A --session-id launch leaves a transcript, like the real one: Resume
+	// refuses an id Claude never saved.
+	`#!/bin/sh\nfor a; do [ "$prev" = --session-id ] && mkdir -p "$HOME/.claude/projects/smoke" && : > "$HOME/.claude/projects/smoke/$a.jsonl"; prev=$a; done\nprintf '%s %s' "$ODIN_PORT" "$ODIN_PANE_ID" > "$HOME/pane-$$"\nprintf '%s\\n' "$@" > "$HOME/.claude-$$"\nmv "$HOME/.claude-$$" "$HOME/claude-$$.args"\necho "fake claude is working"\nexec sleep 600\n`,
 	{ mode: 0o755 },
 );
 // Sessions run in a login shell, which reads these after macOS's path_helper
@@ -362,6 +364,7 @@ await step("Tasks: every feed tab opens", async () => {
 		"GitHub",
 		"Notion",
 		"Email",
+		"ClickUp",
 	]) {
 		const found = await page<boolean>(`(() => {
 			const strip = __find("button", "Slack").parentElement;
@@ -420,6 +423,48 @@ await step("the My Tasks composer adds a task with its button", async () => {
 	await waitForText(typed);
 });
 
+/**
+ * Where TASK's columns sit, and the header's Task label: every tab draws
+ * rows with the one table, so the same task lines up the same way on All and
+ * on its own tab (task-table.test.ts checks the code; this checks the screen).
+ */
+const taskColumns = () =>
+	page<number[] | null>(`(() => {
+		const title = [...document.querySelectorAll("button")].find((e) => e.textContent.trim() === ${JSON.stringify(TASK)});
+		const row = title?.closest("[data-task-row]");
+		const header = [...document.querySelectorAll("span")].find((e) => e.textContent.trim() === "Task");
+		if (!row || !header) return null;
+		const x = (e) => Math.round(e?.getBoundingClientRect().left ?? -1);
+		return [
+			x(header),
+			x(title),
+			x(row.querySelector('button[aria-label^="Line it up"]')),
+			x(row.querySelector('button[aria-label="Start session"], button[aria-label="Go to session"]')),
+			x(row.querySelector('button[title="Mark done"]')),
+		];
+	})()`);
+
+await step(
+	"a task's columns line up the same on All and on its own tab",
+	async () => {
+		await rail("Tasks");
+		await waitForText(TASK);
+		const all = await taskColumns();
+		await page(`(() => {
+		const strip = __find("button", "Slack").parentElement;
+		__find("button", "Tasks", strip).click();
+	})()`);
+		await waitForText("my own list");
+		await waitForText(TASK);
+		const own = await taskColumns();
+		if (!all || !own) throw new Error("no table row or header for the task");
+		if (all[0] !== all[1] || own[0] !== own[1])
+			throw new Error(`the Task header isn't over the titles: ${all} / ${own}`);
+		if (JSON.stringify(all) !== JSON.stringify(own))
+			throw new Error(`columns moved between All ${all} and Tasks ${own}`);
+	},
+);
+
 await step("a new profile sees none of the first one's tasks", async () => {
 	await rail("Settings");
 	await waitForText("profiles");
@@ -450,24 +495,156 @@ await step("starting a task asks for optional context first", async () => {
 		throw new Error("Cancel still started a session");
 });
 
-await step("Read later moves a task to Reading material and back", async () => {
-	await rail("Tasks");
-	await waitForText(TASK);
-	const found = await page<boolean>(`(() => {
+/** Click the button titled `title*` on TASK's row in Tasks. */
+const clickOnTaskRow = (title: string) =>
+	page<boolean>(`(() => {
+		const sel = 'button[title^=${JSON.stringify(title)}], button[aria-label^=${JSON.stringify(title)}]';
 		let row = [...document.querySelectorAll("button")].find((e) => e.textContent.trim() === ${JSON.stringify(TASK)});
-		while (row && !row.querySelector('button[title^="Nothing to do"]')) row = row.parentElement;
-		row?.querySelector('button[title^="Nothing to do"]').click();
+		while (row && !row.querySelector(sel)) row = row.parentElement;
+		row?.querySelector(sel).click();
 		return !!row;
 	})()`);
-	if (!found) throw new Error("no Read later button on the task's row");
-	await waitForText(TASK, false);
-	await click("button", "Reading material");
+
+/** Whether TASK's row has a button titled `title*`. */
+const clickOnTaskRowHas = (title: string) =>
+	page<boolean>(`(() => {
+		const sel = 'button[title^=${JSON.stringify(title)}], button[aria-label^=${JSON.stringify(title)}]';
+		let row = [...document.querySelectorAll("button")].find((e) => e.textContent.trim() === ${JSON.stringify(TASK)});
+		while (row && !row.querySelector(sel)) row = row.parentElement;
+		return !!row?.querySelector(sel) && !!row.querySelector('button[title="Mark done"]');
+	})()`);
+
+/**
+ * Where Start session and Done sit on TASK's row. Rows are separate grids, so a
+ * wider or missing button on one row ("↺ Read later", no Tonight) used to push
+ * its buttons out of line with every other row's.
+ */
+const taskRowButtons = () =>
+	page<{ start: number; done: number } | null>(`(() => {
+		let row = [...document.querySelectorAll("button")].find((e) => e.textContent.trim() === ${JSON.stringify(TASK)});
+		while (row && !row.querySelector('button[title="Mark done"]')) row = row.parentElement;
+		const done = row?.querySelector('button[title="Mark done"]')?.getBoundingClientRect();
+		const start = [...(row?.querySelectorAll("button") ?? [])].find((e) => /^(Start session|Go to session)/.test(e.getAttribute("aria-label") || e.textContent.trim()))?.getBoundingClientRect();
+		return done && start ? { start: Math.round(start.right), done: Math.round(done.left) } : null;
+	})()`);
+
+await step("Read later marks a task and keeps it on the list", async () => {
+	await rail("Tasks");
 	await waitForText(TASK);
-	await waitForText("saved");
-	// Undo on the only row empties the shelf: back on the queue, row and all.
-	await click("button", "Put it back");
+	const before = await taskRowButtons();
+	if (!before) throw new Error("no Start session and Done on the task's row");
+	if (before.done - before.start > 16)
+		throw new Error(
+			`Start session isn't next to Done: ${before.done - before.start}px apart`,
+		);
+	if (!(await clickOnTaskRow("Mark it Read later")))
+		throw new Error("no Read later button on the task's row");
+	// The row's own button turns to "Back to Waiting on you": the Status
+	// column that would print "Read later" is hidden on a narrow window.
+	for (
+		const end = Date.now() + 5_000;
+		!(await clickOnTaskRowHas("Back to Waiting on you"));
+	) {
+		if (Date.now() > end) throw new Error("Read later never took");
+		await sleep(200);
+	}
 	await waitForText(TASK);
-	await waitForText("waiting on you");
+	const after = await taskRowButtons();
+	if (JSON.stringify(after) !== JSON.stringify(before))
+		throw new Error(
+			`the wider "↺ Read later" moved the row's buttons: ${JSON.stringify(before)} -> ${JSON.stringify(after)}`,
+		);
+	if (!(await clickOnTaskRow("Back to Waiting on you")))
+		throw new Error("no way back from Read later on the task's row");
+	for (
+		const end = Date.now() + 5_000;
+		await clickOnTaskRowHas("Back to Waiting on you");
+	) {
+		if (Date.now() > end) throw new Error("Read later never cleared");
+		await sleep(200);
+	}
+	await waitForText(TASK);
+});
+
+await step(
+	"Up next lines a task up above the list and lets it go",
+	async () => {
+		await rail("Tasks");
+		if (!(await clickOnTaskRow("Line it up")))
+			throw new Error("no Up next button on the task's row");
+		await waitForText("drag to reorder");
+		await page(
+			`document.querySelector('button[title="Take it off Up next"], button[aria-label="Take it off Up next"]')?.click()`,
+		);
+		await waitForText("drag to reorder", false);
+		await waitForText(TASK);
+	},
+);
+
+await step("Tonight on a task row picks it for the Night Agent", async () => {
+	// Next in line is a column you open on the board; a fresh home has it shut.
+	const openNextInLine = () =>
+		page(
+			`document.querySelector('button[title="Show the tasks worth starting next"]')?.click()`,
+		);
+	await rail("Tasks");
+	// One grid column per row item: one short and Done wraps under the checkbox.
+	const doneWraps = await page<boolean>(`(() => {
+		const title = [...document.querySelectorAll("button")].find((e) => e.textContent.trim() === ${JSON.stringify(TASK)});
+		const done = title?.closest("[data-task-row]")?.querySelector('button[title="Mark done"]');
+		return !done || done.getBoundingClientRect().top > title.getBoundingClientRect().bottom;
+	})()`);
+	if (doneWraps) throw new Error("Done wrapped off the task's row");
+	if (!(await clickOnTaskRow("Pick for tonight")))
+		throw new Error("no Tonight button on the task's row");
+	// First pick: the keeps-the-computer-awake notice comes first.
+	await waitForText("keeps your computer awake");
+	await click("button", "Got it");
+	await rail("Dev Board");
+	await openNextInLine();
+	await waitForText("tonight · 1");
+	await rail("Tasks");
+	if (!(await clickOnTaskRow("Take off tonight")))
+		throw new Error("Tonight didn't toggle back on the task's row");
+	await rail("Dev Board");
+	await openNextInLine();
+	await waitForText("click the moon on a task to run it tonight");
+	// Leave the board as the later steps expect it.
+	await page(
+		`document.querySelector('button[title="Hide the Next in line column"]')?.click()`,
+	);
+});
+
+await step("the Tasks page has its own composer", async () => {
+	const typed = `All composer task ${Date.now()}`;
+	await rail("Tasks");
+	await fill('input[placeholder="What needs doing?"]', typed);
+	await click("button", "Add task");
+	await waitForText(typed);
+});
+
+await step("ticking two tasks marks both done at once", async () => {
+	const pair = [`Bulk one ${Date.now()}`, `Bulk two ${Date.now()}`];
+	await rail("Tasks");
+	for (const typed of pair) {
+		await fill('input[placeholder="What needs doing?"]', typed);
+		await click("button", "Add task");
+		await waitForText(typed);
+	}
+	for (const typed of pair)
+		await page(
+			`document.querySelector(${JSON.stringify(`input[aria-label="Select ${typed}"]`)}).click()`,
+		);
+	await waitForText("2 selected");
+	// The bar's Done, not a row's: the bar is the element that says "selected".
+	await page(`(() => {
+		let bar = [...document.querySelectorAll("span")].find((e) => e.textContent.trim() === "2 selected");
+		while (bar && !bar.querySelector('button[title="Mark done"]')) bar = bar.parentElement;
+		bar.querySelector('button[title="Mark done"]').click();
+	})()`);
+	for (const typed of pair) await waitForText(typed, false);
+	await waitForText("2 selected", false);
+	await waitForText(TASK);
 });
 
 await step("A task's title opens its details beside the list", async () => {
@@ -498,6 +675,35 @@ await step("A task's title opens its details beside the list", async () => {
 	await waitForText("Tasks feed →", false);
 });
 
+await step("⌘⇧F Search all finds a task and opens its details", async () => {
+	await rail("Dev Board");
+	await waitForText("next in line");
+	await page(`document.activeElement?.blur()`);
+	await page(
+		`document.dispatchEvent(new KeyboardEvent("keydown", { key: "f", code: "KeyF", metaKey: true, shiftKey: true, bubbles: true }))`,
+	);
+	await sleep(300);
+	await fill(
+		'input[placeholder="Search feeds, the board and every past session"]',
+		TASK,
+	);
+	// The board can show the task too: wait for it as the palette's picked hit.
+	const picked = `document.querySelector('[cmdk-item][data-selected="true"]')?.textContent.includes(${JSON.stringify(TASK)})`;
+	for (const end = Date.now() + 5_000; !(await page<boolean>(picked)); ) {
+		if (Date.now() > end) throw new Error("the task never came up first");
+		await sleep(200);
+	}
+	// Enter picks it, the way the keyboard would.
+	await page(
+		`document.activeElement?.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true }))`,
+	);
+	await waitForText("Tasks feed →");
+	const hash = await page<string>("location.hash");
+	if (!hash.startsWith("#/all")) throw new Error(`Search all opened ${hash}`);
+	await click("button", "Close details");
+	await waitForText("Tasks feed →", false);
+});
+
 await step("Done takes a task off the list", async () => {
 	await rail("Tasks");
 	await waitForText(TASK);
@@ -512,16 +718,18 @@ await step("Done takes a task off the list", async () => {
 	await waitForText(TASK, false);
 });
 
-// Settings is six fixed screens; each sidebar link and the route it opens.
+// Settings is eight fixed screens; each sidebar link and the route it opens.
 const SETTINGS: [string, string][] = [
 	["Connections", "#/settings/connections"],
 	["Sessions", "#/settings/sessions"],
-	["Backlog", "#/settings/backlog"],
+	["Storage", "#/settings/storage"],
+	["Backlog & Night Agent", "#/settings/backlog"],
 	["Notifications", "#/settings/ringtones"],
 	["Appearance", "#/settings/appearance"],
 	["Keyboard", "#/settings/keyboard"],
+	["Advanced", "#/settings/advanced"],
 ];
-await step("Settings is exactly its six screens, and each opens", async () => {
+await step("Settings: exactly its eight screens, and each opens", async () => {
 	await rail("Settings");
 	await waitForText("profiles");
 	const links = await page<string[]>(
@@ -536,18 +744,25 @@ await step("Settings is exactly its six screens, and each opens", async () => {
 		if (!hash.startsWith(route)) throw new Error(`${label} opened ${hash}`);
 		await expectHealthy();
 	}
+	// Keyboard's search narrows the list.
+	await click("a", "Keyboard");
+	await fill('input[aria-label="Search shortcuts"]', "undo");
+	await waitForText("next session", false);
+	await waitForText("undo the last done");
+	await fill('input[aria-label="Search shortcuts"]', "");
 	await click("a", "Back");
 	await waitForText("waiting on you");
 });
 
-await step("Quick question follows up in the open conversation", async () => {
+await step("The raven opens its panel in place", async () => {
 	await rail("Dev Board");
 	await waitForText("next in line");
-	await click("button", "Ask a Claude");
-	await waitForText(`follows up in “${QUESTION}”`);
-	await click("button", "Show it");
-	await waitForText("follows up in", false);
-	await waitForText(QUESTION);
+	await click("button", "Ask the raven");
+	// The left-open conversation's Claude died with the last run, so the panel
+	// greets; asking would resume it there.
+	await waitForText("how can i help you today?");
+	await click("button", "Ask the raven");
+	await waitForText("how can i help you today?", false);
 });
 
 const SESSION = `Smoke session ${Date.now()}`;
@@ -555,7 +770,7 @@ let sessionPid = 0;
 await step(
 	"New Session puts a card on the board and gives claude the prompt",
 	async () => {
-		// The previous step left the conversation's drawer open; Esc closes it.
+		// Esc first, so nothing an earlier step opened is in the way.
 		await page(
 			`(document.activeElement ?? document.body).dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))`,
 		);
@@ -571,7 +786,7 @@ await step(
 		await page(
 			`document.querySelector('button[title="Start this session now, gate or no gate"]')?.click()`,
 		);
-		// Quick question keeps its own claude warm, so pick out the run that
+		// The crow keeps its own claude warm, so pick out the run that
 		// carries this session's prompt.
 		for (const end = Date.now() + 60_000; !sessionPid; await sleep(500)) {
 			if (Date.now() > end) {

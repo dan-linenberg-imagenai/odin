@@ -1,6 +1,8 @@
 import { toast } from "@odin/ui/sonner";
 import { useLaunchTaskSession } from "renderer/hooks/useLaunchTaskSession";
 import { electronTrpc } from "renderer/lib/electron-trpc";
+import { useClaudeCommand } from "renderer/stores/claude-command";
+import { useMyTasks } from "../hooks/useOdinTasks";
 import { useOdinWorkspace } from "../hooks/useOdinWorkspace";
 import { usePaneMeta } from "../hooks/usePaneMeta";
 import {
@@ -23,6 +25,7 @@ export function NewSessionDialog({
 	const { ensureWorkspace } = useOdinWorkspace();
 	const { launch } = useLaunchTaskSession();
 	const { data: projects = [] } = electronTrpc.projects.getRecents.useQuery();
+	const { add: addTask } = useMyTasks();
 
 	const handleNewSession = async (
 		rawPrompt: string,
@@ -31,6 +34,19 @@ export function NewSessionDialog({
 	) => {
 		const prompt = rawPrompt.trim();
 		if (!prompt && images.length === 0) return;
+		if (useClaudeCommand.getState().toBacklog) {
+			// ponytail: a My Tasks row is plain text, so attachments have nowhere
+			// to live yet - say so rather than drop them.
+			if (images.length > 0)
+				return void toast.error(
+					"Backlog tasks can't keep images or videos yet. Remove them or start the session now.",
+				);
+			if (!prompt) return;
+			addTask(prompt, undefined, repoPath);
+			onClose();
+			toast.success("Added to My Tasks");
+			return;
+		}
 		const ensured = await ensureWorkspace();
 		if (!ensured.ok) {
 			toast.error(ensured.error);
@@ -68,6 +84,8 @@ export function NewSessionDialog({
 			heading="New Session"
 			placeholder="What should the agent do? (it picks the repo)"
 			repoPicker
+			modelPicker
+			backlogToggle
 			onCancel={onClose}
 			onSubmit={handleNewSession}
 		/>

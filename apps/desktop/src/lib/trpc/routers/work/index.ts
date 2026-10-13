@@ -5,6 +5,7 @@ import { TRPCError } from "@trpc/server";
 import { isInternalBuild } from "main/lib/build-channel";
 import { githubAccessToken, githubApiFetch } from "main/lib/github-token";
 import { hasJiraOAuth, jiraRequestContext } from "main/lib/jira-token";
+import { clickupFetch } from "main/lib/read-link";
 import { z } from "zod";
 import { publicProcedure, router } from "../..";
 import { readOdinConfig, resolveGithubToken } from "../odin-config";
@@ -84,6 +85,30 @@ export interface JiraIssueRow {
 	mention: JiraMention | null;
 	/** The ticket's description as plain text, capped - for the hover card. */
 	description?: string | null;
+	/** The epic it sits under. Null when it has none, or its parent is a story. */
+	epic?: { key: string; title: string } | null;
+}
+
+interface JiraParent {
+	key: string;
+	fields?: {
+		summary?: string;
+		issuetype?: { name?: string; hierarchyLevel?: number };
+	};
+}
+
+/**
+ * The parent, when it's an epic. A sub-task's parent is a story, not an epic;
+ * hierarchy level 1 is the epic level whatever the site renamed the type to.
+ */
+export function epicOf(parent: JiraParent | undefined): JiraIssueRow["epic"] {
+	const type = parent?.fields?.issuetype;
+	if (
+		!parent ||
+		!(type?.hierarchyLevel === 1 || /epic/i.test(type?.name ?? ""))
+	)
+		return null;
+	return { key: parent.key, title: parent.fields?.summary ?? parent.key };
 }
 
 interface JiraComment {
@@ -174,6 +199,25 @@ export interface EmailRow {
 	junk?: boolean | null;
 }
 
+/** One open ClickUp task assigned to me. */
+export interface ClickupTaskRow {
+	id: string;
+	url: string;
+	name: string;
+	status: string | null;
+	priority: string | null;
+	list: string | null;
+	creator: string | null;
+	description: string | null;
+	updated: string | null;
+	created: string | null;
+	dueDate: string | null;
+}
+
+/** ClickUp dates are epoch-ms strings; the feeds speak ISO. */
+const clickupDate = (ms: string | null | undefined) =>
+	ms ? new Date(Number(ms)).toISOString() : null;
+
 export interface GmailCredentials {
 	address: string;
 	password: string;
@@ -252,6 +296,7 @@ interface JiraSearchResponse {
 			duedate?: string;
 			comment?: { comments?: JiraComment[] };
 			description?: unknown;
+			parent?: JiraParent;
 		};
 	}[];
 }
@@ -279,6 +324,7 @@ export const createWorkRouter = () => {
 			hasJira: hasJiraOAuth(),
 			hasGithub: githubToken() !== null,
 			hasGmail: gmailCredentials() !== null,
+			hasClickup: !!readOdinConfig().clickupToken,
 			/**
 			 * Odin's own checkout: gates self-update, and is where "Work on Odin"
 			 * sessions launch so the agent starts in the right repo instead of
@@ -444,7 +490,7 @@ export const createWorkRouter = () => {
 					const jql = `${match}${openOnly} ORDER BY updated DESC`;
 					// Comment bodies are only worth their weight on the mention rows,
 					// where they are the point.
-					const fields = `summary,status,priority,project,issuetype,reporter,assignee,updated,created,duedate,description${role === "mentioned" ? ",comment" : ""}`;
+					const fields = `summary,status,priority,project,issuetype,reporter,assignee,updated,created,duedate,description,parent${role === "mentioned" ? ",comment" : ""}`;
 					const response = await fetch(
 						`${request.base}/rest/api/3/search/jql?jql=${encodeURIComponent(jql)}&maxResults=100&fields=${fields}`,
 						{ headers },
@@ -479,6 +525,7 @@ export const createWorkRouter = () => {
 								.replace(/\n{3,}/g, "\n\n")
 								.trim()
 								.slice(0, 3000) || null,
+						epic: epicOf(issue.fields?.parent),
 						mention: accountId
 							? latestMention(issue.fields?.comment?.comments ?? [], accountId)
 							: null,
@@ -614,6 +661,69 @@ export const createWorkRouter = () => {
 						...email,
 						junk: verdicts.get(email.id) ?? null,
 					})),
+				};
+			},
+		),
+
+		/** Open tasks assigned to me, across every ClickUp workspace the token reaches. */
+		myClickupTasks: publicProcedure.query(
+			async (): Promise<{ tasks: ClickupTaskRow[] }> => {
+				const token = readOdinConfig().clickupToken;
+				if (!token) {
+					throw new TRPCError({
+						code: "PRECONDITION_FAILED",
+						message:
+							"ClickUp isn't connected - add it in Settings → Connections.",
+					});
+				}
+				const get = async <T>(path: string): Promise<T> => {
+					const response = await clickupFetch(path, token);
+					if (!response.ok) {
+						throw feedError("ClickUp", response.status, await response.text());
+					}
+					return (await response.json()) as T;
+				};
+				const [{ user }, { teams }] = await Promise.all([
+					get<{ user: { id: number } }>("user"),
+					get<{ teams: { id: string }[] }>("team"),
+				]);
+				type Task = {
+					id: string;
+					name: string;
+					url: string;
+					status?: { status?: string };
+					priority?: { priority?: string } | null;
+					list?: { name?: string };
+					creator?: { username?: string };
+					text_content?: string | null;
+					date_updated?: string | null;
+					date_created?: string | null;
+					due_date?: string | null;
+				};
+				// ponytail: first page (100 tasks) per workspace - page on when someone has more.
+				const pages = await Promise.all(
+					teams.map((team) =>
+						get<{ tasks: Task[] }>(
+							`team/${team.id}/task?assignees[]=${user.id}&subtasks=true&order_by=updated`,
+						),
+					),
+				);
+				return {
+					tasks: pages
+						.flatMap((page) => page.tasks)
+						.map((task) => ({
+							id: task.id,
+							url: task.url,
+							name: task.name,
+							status: task.status?.status ?? null,
+							priority: task.priority?.priority ?? null,
+							list: task.list?.name ?? null,
+							creator: task.creator?.username ?? null,
+							description: task.text_content || null,
+							updated: clickupDate(task.date_updated),
+							created: clickupDate(task.date_created),
+							dueDate: clickupDate(task.due_date),
+						})),
 				};
 			},
 		),

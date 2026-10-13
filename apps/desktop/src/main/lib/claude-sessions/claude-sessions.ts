@@ -560,6 +560,8 @@ export interface TranscriptMessage {
 	role: "user" | "assistant";
 	text: string;
 	at: string | null;
+	/** PR urls `gh pr create` printed: this session opened them. */
+	opened?: true;
 }
 
 /** The conversation, prose only - the readable form of a session. */
@@ -570,6 +572,8 @@ export function parseTranscript(
 ): TranscriptMessage[] {
 	const messages: TranscriptMessage[] = [];
 	const prCreates = new Set<string>();
+	// Artifact publishes by tool_use id: the label and summary the brief shows.
+	const publishes = new Map<string, { title: string; description: string }>();
 	for (const line of jsonl.split("\n")) {
 		if (!line) continue;
 		let entry: Record<string, unknown>;
@@ -593,6 +597,35 @@ export function parseTranscript(
 				)
 					prCreates.add(block.id);
 				else if (
+					block?.type === "tool_use" &&
+					block.name === "Artifact" &&
+					(block.input?.action ?? "publish") === "publish" &&
+					!block.input?.asset
+				)
+					publishes.set(block.id, {
+						title: String(
+							block.input?.title ??
+								basename(String(block.input?.file_path ?? "Artifact"), ".html"),
+						),
+						description: String(block.input?.description ?? ""),
+					});
+				else if (
+					block?.type === "tool_result" &&
+					publishes.has(block.tool_use_id)
+				) {
+					// "Published <file> at <url>" - the reply often never repeats the
+					// link, and the brief only reads Claude's side for it.
+					const url = messageText(block.content).match(ARTIFACT_URL)?.[0];
+					const publish = publishes.get(block.tool_use_id);
+					if (url && publish)
+						messages.push({
+							role: "assistant",
+							// A table row: the brief's hover reads the cells after the
+							// link as what it is.
+							text: `| [${publish.title}](${url}) | ${publish.description} |`,
+							at: typeof entry.timestamp === "string" ? entry.timestamp : null,
+						});
+				} else if (
 					block?.type === "tool_result" &&
 					prCreates.has(block.tool_use_id)
 				) {
@@ -602,6 +635,7 @@ export function parseTranscript(
 							role: "assistant",
 							text: urls.join("\n"),
 							at: typeof entry.timestamp === "string" ? entry.timestamp : null,
+							opened: true,
 						});
 				}
 			}
@@ -757,6 +791,7 @@ export interface RuleFiring {
  */
 const PR_ACTION =
 	/(?:^|[;&|])\s*(?:\w+=\S*\s+)*(?:gh pr (?:create|edit|ready)|git\b[^;&|\n]*?\spush)\b/m;
+const ARTIFACT_URL = /https:\/\/claude\.ai\/(?:code\/)?artifact\/[\w-]+/;
 const PR_URL = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/g;
 
 /**

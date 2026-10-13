@@ -1,3 +1,4 @@
+import { Tooltip, TooltipContent, TooltipTrigger } from "@odin/ui/tooltip";
 import { cn } from "@odin/ui/utils";
 import { type ReactNode, useRef } from "react";
 import { useHotkey } from "renderer/hotkeys";
@@ -235,6 +236,38 @@ export const ROW_LINK_SLOT = "flex w-[84px] shrink-0 justify-end";
  * left with it.
  */
 export const ROW_PRIMARY_SLOT = "flex w-[132px] shrink-0 justify-end";
+/**
+ * The Tasks page's secondary buttons get slots too, sized to their widest
+ * label ("Tonight ✓", "↺ Read later"): a row without Tonight or with Read later
+ * on shifted Start session and Done out of line with the rows around it.
+ */
+export const ROW_SLOT_UP_NEXT = "flex w-[72px] shrink-0 justify-center";
+export const ROW_SLOT_TONIGHT = "flex w-[96px] shrink-0 justify-center";
+export const ROW_SLOT_READ_LATER = "flex w-[112px] shrink-0 justify-center";
+/** A row action drawn as an icon - always shown, named by its tooltip. */
+export const ROW_ICON_BUTTON =
+	"flex size-6 shrink-0 items-center justify-center rounded-[6px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground hover:ring-1 hover:ring-inset hover:ring-border";
+
+/**
+ * An icon's name, shown the moment the cursor lands on it - a row of bare
+ * icons is unreadable if their names wait a second behind a native title.
+ */
+export function IconTip({
+	label,
+	children,
+}: {
+	label: string;
+	children: ReactNode;
+}) {
+	return (
+		<Tooltip delayDuration={0}>
+			<TooltipTrigger asChild>
+				<span className="inline-flex">{children}</span>
+			</TooltipTrigger>
+			<TooltipContent side="top">{label}</TooltipContent>
+		</Tooltip>
+	);
+}
 export const ROW_LINK_BUTTON =
 	"whitespace-nowrap rounded-[7px] px-2.5 py-1 text-xs font-semibold text-muted-foreground transition-colors hover:bg-accent hover:text-foreground";
 
@@ -249,3 +282,14 @@ export const FEED_ROW =
 	"group rounded-[10px] border border-border bg-card px-3.5 py-2 shadow-[inset_0_1px_0_rgb(255_255_255/0.035)] transition-colors hover:border-primary/30 hover:bg-secondary/60";
 /** A full-width box in the list - not connected, nothing picked, failed. */
 export const FEED_NOTICE_BOX = "rounded-[10px] px-3.5 py-2.5 text-xs";
+
+/**
+ * A band or section label over a run of rows. Small caps with air above, so
+ * it reads as a heading: at the rows' own 11px muted weight it read as one
+ * more line of meta, and four of them in a column were a wall of grey.
+ */
+export const SECTION_LABEL =
+	"flex items-center gap-2 px-1 pt-3 pb-1 text-[11px] font-semibold uppercase tracking-[.08em] text-soft-foreground";
+/** The aside after a label - a hint or a toggle - in the rows' own quiet voice. */
+export const SECTION_HINT =
+	"font-normal normal-case tracking-normal text-muted-foreground";

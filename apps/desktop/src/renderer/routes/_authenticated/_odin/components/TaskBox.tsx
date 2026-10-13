@@ -3,17 +3,22 @@ import { cn } from "@odin/ui/utils";
 import type { AgentSkill } from "lib/trpc/routers/skills";
 import { useEffect, useRef, useState } from "react";
 import { HiOutlineClock, HiOutlineSparkles } from "react-icons/hi2";
+import { isHotkey } from "renderer/hotkeys";
 import { electronTrpc } from "renderer/lib/electron-trpc";
+import { useClaudeCommand } from "renderer/stores/claude-command";
 import { describeCron, nextRun } from "shared/cron";
 import {
 	PRIORITY_LABELS,
 	parseTask,
 	priorityOf,
 	useMyTasks,
+	useOdinTasks,
 	withPriority,
 	withSkill,
 } from "../hooks/useOdinTasks";
+import { useStartTask } from "../hooks/useStartTask";
 import { ROW_PRIMARY_BUTTON } from "./FeedChrome";
+import { readFile } from "./OdinPromptDialog";
 import { PILL } from "./pill";
 import { matchRepos, repoLabel } from "./repo-picker";
 import { matchSkills } from "./skill-picker";
@@ -26,6 +31,31 @@ const splitTask = (text: string): [string, string] => {
 };
 const joinTask = (title: string, notes: string) =>
 	notes ? `${title}\n\n${notes}` : title;
+
+const isMedia = (file: File) => /^(image|video)\//.test(file.type);
+
+/**
+ * Dropped or pasted photos and videos, as paths the session can open. A task
+ * is one string in localStorage, so it holds paths, never bytes: a file from
+ * Finder is cited where it lies, a pasted screenshot is saved to disk first.
+ * Imported on use so the box still renders without Electron (the tests).
+ */
+export async function attachmentPaths(files: File[]): Promise<string[]> {
+	const [{ electronTrpcClient }, { parseDataUrl }] = await Promise.all([
+		import("renderer/lib/trpc-client"),
+		import("renderer/hooks/useLaunchTaskSession"),
+	]);
+	return Promise.all(
+		files.map(async (file) => {
+			const path = window.webUtils.getPathForFile(file);
+			if (path) return path;
+			const { dataUrl = "" } = await readFile(file);
+			return electronTrpcClient.system.saveAttachment.mutate(
+				parseDataUrl(dataUrl),
+			);
+		}),
+	);
+}
 
 /**
  * The box you write a task in - compose row, edit row and the hotkey's quick
@@ -43,6 +73,7 @@ export function TaskBox({
 	placeholder,
 	autoFocus,
 	hidePriority,
+	compact,
 	skills,
 	repos,
 	repo,
@@ -57,6 +88,11 @@ export function TaskBox({
 	autoFocus?: boolean;
 	/** Automations are scheduled, not ranked - the picker means nothing there. */
 	hidePriority?: boolean;
+	/**
+	 * Folded to its title line until it's focused or holds text. For a box
+	 * that sits above a list you came to read; ⌘N opens the full one anyway.
+	 */
+	compact?: boolean;
 	/**
 	 * The skills this box can offer. Passed in rather than fetched so the box
 	 * stays a plain component - nothing here needs a tRPC context. Without it
@@ -79,24 +115,51 @@ export function TaskBox({
 	submitLabel?: string;
 }) {
 	const [title, notes] = splitTask(value);
-	// Ctrl/⌘+Enter submits from either field.
+	const [focused, setFocused] = useState(false);
+	const folded = !!compact && !focused && !value.trim();
+	// Send (⌘Enter unless rebound) submits from either field.
 	const keys = (event: React.KeyboardEvent) => {
-		if (
-			event.key === "Enter" &&
-			(event.metaKey || event.ctrlKey) &&
-			!event.nativeEvent.isComposing
-		) {
+		if (isHotkey("SUBMIT", event.nativeEvent)) {
 			event.preventDefault();
 			onSubmit();
 		}
 		if (event.key === "Escape") onCancel?.();
+	};
+	// Paths go on their own lines at the end of the brief, where the session's
+	// prompt picks them up like any other text.
+	const attach = (list: FileList, event: React.SyntheticEvent) => {
+		const files = [...list].filter(isMedia);
+		if (files.length === 0) return;
+		event.preventDefault();
+		attachmentPaths(files)
+			.then((paths) =>
+				onChange(joinTask(title, [notes, ...paths].filter(Boolean).join("\n"))),
+			)
+			.catch(() => toast.error("Couldn't attach that file"));
 	};
 
 	return (
 		<div className="flex h-full min-h-0 flex-col gap-1.5">
 			{/* grow, not flex-1: the basis stays the rows=2 height, so inline use is
 			    unchanged and only a resized dialog hands it extra room. */}
-			<div className="flex min-h-0 grow flex-col overflow-hidden rounded-[10px] border border-border bg-card focus-within:border-primary">
+			<fieldset
+				aria-label="Task"
+				onDragOver={(event) => {
+					if (event.dataTransfer.types.includes("Files"))
+						event.preventDefault();
+				}}
+				onDrop={(event) => attach(event.dataTransfer.files, event)}
+				onPaste={(event) => attach(event.clipboardData.files, event)}
+				onFocus={() => setFocused(true)}
+				onBlur={(event) => {
+					if (!event.currentTarget.contains(event.relatedTarget))
+						setFocused(false);
+				}}
+				className={cn(
+					"flex min-h-0 min-w-0 grow flex-col overflow-hidden rounded-[10px] border bg-card focus-within:border-primary",
+					folded ? "border-dashed border-border" : "border-border",
+				)}
+			>
 				<input
 					value={title}
 					placeholder={placeholder ?? "Name it"}
@@ -107,17 +170,23 @@ export function TaskBox({
 					onKeyDown={keys}
 					className="w-full bg-transparent px-3 pt-2 pb-1.5 text-[13px] font-semibold text-foreground outline-none placeholder:font-normal placeholder:text-muted-foreground"
 				/>
-				<div className="mx-3 border-t border-border" />
-				<textarea
-					value={notes}
-					placeholder="The brief - what it needs, links, anything the session should know (optional)"
-					rows={2}
-					aria-label="Brief"
-					onChange={(event) => onChange(joinTask(title, event.target.value))}
-					onKeyDown={keys}
-					className="w-full min-h-0 grow resize-none bg-transparent px-3 pt-1.5 pb-2 text-[13px] text-muted-foreground outline-none placeholder:text-muted-foreground"
-				/>
-			</div>
+				{!folded && (
+					<>
+						<div className="mx-3 border-t border-border" />
+						<textarea
+							value={notes}
+							placeholder="The brief - what it needs, links, anything the session should know. Drop or paste photos and videos (optional)"
+							rows={2}
+							aria-label="Brief"
+							onChange={(event) =>
+								onChange(joinTask(title, event.target.value))
+							}
+							onKeyDown={keys}
+							className="w-full min-h-0 grow resize-none bg-transparent px-3 pt-1.5 pb-2 text-[13px] text-muted-foreground outline-none placeholder:text-muted-foreground"
+						/>
+					</>
+				)}
+			</fieldset>
 			{/* The picker doesn't hold a value of its own: it rewrites the "!"s in
 			    the text, which is what the store reads either way. Typing "!" and
 			    picking Low are the same edit, so neither can go stale. Medium is
@@ -127,49 +196,53 @@ export function TaskBox({
 			    navigable for free, and there's no popup to style. */}
 			{/* One row at the quick-add's 520px: Skill and Repo on the left,
 			    Priority pushed right. Nothing in it grows as you type. */}
-			<div className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5">
-				{skills && skills.length > 0 && (
-					<SkillSelect skills={skills} value={value} onChange={onChange} />
-				)}
-				{repos && repos.length > 0 && onRepoChange && (
-					<RepoSelect
-						repos={repos}
-						value={repo ?? ""}
-						onChange={onRepoChange}
-					/>
-				)}
-				{!hidePriority && (
-					<div className="ml-auto flex items-center gap-1.5">
-						<span className="text-[11px] text-muted-foreground">Priority</span>
-						<select
-							aria-label="Priority"
-							title="Or lead the title with ! (Low) or !!! (High) - no ! is Medium"
-							value={parseTask(value).priority}
-							onChange={(event) =>
-								onChange(withPriority(value, Number(event.target.value)))
-							}
-							className="cursor-pointer rounded-[6px] bg-secondary px-1.5 py-[3px] text-[11px] font-semibold text-muted-foreground outline-none transition-colors hover:text-foreground"
+			{!folded && (
+				<div className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5">
+					{skills && skills.length > 0 && (
+						<SkillSelect skills={skills} value={value} onChange={onChange} />
+					)}
+					{repos && repos.length > 0 && onRepoChange && (
+						<RepoSelect
+							repos={repos}
+							value={repo ?? ""}
+							onChange={onRepoChange}
+						/>
+					)}
+					{!hidePriority && (
+						<div className="ml-auto flex items-center gap-1.5">
+							<span className="text-[11px] text-muted-foreground">
+								Priority
+							</span>
+							<select
+								aria-label="Priority"
+								title="Or lead the title with ! (Low) or !!! (High) - no ! is Medium"
+								value={parseTask(value).priority}
+								onChange={(event) =>
+									onChange(withPriority(value, Number(event.target.value)))
+								}
+								className="cursor-pointer rounded-[6px] bg-secondary px-1.5 py-[3px] text-[11px] font-semibold text-muted-foreground outline-none transition-colors hover:text-foreground"
+							>
+								{/* Levels only - slot 0 ("None") is legacy storage, not a choice. */}
+								{PRIORITY_LABELS.slice(1).map((label, index) => (
+									<option key={label} value={index + 1}>
+										{label}
+									</option>
+								))}
+							</select>
+						</div>
+					)}
+					{submitLabel && (
+						<button
+							type="button"
+							disabled={!title.trim()}
+							onClick={onSubmit}
+							className={cn(ROW_PRIMARY_BUTTON, hidePriority && "ml-auto")}
 						>
-							{/* Levels only - slot 0 ("None") is legacy storage, not a choice. */}
-							{PRIORITY_LABELS.slice(1).map((label, index) => (
-								<option key={label} value={index + 1}>
-									{label}
-								</option>
-							))}
-						</select>
-					</div>
-				)}
-				{submitLabel && (
-					<button
-						type="button"
-						disabled={!title.trim()}
-						onClick={onSubmit}
-						className={cn(ROW_PRIMARY_BUTTON, hidePriority && "ml-auto")}
-					>
-						{submitLabel}
-					</button>
-				)}
-			</div>
+							{submitLabel}
+						</button>
+					)}
+				</div>
+			)}
 		</div>
 	);
 }
@@ -597,6 +670,9 @@ export function parseSize(stored: string | null): [string, string] | null {
  */
 export function QuickAddTask({ onClose }: { onClose: () => void }) {
 	const { add } = useMyTasks();
+	const { startTask } = useStartTask();
+	const startNow = useClaudeCommand((state) => state.startNow);
+	const setStartNow = useClaudeCommand((state) => state.setStartNow);
 	const { data: skills } = electronTrpc.skills.list.useQuery();
 	const { data: repos } = electronTrpc.repos.list.useQuery();
 	const [draft, setDraft] = useState("");
@@ -620,8 +696,11 @@ export function QuickAddTask({ onClose }: { onClose: () => void }) {
 		// Same rule the store uses - no title, no task, so don't claim one.
 		if (!parseTask(draft).title) return onClose();
 		add(draft, undefined, repo);
-		toast.success("Added to My Tasks");
 		onClose();
+		if (!startNow) return void toast.success("Added to My Tasks");
+		// The store puts a new task first, so that's the one just added.
+		const task = useOdinTasks.getState().tasks[0];
+		if (task) void startTask(task);
 	};
 
 	return (
@@ -647,13 +726,28 @@ export function QuickAddTask({ onClose }: { onClose: () => void }) {
 					<span className="ml-1.5 font-normal text-muted-foreground">
 						⌘⏎ add · esc cancel
 					</span>
+					<label
+						title="Start a session on it right away, not just add it to My Tasks"
+						className={cn(
+							"ml-auto flex cursor-pointer items-center gap-1 rounded-[6px] bg-secondary px-2 py-[3px] text-[11px] font-semibold",
+							startNow ? "text-foreground" : "text-muted-foreground",
+						)}
+					>
+						<input
+							type="checkbox"
+							checked={startNow}
+							onChange={(event) => setStartNow(event.target.checked)}
+							className="accent-primary"
+						/>
+						Start now
+					</label>
 					<button
 						type="button"
 						onClick={save}
 						disabled={!parseTask(draft).title}
-						className="ml-auto rounded-[6px] bg-primary px-2.5 py-[3px] text-[11px] font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:cursor-default disabled:opacity-40"
+						className="ml-1.5 rounded-[6px] bg-primary px-2.5 py-[3px] text-[11px] font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:cursor-default disabled:opacity-40"
 					>
-						Add task
+						{startNow ? "Start session" : "Add task"}
 					</button>
 				</div>
 				<TaskBox

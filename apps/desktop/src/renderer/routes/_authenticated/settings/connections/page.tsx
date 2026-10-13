@@ -17,13 +17,14 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
 import { FaGithub, FaSlack } from "react-icons/fa";
 import { LuCloudUpload, LuTrash2 } from "react-icons/lu";
-import { SiGmail, SiJira, SiNotion } from "react-icons/si";
+import { SiClickup, SiGmail, SiJira, SiNotion } from "react-icons/si";
 import {
 	ConnectProvider,
 	type Provider,
 } from "renderer/components/ConnectProvider/ConnectProvider";
 import { electronTrpc } from "renderer/lib/electron-trpc";
 import { useInAppBrowser } from "renderer/stores/in-app-browser";
+import { LINK_HOSTS } from "shared/in-odin-links";
 import { PROFILE_RESTORE_MS } from "shared/odin-profile";
 import {
 	useOdinFeeds,
@@ -83,9 +84,21 @@ const META: Record<
 		icon: <SiGmail className="size-5" />,
 		description: "Unread mail, in the Email tab.",
 	},
+	clickup: {
+		name: "ClickUp",
+		icon: <SiClickup className="size-5" />,
+		description: "Lets sessions read the ClickUp tasks they're given.",
+	},
 };
 
-const ORDER: Provider[] = ["slack", "github", "jira", "notion", "gmail"];
+const ORDER: Provider[] = [
+	"slack",
+	"github",
+	"jira",
+	"notion",
+	"gmail",
+	"clickup",
+];
 
 function ConnectionsSettings() {
 	const queryClient = useQueryClient();
@@ -229,7 +242,7 @@ function BackupRow() {
 	const reveal = electronTrpc.backup.reveal.useMutation();
 	const data = status.data;
 	const identity = !data?.lastBackupAt
-		? "No backup yet"
+		? "Off until you back up once"
 		: `Last ${new Date(data.lastBackupAt).toLocaleString([], {
 				dateStyle: "medium",
 				timeStyle: "short",
@@ -257,7 +270,9 @@ function BackupRow() {
 						<div className="text-xs text-muted-foreground mt-1 max-w-[70ch]">
 							{data?.available === false
 								? "iCloud Drive is off, so nothing is copied. Turn it on in System Settings → Apple Account → iCloud."
-								: "Keeps 14 days in iCloud Drive → Odin Backups. To restore, quit Odin and copy a day's files back into ~/.odin."}
+								: !data?.lastBackupAt
+									? "Back up now to turn on the daily copy. macOS asks once for access to iCloud Drive."
+									: "Keeps 14 days in iCloud Drive → Odin Backups. To restore, quit Odin and copy a day's files back into ~/.odin."}
 						</div>
 					</div>
 				</div>
@@ -550,22 +565,54 @@ function Profiles({ onSwitched }: { onSwitched: () => void }) {
 	);
 }
 
-/** Undoes "Always open links in your browser" from the in-app browser. */
+/** Every provider names its link hosts, so a new one gets its switch below. */
+const PROVIDER_LINK_HOSTS: Record<Provider, readonly string[]> = LINK_HOSTS;
+const LINK_PROVIDERS = ORDER.filter((p) => PROVIDER_LINK_HOSTS[p].length > 0);
+const linkSiteNames = LINK_PROVIDERS.map((p) => META[p].name);
+const LINK_SITE_LIST = `${linkSiteNames.slice(0, -1).join(", ")} and ${linkSiteNames.at(-1)}`;
+
+/**
+ * Undoes "Always open links in your browser" from the in-app browser; while
+ * it's on, each site can still send its own links to your browser.
+ */
 function OpenLinksInOdinRow() {
 	const external = useInAppBrowser((state) => state.external);
+	const browserSites = useInAppBrowser((state) => state.browserSites);
 	return (
-		<SettingRow
-			label="Open links inside Odin"
-			htmlFor="open-links-in-odin"
-			description="Slack, Jira, GitHub, Notion and Gmail links open in a panel over the page instead of another app; other links always go to your default browser. Off sends them all there."
-		>
-			<Switch
-				id="open-links-in-odin"
-				checked={!external}
-				onCheckedChange={(inOdin) =>
-					useInAppBrowser.setState({ external: !inOdin })
-				}
-			/>
-		</SettingRow>
+		<>
+			<SettingRow
+				label="Open links inside Odin"
+				htmlFor="open-links-in-odin"
+				description={`${LINK_SITE_LIST} links open in a panel over the page instead of another app; other links always go to your default browser. Off sends them all there.`}
+			>
+				<Switch
+					id="open-links-in-odin"
+					checked={!external}
+					onCheckedChange={(inOdin) =>
+						useInAppBrowser.setState({ external: !inOdin })
+					}
+				/>
+			</SettingRow>
+			{!external &&
+				LINK_PROVIDERS.map((id) => (
+					<SettingRow
+						key={id}
+						label={`${META[id].name} links`}
+						htmlFor={`open-links-in-odin-${id}`}
+					>
+						<Switch
+							id={`open-links-in-odin-${id}`}
+							checked={!browserSites.includes(id)}
+							onCheckedChange={(inOdin) =>
+								useInAppBrowser.setState({
+									browserSites: inOdin
+										? browserSites.filter((site) => site !== id)
+										: [...browserSites, id],
+								})
+							}
+						/>
+					</SettingRow>
+				))}
+		</>
 	);
 }

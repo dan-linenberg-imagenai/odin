@@ -38,6 +38,16 @@ const RULE = /^[\s]*[─━]{10,}[\s]*$/;
 const BTW_EDGE = /^[\s]*▔{10,}[\s]*$/;
 
 /**
+ * Claude's first-run setup - the splash, the text-style picker, the folder
+ * trust question, the bypass-permissions warning. None of it draws the input
+ * box or a status line, so a fresh machine's first session read as Claude
+ * gone: the card offered Resume and the drawer hid the terminal behind
+ * "Starting session...", with the question nobody could see.
+ */
+const SETUP =
+	/Welcome to Claude Code|Choose the text style|Do you trust the files in this folder|Is this a project you created or one you trust|Bypass Permissions mode/;
+
+/**
  * The spinner line, which is the only thing on screen that says "mid-turn":
  *
  *   ✳ Calculating… (11m 48s · ↓ 40.9k tokens · thought for 1s)
@@ -75,6 +85,16 @@ function footerOf(screen: string): string {
 	const boxTop = rules.length >= 2 ? rules[rules.length - 2] : lines.length;
 	return lines.slice(Math.max(0, boxTop - FOOTER_LINES)).join("\n");
 }
+
+/**
+ * Claude paints a run of spaces as "cursor forward" (ESC[nC). An ANSI strip
+ * drops it and glues the words: "bypass permissions on" reads
+ * "bypasspermissionson", the idle prompt goes unseen, and the raven waited out
+ * its timeout without typing the question. Call before stripping.
+ */
+export const spacesForCursorForward = (ansi: string): string =>
+	// biome-ignore lint/suspicious/noControlCharactersInRegex: matching ESC is the point
+	ansi.replace(/\x1b\[(\d*)C/g, (_, n) => " ".repeat(Number(n) || 1));
 
 export function odinScreenStatus(screen: string): PaneStatus | undefined {
 	const footer = footerOf(screen);
@@ -135,6 +155,7 @@ export function odinScreenWrite(
  */
 export function agentOnScreen(screen: string): boolean {
 	if (odinScreenStatus(screen) !== undefined) return true;
+	if (SETUP.test(screen)) return true;
 	// The box on its own - Claude drawn, but caught between repaints of the
 	// status line under it.
 	const lines = screen.split(/\r\n|\n|\r/);

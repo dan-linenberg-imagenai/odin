@@ -47,7 +47,7 @@ export const HOTKEYS_REGISTRY = {
 	// capture. These are the only ones the settings page lists (see
 	// settings/keyboard/page.tsx).
 	ODIN_HOME: {
-		key: { mac: L("o"), windows: L("o"), linux: L("o") },
+		key: { mac: L("l"), windows: L("l"), linux: L("l") },
 		label: "Sessions",
 		category: "Navigation",
 		description: "Open the live terminals of every session working or waiting",
@@ -130,6 +130,18 @@ export const HOTKEYS_REGISTRY = {
 		category: "Navigation",
 		description: "Focus the current screen's search box",
 	},
+	// ⌘F's wider sibling: every feed row and every session, not just this
+	// screen. Not ⌘K - that's Clear Terminal. A chord, so it works from a terminal.
+	ODIN_SEARCH_ALL: {
+		key: {
+			mac: L("meta+shift+f"),
+			windows: L("ctrl+shift+alt+f"),
+			linux: L("ctrl+shift+alt+f"),
+		},
+		label: "Search All",
+		category: "Navigation",
+		description: "Search every feed and Dev Board session at once",
+	},
 	// Off in text boxes and terminals (their own undo); see the Board's useBoardUndo.
 	ODIN_BOARD_UNDO: {
 		key: {
@@ -153,17 +165,17 @@ export const HOTKEYS_REGISTRY = {
 		category: "Navigation",
 		description: "Write a task down without leaving what you're doing",
 	},
-	// A chord for the same reason as New Task: the question comes up mid-session.
-	ODIN_QUICK_QUESTION: {
+	// A chord for the same reason as New Task: the ask comes up mid-session.
+	ODIN_ASK_CROW: {
 		key: {
 			mac: L("meta+shift+i"),
 			windows: L("ctrl+shift+alt+i"),
 			linux: L("ctrl+shift+alt+i"),
 		},
-		label: "Quick Question",
+		label: "Ask the raven",
 		category: "Navigation",
 		description:
-			"Ask a Claude that's already running - no wait for it to start",
+			"Odin's raven: give it instructions for Odin, or ask it anything",
 	},
 	// ⌘L, where a browser's address bar would be.
 	ODIN_COPY_LINK: {
@@ -175,6 +187,31 @@ export const HOTKEYS_REGISTRY = {
 		label: "Copy Link",
 		category: "Navigation",
 		description: "Copy the link of the page open in the in-app browser",
+	},
+
+	// Send from a multi-line box (a task, a prompt, a note), where Enter is a newline.
+	SUBMIT: {
+		key: { mac: "meta+enter", windows: "ctrl+enter", linux: "ctrl+enter" },
+		label: "Send",
+		category: "Navigation",
+		description: "Send a task, prompt or note from its text box",
+	},
+	// Claude Code's own Ctrl+Enter: cut into the running turn instead of queueing.
+	CHAT_SEND_NOW: {
+		key: { mac: "ctrl+enter", windows: "ctrl+enter", linux: "ctrl+enter" },
+		label: "Send now",
+		category: "Navigation",
+		description: "Send a chat reply into Claude's running turn",
+	},
+	ODIN_SEARCH_ROW_MENU: {
+		key: {
+			mac: L("meta+k"),
+			windows: L("ctrl+shift+alt+k"),
+			linux: L("ctrl+shift+alt+k"),
+		},
+		label: "Search Result Actions",
+		category: "Navigation",
+		description: "Show the actions for the highlighted Search All result",
 	},
 
 	// Navigation
@@ -291,25 +328,34 @@ export const HOTKEYS_REGISTRY = {
 		label: "Switch to Workspace 9",
 		category: "Workspace",
 	},
-	PREV_WORKSPACE: {
+	// A chord, so it works from the chat box and the terminal too.
+	PREV_SESSION: {
 		key: {
 			mac: "meta+alt+up",
 			windows: "ctrl+shift+alt+up",
 			linux: "ctrl+shift+alt+up",
 		},
-		label: "Previous Workspace",
-		category: "Workspace",
-		description: "Navigate to the previous workspace in the sidebar",
+		label: "Previous Session",
+		category: "Navigation",
+		description: "Open the session above in the drawer's session list",
 	},
-	NEXT_WORKSPACE: {
+	// A bare key, like the rail's: off in text boxes and terminals.
+	ODIN_OPEN_SESSIONS: {
+		key: { mac: L("o"), windows: L("o"), linux: L("o") },
+		label: "Open Sessions",
+		category: "Navigation",
+		description:
+			"Open the board's first session in flight, with the session list beside it",
+	},
+	NEXT_SESSION: {
 		key: {
 			mac: "meta+alt+down",
 			windows: "ctrl+shift+alt+down",
 			linux: "ctrl+shift+alt+down",
 		},
-		label: "Next Workspace",
-		category: "Workspace",
-		description: "Navigate to the next workspace in the sidebar",
+		label: "Next Session",
+		category: "Navigation",
+		description: "Open the session below in the drawer's session list",
 	},
 	CLOSE_WORKSPACE: {
 		key: {
@@ -609,6 +655,18 @@ export const HOTKEYS_REGISTRY = {
 		category: "Terminal",
 		description: "Scroll the active terminal to the bottom",
 	},
+	CHAT_TO_TOP: {
+		key: { mac: "pageup", windows: "pageup", linux: "pageup" },
+		label: "Chat: Jump to Top",
+		category: "Terminal",
+		description: "Jump the session chat to its first message",
+	},
+	CHAT_TO_BOTTOM: {
+		key: { mac: "pagedown", windows: "pagedown", linux: "pagedown" },
+		label: "Chat: Jump to Bottom",
+		category: "Terminal",
+		description: "Jump the session chat to its latest message",
+	},
 	PREV_TAB_ALT: {
 		key: {
 			mac: "ctrl+shift+tab",
@@ -834,6 +892,47 @@ export const HOTKEYS_REGISTRY = {
 		label: "Copy Path",
 		category: "Window",
 		description: "Copy the workspace path to the clipboard",
+	},
+
+	// The native menu's own items: the renderer pushes these to main (see
+	// routes/-layout.tsx), which registers them as menu accelerators.
+	RELOAD_WINDOW: {
+		key: { mac: L("meta+r"), windows: L("ctrl+r"), linux: L("ctrl+r") },
+		label: "Reload",
+		category: "Window",
+		description: "Reload the Odin window",
+	},
+	CLOSE_WINDOW: {
+		key: {
+			mac: L("meta+shift+q"),
+			windows: L("ctrl+shift+q"),
+			linux: L("ctrl+shift+q"),
+		},
+		label: "Close Window",
+		category: "Window",
+	},
+	ZOOM_RESET: {
+		key: { mac: L("meta+0"), windows: L("ctrl+0"), linux: L("ctrl+0") },
+		label: "Actual Size",
+		category: "Window",
+	},
+	ZOOM_IN: {
+		key: {
+			mac: L("meta+equal"),
+			windows: L("ctrl+equal"),
+			linux: L("ctrl+equal"),
+		},
+		label: "Zoom In",
+		category: "Window",
+	},
+	ZOOM_OUT: {
+		key: {
+			mac: L("meta+minus"),
+			windows: L("ctrl+minus"),
+			linux: L("ctrl+minus"),
+		},
+		label: "Zoom Out",
+		category: "Window",
 	},
 
 	// Help

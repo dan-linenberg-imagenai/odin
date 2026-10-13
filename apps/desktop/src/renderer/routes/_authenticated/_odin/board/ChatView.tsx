@@ -4,9 +4,11 @@ import { cn } from "@odin/ui/utils";
 import {
 	createContext,
 	memo,
+	type ReactNode,
 	useCallback,
 	useContext,
 	useEffect,
+	useLayoutEffect,
 	useMemo,
 	useRef,
 	useState,
@@ -15,26 +17,63 @@ import {
 	LuArrowUp,
 	LuChevronRight,
 	LuSquareTerminal,
-	LuTerminal,
+	LuWrench,
 } from "react-icons/lu";
 import { MarkdownRenderer } from "renderer/components/MarkdownRenderer";
+import { isHotkey, useHotkeyDisplay } from "renderer/hotkeys";
 import { electronTrpc } from "renderer/lib/electron-trpc";
+import { shellEscapePaths } from "renderer/screens/main/components/WorkspaceView/ContentView/TabsContent/Terminal/utils";
+import { draftFor, useChatDrafts } from "renderer/stores/chat-drafts";
+import { useCompacting } from "renderer/stores/compacting";
 import { openUrl } from "renderer/stores/in-app-browser";
 import { useSessionView } from "renderer/stores/session-view";
+import {
+	getImageMimeType,
+	getVideoMimeType,
+	isPreviewableVideoFile,
+} from "shared/file-types";
+import {
+	insertSkill,
+	matchSkills,
+	skillToken,
+} from "../components/skill-picker";
+import { attachmentPaths } from "../components/TaskBox";
 import { COMPACT_MARKDOWN } from "../components/TranscriptView";
-import { PlanCard, QuestionCard } from "./ChatPrompts";
+import { actionItemLines } from "./brief";
+import { PlanCard, QuestionCard, ScreenMenuCard } from "./ChatPrompts";
 import { collectRefs, linkify } from "./chat-links";
+import { parseScreenMenu } from "./screen-menu";
 
 type Item =
-	| { kind: "user"; id: string; text: string; images?: string[] }
-	| { kind: "text"; id: string; text: string }
+	| {
+			kind: "user";
+			id: string;
+			text: string;
+			images?: string[];
+			/** When you sent it (ms) - a turn's start. Unset for a mid-turn queued message. */
+			at?: number;
+	  }
+	| { kind: "text"; id: string; text: string; msg?: string; out?: number }
 	| {
 			kind: "tool";
 			id: string;
+			/** The API message it came in, and that message's output tokens so far. */
+			msg?: string;
+			out?: number;
 			name: string;
 			input: Record<string, unknown>;
 			result?: string;
 			isError?: boolean;
+	  }
+	| {
+			kind: "compact";
+			id: string;
+			/** When it finished (ms). */
+			at?: number;
+			summary?: string;
+			preTokens?: number;
+			postTokens?: number;
+			durationMs?: number;
 	  };
 
 type Block = {
@@ -54,7 +93,20 @@ type Line = {
 	uuid?: string;
 	isMeta?: boolean;
 	isSidechain?: boolean;
-	message?: { content?: string | Block[] };
+	subtype?: string;
+	timestamp?: string;
+	compactMetadata?: {
+		preTokens?: number;
+		postTokens?: number;
+		durationMs?: number;
+	};
+	/** The summary Claude continues from - long, and not something you typed. */
+	isCompactSummary?: boolean;
+	message?: {
+		id?: string;
+		content?: string | Block[];
+		usage?: { output_tokens?: number };
+	};
 	/** A message you sent mid-turn rides in as a queued_command attachment. */
 	attachment?: { type?: string; prompt?: string | Block[] };
 };
@@ -102,6 +154,17 @@ function blockText(content: string | Block[] | undefined): string {
 		.join("\n");
 }
 
+/** A message sent mid-turn reads as the user turn it is, its images too - with no time, it starts no turn. */
+function unqueue(line: Line): Line {
+	if (line.attachment?.type !== "queued_command") return line;
+	return {
+		...line,
+		type: "user",
+		timestamp: undefined,
+		message: { content: line.attachment.prompt },
+	};
+}
+
 /**
  * Fold new JSONL lines into the item list. Append-only, except a tool_result
  * fills in the tool row it answers - that row gets a new object, the rest keep
@@ -113,20 +176,36 @@ export function applyLines(items: Item[], lines: Line[]): Item[] {
 	next.forEach((item, index) => {
 		if (item.kind === "tool") toolIndex.set(item.id, index);
 	});
-	lines.forEach((line, lineIndex) => {
+	lines.map(unqueue).forEach((line, lineIndex) => {
 		if (line.isMeta || line.isSidechain) return;
 		const id = line.uuid ?? `${items.length}-${lineIndex}`;
-		if (line.attachment?.type === "queued_command") {
-			const text = userText(blockText(line.attachment.prompt));
-			if (text) next.push({ kind: "user", id, text });
+		if (line.subtype === "compact_boundary") {
+			const { preTokens, postTokens, durationMs } = line.compactMetadata ?? {};
+			next.push({
+				kind: "compact",
+				id,
+				at: line.timestamp ? Date.parse(line.timestamp) : undefined,
+				preTokens,
+				postTokens,
+				durationMs,
+			});
+			return;
+		}
+		if (line.isCompactSummary) {
+			const summary = blockText(line.message?.content);
+			const last = next.at(-1);
+			if (last?.kind === "compact")
+				next[next.length - 1] = { ...last, summary };
+			else next.push({ kind: "compact", id, summary });
 			return;
 		}
 		if (!line.message) return;
 		const content = line.message.content;
+		const at = line.timestamp ? Date.parse(line.timestamp) : undefined;
 		if (line.type === "user") {
 			if (typeof content === "string") {
 				const text = userText(content);
-				if (text) next.push({ kind: "user", id, text });
+				if (text) next.push({ kind: "user", id, text, at });
 				return;
 			}
 			// A pasted image is an image block beside "[Image #N] ..." text.
@@ -138,10 +217,10 @@ export function applyLines(items: Item[], lines: Line[]): Item[] {
 			let imagesShown = images.length === 0;
 			for (const [i, block] of (content ?? []).entries()) {
 				if (block.type === "tool_result" && block.tool_use_id) {
-					const at = toolIndex.get(block.tool_use_id);
-					const tool = at === undefined ? undefined : next[at];
-					if (at !== undefined && tool?.kind === "tool")
-						next[at] = {
+					const index = toolIndex.get(block.tool_use_id);
+					const tool = index === undefined ? undefined : next[index];
+					if (index !== undefined && tool?.kind === "tool")
+						next[index] = {
 							...tool,
 							result: blockText(block.content),
 							isError: block.is_error,
@@ -156,16 +235,25 @@ export function applyLines(items: Item[], lines: Line[]): Item[] {
 						kind: "user",
 						id: `${id}:${i}`,
 						text,
+						at,
 						...(imagesShown ? {} : { images }),
 					});
 					imagesShown = true;
 				}
 			}
-			if (!imagesShown) next.push({ kind: "user", id, text: "", images });
+			if (!imagesShown) next.push({ kind: "user", id, text: "", images, at });
 		} else if (line.type === "assistant" && Array.isArray(content)) {
+			const msg = line.message.id;
+			const out = line.message.usage?.output_tokens;
 			for (const [i, block] of content.entries()) {
 				if (block.type === "text" && block.text?.trim())
-					next.push({ kind: "text", id: `${id}:${i}`, text: block.text });
+					next.push({
+						kind: "text",
+						id: `${id}:${i}`,
+						text: block.text,
+						msg,
+						out,
+					});
 				else if (block.type === "tool_use" && block.id) {
 					toolIndex.set(block.id, next.length);
 					next.push({
@@ -173,6 +261,8 @@ export function applyLines(items: Item[], lines: Line[]): Item[] {
 						id: block.id,
 						name: block.name ?? "Tool",
 						input: block.input ?? {},
+						msg,
+						out,
 					});
 				}
 			}
@@ -181,17 +271,67 @@ export function applyLines(items: Item[], lines: Line[]): Item[] {
 	return next;
 }
 
+function parseLines(parts: string[]): Line[] {
+	return parts.flatMap((part) => {
+		try {
+			return [JSON.parse(part) as Line];
+		} catch {
+			return [];
+		}
+	});
+}
+
+function readBytes(read: { kind: string; content: unknown }): Uint8Array {
+	return read.kind === "bytes"
+		? Uint8Array.from(atob(read.content as string), (c) => c.charCodeAt(0))
+		: new TextEncoder().encode(read.content as string);
+}
+
+/**
+ * An earlier chunk of the transcript, joined to `head` - the first half of the
+ * line the loaded window starts on, cut where the window began. Returns the
+ * whole lines, and the new cut line unless the chunk reached the file's start.
+ */
+export function splitEarlier(
+	earlier: Uint8Array,
+	head: Uint8Array,
+	atFileStart: boolean,
+): { lines: string[]; head: Uint8Array } {
+	const bytes = new Uint8Array(earlier.length + head.length);
+	bytes.set(earlier);
+	bytes.set(head, earlier.length);
+	const parts: Uint8Array[] = [];
+	for (let at = 0; at <= bytes.length; ) {
+		const cut = bytes.indexOf(10, at);
+		const end = cut < 0 ? bytes.length : cut;
+		parts.push(bytes.subarray(at, end));
+		at = end + 1;
+	}
+	const cutLine = atFileStart ? undefined : parts.shift();
+	const decoder = new TextDecoder();
+	return {
+		lines: parts.map((part) => decoder.decode(part)),
+		head: cutLine ? cutLine.slice() : new Uint8Array(0),
+	};
+}
+
 /**
  * The transcript, tailed: one read of the last TAIL_BYTES, then only the bytes
  * appended since. The old full read re-parsed the whole file every poll.
+ * `loadEarlier` reads the TAIL_BYTES before what's loaded - a long session's
+ * start sits megabytes back, and a resumed one is always a long one.
  */
 function useLiveItems(path: string | null, workspaceId: string) {
 	const [items, setItems] = useState<Item[]>([]);
 	const [missing, setMissing] = useState<string | null>(null);
+	const [hasEarlier, setHasEarlier] = useState(false);
+	// Bumps once per loaded earlier chunk, in the same render as its rows.
+	const [earlierLoads, setEarlierLoads] = useState(0);
 	const utils = electronTrpc.useUtils();
 	// Read now instead of at the next poll - after a send, so Claude's echo of
 	// your message lands as soon as it's written.
 	const pokeRef = useRef(() => {});
+	const loadEarlierRef = useRef(async () => false);
 	useEffect(() => {
 		if (!path) return;
 		let cancelled = false;
@@ -199,11 +339,17 @@ function useLiveItems(path: string | null, workspaceId: string) {
 		let skipFirstLine = false;
 		let remainder = "";
 		const decoder = new TextDecoder();
+		// Where the loaded window starts, and the cut line it starts with: the
+		// earlier chunk ends with that line's first half.
+		let start = 0;
+		let head: Uint8Array = new Uint8Array(0);
+		let loadingEarlier = false;
 		let timer: ReturnType<typeof setTimeout>;
 		let running = false;
 		let again = false;
 		setItems([]);
 		setMissing(null);
+		setHasEarlier(false);
 		const tick = async () => {
 			if (running) {
 				again = true;
@@ -226,6 +372,8 @@ function useLiveItems(path: string | null, workspaceId: string) {
 					}
 					offset = Math.max(0, (meta.size ?? 0) - TAIL_BYTES);
 					skipFirstLine = offset > 0;
+					start = offset;
+					if (!cancelled) setHasEarlier(start > 0);
 				}
 				const read = await utils.client.filesystem.readFile.query({
 					workspaceId,
@@ -236,12 +384,11 @@ function useLiveItems(path: string | null, workspaceId: string) {
 				if (cancelled) return;
 				if (read.byteLength > 0) {
 					offset += read.byteLength;
-					const bytes =
-						read.kind === "bytes"
-							? Uint8Array.from(atob(read.content as string), (c) =>
-									c.charCodeAt(0),
-								)
-							: new TextEncoder().encode(read.content);
+					const bytes = readBytes(read);
+					if (skipFirstLine) {
+						const cut = bytes.indexOf(10);
+						head = bytes.slice(0, cut < 0 ? bytes.length : cut);
+					}
 					const chunk = remainder + decoder.decode(bytes, { stream: true });
 					const parts = chunk.split("\n");
 					remainder = parts.pop() ?? "";
@@ -249,13 +396,7 @@ function useLiveItems(path: string | null, workspaceId: string) {
 						parts.shift();
 						skipFirstLine = false;
 					}
-					const lines = parts.flatMap((part) => {
-						try {
-							return [JSON.parse(part) as Line];
-						} catch {
-							return [];
-						}
-					});
+					const lines = parseLines(parts);
 					if (lines.length) setItems((prev) => applyLines(prev, lines));
 				}
 				setMissing(null);
@@ -267,6 +408,38 @@ function useLiveItems(path: string | null, workspaceId: string) {
 			if (!cancelled) timer = setTimeout(tick, again ? 0 : POLL_MS);
 			again = false;
 		};
+		loadEarlierRef.current = async () => {
+			// Not before the tail's first read: it's what finds the cut line.
+			if (start === 0 || loadingEarlier || offset === null || offset === start)
+				return false;
+			loadingEarlier = true;
+			try {
+				const from = Math.max(0, start - TAIL_BYTES);
+				const read = await utils.client.filesystem.readFile.query({
+					workspaceId,
+					absolutePath: path,
+					offset: from,
+					maxBytes: start - from,
+				});
+				if (cancelled) return false;
+				const split = splitEarlier(readBytes(read), head, from === 0);
+				head = split.head;
+				start = from;
+				// ponytail: a tool row whose result sits past the cut stays without
+				// it; the tail window already dropped that result.
+				const rows = applyLines([], parseLines(split.lines));
+				setItems((prev) => [...rows, ...prev]);
+				setEarlierLoads((n) => n + 1);
+				setHasEarlier(from > 0);
+				return true;
+			} catch (error) {
+				if (!cancelled)
+					setMissing(error instanceof Error ? error.message : String(error));
+				return false;
+			} finally {
+				loadingEarlier = false;
+			}
+		};
 		pokeRef.current = () => void tick();
 		void tick();
 		return () => {
@@ -274,7 +447,14 @@ function useLiveItems(path: string | null, workspaceId: string) {
 			clearTimeout(timer);
 		};
 	}, [path, workspaceId, utils]);
-	return { items, missing, poke: () => pokeRef.current() };
+	return {
+		items,
+		missing,
+		poke: () => pokeRef.current(),
+		hasEarlier,
+		earlierLoads,
+		loadEarlier: () => loadEarlierRef.current(),
+	};
 }
 
 function toolSummary(input: Record<string, unknown>): string {
@@ -292,6 +472,56 @@ function toolSummary(input: Record<string, unknown>): string {
 		if (typeof value === "string" && value) return value.split("\n")[0] ?? "";
 	}
 	return "";
+}
+
+const base = (path: unknown) =>
+	typeof path === "string" ? (path.split("/").pop() ?? path) : "";
+
+/**
+ * What a tool call is doing, in words: Claude writes a description for every
+ * command and agent, the rest read off the file or pattern. The raw input
+ * stays one click under it.
+ */
+export function toolDescription(tool: Pick<Tool, "name" | "input">): string {
+	const { name, input } = tool;
+	if (typeof input.description === "string" && input.description)
+		return input.description;
+	switch (name) {
+		case "Read":
+			return `Read ${base(input.file_path)}`;
+		case "Edit":
+		case "MultiEdit":
+			return `Edited ${base(input.file_path)}`;
+		case "Write":
+			return `Wrote ${base(input.file_path)}`;
+		case "Grep":
+		case "Glob":
+			return `Searched for ${input.pattern}`;
+		case "Skill":
+			return `Used the ${input.skill} skill`;
+		case "WebFetch":
+			return `Opened ${input.url}`;
+		case "WebSearch":
+			return `Searched the web for ${input.query}`;
+	}
+	return `${name} ${toolSummary(input)}`.trim();
+}
+
+/** Colour +/- lines green/red like the terminal, only for output that has a diff hunk. */
+function DiffColored({ text }: { text: string }) {
+	if (!/^@@ /m.test(text)) return <>{text}</>;
+	return text.split("\n").map((line, index) => (
+		<div
+			// biome-ignore lint/suspicious/noArrayIndexKey: static lines, never reordered
+			key={index}
+			className={cn(
+				/^\+(?!\+\+ )/.test(line) && "text-emerald-400",
+				/^-(?!-- )/.test(line) && "text-danger",
+			)}
+		>
+			{line || "\u00a0"}
+		</div>
+	));
 }
 
 const ToolRow = memo(function ToolRow({
@@ -321,11 +551,11 @@ const ToolRow = memo(function ToolRow({
 						done && (item.isError ? "bg-danger" : "bg-emerald-500"),
 					)}
 				/>
-				<span className="shrink-0 font-semibold text-foreground">
-					{item.name}
+				<span className="min-w-0 truncate text-foreground">
+					{toolDescription(item)}
 				</span>
-				<span className="min-w-0 truncate font-mono text-[11.5px] text-muted-foreground">
-					{toolSummary(item.input)}
+				<span className="min-w-0 flex-1 truncate font-mono text-[11px] text-faint-foreground">
+					{item.name}
 				</span>
 				<span className="ml-auto shrink-0 text-[10px] text-faint-foreground">
 					{open ? "▾" : "▸"}
@@ -357,7 +587,7 @@ const ToolRow = memo(function ToolRow({
 							)}
 						>
 							{/* ponytail: capped - a 2MB tool output in a <pre> stalls the drawer */}
-							{item.result.slice(0, 20_000)}
+							<DiffColored text={item.result.slice(0, 20_000)} />
 						</pre>
 					)}
 				</div>
@@ -367,10 +597,15 @@ const ToolRow = memo(function ToolRow({
 });
 
 type Tool = Extract<Item, { kind: "tool" }>;
+type Group = Tool[];
 
-/** Runs of tool calls fold into one group, like the desktop app hides its commands. */
-export function segments(items: Item[]): (Item | Tool[])[] {
-	const out: (Item | Tool[])[] = [];
+/**
+ * Runs of tool calls fold into one group, like the desktop app hides its
+ * commands. Claude's narration between runs stays visible - it is the
+ * conversation; only the commands are technical noise.
+ */
+export function segments(items: Item[]): (Item | Group)[] {
+	const out: (Item | Group)[] = [];
 	for (const item of items) {
 		const last = out.at(-1);
 		if (item.kind !== "tool") out.push(item);
@@ -390,81 +625,56 @@ function asking(items: Item[]): Tool | null {
 		: null;
 }
 
-const VERBS: Record<string, [string, string]> = {
-	Bash: ["ran", "command"],
-	Read: ["read", "file"],
-	Edit: ["edited", "file"],
-	MultiEdit: ["edited", "file"],
-	Write: ["wrote", "file"],
-	Grep: ["searched", "time"],
-	Glob: ["searched", "time"],
-};
-
-/** "Ran 3 commands, read 2 files" - same verb counted once. */
-export function groupSummary(tools: Tool[]): string {
-	const counts = new Map<string, number>();
-	for (const tool of tools) {
-		const [verb, noun] = VERBS[tool.name] ?? ["used", "tool"];
-		const key = `${verb} ${noun}`;
-		counts.set(key, (counts.get(key) ?? 0) + 1);
-	}
-	const text = [...counts]
-		.map(([key, n]) => {
-			const [verb, noun] = key.split(" ");
-			return `${verb} ${n} ${noun}${n > 1 ? "s" : ""}`;
-		})
-		.join(", ");
-	return text.charAt(0).toUpperCase() + text.slice(1);
-}
-
 const ToolGroup = memo(
-	function ToolGroup({ tools }: { tools: Tool[] }) {
+	function ToolGroup({
+		group,
+		lead,
+	}: {
+		group: Group;
+		/** The line Claude wrote before this run - the toggle sits at its end. */
+		lead?: ReactNode;
+	}) {
 		const [open, setOpen] = useState(false);
 		const compact = useContext(Compact);
-		const running = tools.find((tool) => tool.result === undefined);
-		const failed = tools.some((tool) => tool.isError);
+		// A failure Claude retried past is routine; only flag a run that ended failing.
+		const failed = group.at(-1)?.isError === true;
 		return (
 			<div className="flex min-w-0 flex-col">
-				<button
-					type="button"
-					onClick={() => setOpen((value) => !value)}
+				{/* Alone on its row, the toggle centres on Claude's mark beside it. */}
+				<div
 					className={cn(
-						"flex min-w-0 max-w-full items-center gap-2 self-start text-left",
-						compact
-							? "rounded-md py-0.5 text-[11.5px] text-muted-foreground hover:text-foreground"
-							: "rounded-lg border border-border bg-secondary px-2.5 py-1 text-[12px] text-soft-foreground hover:bg-accent hover:text-foreground",
+						"flex min-w-0 gap-2",
+						lead ? "items-end" : "h-7 items-center",
 					)}
 				>
-					<LuTerminal
-						className={cn("shrink-0", compact ? "size-3" : "size-3.5")}
-					/>
-					<span className="shrink-0">{groupSummary(tools)}</span>
-					{failed && <span className="shrink-0 text-danger">· error</span>}
-					{running && (
-						<span className="flex min-w-0 items-center gap-1.5 text-working">
-							<span className="size-[6px] shrink-0 animate-pulse rounded-full bg-working" />
-							<span className="truncate font-mono text-[11.5px]">
-								{running.name} {toolSummary(running.input)}
-							</span>
-						</span>
-					)}
-					<LuChevronRight
+					{lead && <div className="min-w-0">{lead}</div>}
+					{/* Live work shows once, in the turn's own "Working..." row below. */}
+					<button
+						type="button"
+						onClick={() => setOpen((value) => !value)}
+						title={failed ? "Worked - ended in an error" : "Worked"}
+						aria-label={failed ? "Worked, ended in an error" : "Worked"}
+						aria-expanded={open}
 						className={cn(
-							"size-3.5 shrink-0 transition-transform",
-							open && "rotate-90",
-						)}
-					/>
-				</button>
-				{open && (
-					<div
-						className={cn(
-							compact
-								? "mt-0.5 ml-1.5 border-l border-border pl-1.5"
-								: "mt-1.5 rounded-lg border border-border bg-secondary/20 p-1.5",
+							"shrink-0 rounded p-0.5 text-faint-foreground hover:bg-accent hover:text-foreground",
+							lead && "mb-0.5",
+							open && "bg-accent text-foreground",
+							failed && "text-destructive",
 						)}
 					>
-						{tools.map((tool) => (
-							<ToolRow key={tool.id} item={tool} />
+						<LuWrench className="size-3.5" />
+					</button>
+				</div>
+				{open && (
+					<div
+						className={
+							compact
+								? "mt-0.5 ml-1.5 border-l border-border pl-1.5"
+								: "mt-1.5 rounded-lg border border-border bg-secondary/20 p-1.5"
+						}
+					>
+						{group.map((item) => (
+							<ToolRow key={item.id} item={item} />
 						))}
 					</div>
 				)}
@@ -473,9 +683,107 @@ const ToolGroup = memo(
 	},
 	// The array is rebuilt every render; its rows only change by reference.
 	(prev, next) =>
-		prev.tools.length === next.tools.length &&
-		prev.tools.every((tool, i) => tool === next.tools[i]),
+		prev.lead === next.lead &&
+		prev.group.length === next.group.length &&
+		prev.group.every((item, i) => item === next.group[i]),
 );
+
+const kTokens = (n: number) => `${Math.round(n / 1000)}k`;
+
+/**
+ * Where Claude compacted: one quiet line with what it saved. The summary it
+ * continues from runs to pages, so it stays folded until you ask.
+ */
+function CompactRow({ item }: { item: Extract<Item, { kind: "compact" }> }) {
+	const [open, setOpen] = useState(false);
+	const stats = [
+		item.preTokens && item.postTokens
+			? `${kTokens(item.preTokens)} → ${kTokens(item.postTokens)} tokens`
+			: null,
+		item.durationMs ? `${Math.round(item.durationMs / 1000)}s` : null,
+	]
+		.filter(Boolean)
+		.join(" · ");
+	return (
+		<div className="my-3 flex flex-col">
+			<button
+				type="button"
+				disabled={!item.summary}
+				onClick={() => setOpen((value) => !value)}
+				className="flex items-center gap-3 text-[11.5px] text-muted-foreground enabled:hover:text-foreground"
+			>
+				<span className="h-px flex-1 bg-border" />
+				{item.summary && (
+					<LuChevronRight
+						className={cn(
+							"size-3.5 shrink-0 transition-transform",
+							open && "rotate-90",
+						)}
+					/>
+				)}
+				<span className="shrink-0">
+					Conversation compacted{stats && ` · ${stats}`}
+				</span>
+				<span className="h-px flex-1 bg-border" />
+			</button>
+			{open && item.summary && (
+				<div className="mt-2 max-h-[420px] select-text cursor-text overflow-y-auto rounded-lg border border-border bg-secondary/20 p-3">
+					<MarkdownRenderer
+						content={item.summary}
+						style="default"
+						allowHtml={false}
+						className={COMPACT_MARKDOWN}
+					/>
+				</div>
+			)}
+		</div>
+	);
+}
+
+/**
+ * Output tokens across these items. Claude writes one line per block, each
+ * carrying its message's running total, so the largest per message counts.
+ */
+export function outputTokens(items: Item[]): number {
+	const byMessage = new Map<string, number>();
+	for (const item of items)
+		if ((item.kind === "text" || item.kind === "tool") && item.msg)
+			byMessage.set(
+				item.msg,
+				Math.max(byMessage.get(item.msg) ?? 0, item.out ?? 0),
+			);
+	let total = 0;
+	for (const out of byMessage.values()) total += out;
+	return total;
+}
+
+/** "840", "2.1k", "12k". */
+export function tokenLabel(n: number): string {
+	if (n < 1000) return String(n);
+	return n < 10_000 ? `${(n / 1000).toFixed(1)}k` : `${Math.round(n / 1000)}k`;
+}
+
+/** Time since a moment, ticking: "42s", then "3m 05s", then "1h 02m". */
+function Elapsed({ since }: { since: number }) {
+	const [now, setNow] = useState(Date.now);
+	useEffect(() => {
+		const timer = setInterval(() => setNow(Date.now()), 1000);
+		return () => clearInterval(timer);
+	}, []);
+	return (
+		<span className="shrink-0 tabular-nums text-muted-foreground">
+			{elapsedLabel(now - since)}
+		</span>
+	);
+}
+
+export function elapsedLabel(ms: number): string {
+	const s = Math.max(0, Math.round(ms / 1000));
+	const pad = (n: number) => String(n).padStart(2, "0");
+	if (s < 60) return `${s}s`;
+	if (s < 3600) return `${Math.floor(s / 60)}m ${pad(s % 60)}s`;
+	return `${Math.floor(s / 3600)}h ${pad(Math.floor(s / 60) % 60)}m`;
+}
 
 /** A row arriving while you watch: a short fade and rise, compositor-only. */
 const ENTER = "animate-in fade-in slide-in-from-bottom-2 duration-300 ease-out";
@@ -488,16 +796,30 @@ function UserBubble({
 	text,
 	images,
 	pending,
+	workspaceId,
 }: {
 	text: string;
 	images?: Preview[];
 	pending?: boolean;
+	workspaceId?: string;
 }) {
+	// A launch prompt (task + standing rules + reply format) fills the screen;
+	// show just the request you typed, and Odin's part only on its own button.
+	const request = launchRequest(text);
+	const attached = useAttachedPreviews(
+		request === null ? [] : launchAttachments(text),
+		workspaceId,
+	);
+	const previews = [...(images ?? []), ...attached];
+	const [open, setOpen] = useState(false);
+	const [full, setFull] = useState(false);
 	const compact = useContext(Compact);
+	const shown = full || request === null ? text : request;
+	const long = shown.length > 300 || shown.split("\n").length > 4;
 	return (
 		<div
 			className={cn(
-				"ml-auto select-text cursor-text whitespace-pre-wrap break-words text-foreground first:mt-0",
+				"ml-auto select-text cursor-text break-words text-foreground first:mt-0",
 				compact
 					? "mt-2 max-w-[85%] rounded-lg rounded-br-sm bg-primary/15 px-2.5 py-1.5 text-[12.5px] leading-normal"
 					: "mt-5 mb-1 max-w-[75%] rounded-2xl rounded-br-md border border-primary/30 bg-primary/15 px-4 py-2.5 text-[13.5px] leading-relaxed shadow-sm",
@@ -505,12 +827,89 @@ function UserBubble({
 				pending && ENTER,
 			)}
 		>
-			{images && images.length > 0 && (
-				<PreviewStrip previews={images} className={text ? "mb-2" : ""} />
+			{previews.length > 0 && (
+				<PreviewStrip previews={previews} className={text ? "mb-2" : ""} />
 			)}
-			{text}
+			<div className={cn(long && !open && "line-clamp-3")}>
+				{/* Typed line breaks stay: markdown would fold them into spaces. */}
+				<MarkdownRenderer
+					content={shown}
+					style="default"
+					allowHtml={false}
+					className={cn(
+						compact ? CARD_MARKDOWN : COMPACT_MARKDOWN,
+						compact ? "text-[12.5px]" : "text-[13.5px]",
+						"text-foreground [&_li]:whitespace-pre-wrap [&_p]:whitespace-pre-wrap",
+					)}
+				/>
+			</div>
+			{(long || request !== null) && (
+				<div
+					className={cn(
+						"mt-1 flex gap-3",
+						compact ? "text-[11px]" : "text-[12px]",
+					)}
+				>
+					{long && (
+						<button
+							type="button"
+							onClick={() => setOpen(!open)}
+							className="text-link hover:underline"
+						>
+							{open ? "Show less" : "Show more"}
+						</button>
+					)}
+					{request !== null && (
+						<button
+							type="button"
+							onClick={() => setFull(!full)}
+							className="text-link hover:underline"
+						>
+							{full ? "Hide Odin's prompt" : "Show Odin's prompt"}
+						</button>
+					)}
+				</div>
+			)}
 		</div>
 	);
+}
+
+/**
+ * The launch prompt's attached images and videos, read off disk as data URLs -
+ * the folded bubble hides the paths, so these show what was attached.
+ */
+function useAttachedPreviews(
+	paths: string[],
+	workspaceId: string | undefined,
+): Preview[] {
+	const reads = electronTrpc.useQueries((t) =>
+		workspaceId
+			? paths.map((absolutePath) =>
+					t.filesystem.readFile(
+						{ workspaceId, absolutePath, encoding: "base64" },
+						{ staleTime: Number.POSITIVE_INFINITY, retry: false },
+					),
+				)
+			: [],
+	);
+	return paths.flatMap((path, i): Preview[] => {
+		const content = reads[i]?.data?.content;
+		if (typeof content !== "string") return [];
+		const video = getVideoMimeType(path);
+		return video
+			? [{ url: `data:${video};base64,${content}`, video: true as const }]
+			: [`data:${getImageMimeType(path)};base64,${content}`];
+	});
+}
+
+/** The image and video paths under a launch prompt's "Attached files" head. */
+export function launchAttachments(text: string): string[] {
+	const block = text
+		.split(/\n\n+/)
+		.find((part) => part.startsWith("Attached files"));
+	return (block?.split("\n").slice(1) ?? [])
+		.map((line) => line.trim())
+		.filter((path) => getImageMimeType(path) || isPreviewableVideoFile(path));
 }
 
 /** A pasted image or video: an image's URL alone, or a video with its file. */
@@ -519,30 +918,64 @@ type Preview = string | { url: string; video: true };
 function PreviewStrip({
 	previews,
 	className,
+	onRemove,
 }: {
 	previews: Preview[];
 	className?: string;
+	/** The composer's previews: each gets an × that drops it before sending. */
+	onRemove?: (index: number) => void;
 }) {
+	// A click toggles one picture between thumbnail and a larger view.
+	const [enlarged, setEnlarged] = useState<string | null>(null);
 	return (
 		<div className={cn("flex flex-wrap gap-2", className)}>
-			{previews.map((preview) =>
-				typeof preview === "string" ? (
-					<img
-						key={preview}
-						src={preview}
-						alt="Pasted"
-						className="max-h-40 max-w-60 rounded-lg border border-border object-contain"
-					/>
-				) : (
-					<video
-						key={preview.url}
-						src={preview.url}
-						controls
-						muted
-						className="max-h-40 max-w-60 rounded-lg border border-border"
-					/>
-				),
-			)}
+			{previews.map((preview, index) => (
+				<div
+					key={typeof preview === "string" ? preview : preview.url}
+					className="relative"
+				>
+					{onRemove && (
+						<button
+							type="button"
+							title="Remove"
+							onClick={() => onRemove(index)}
+							className="absolute -right-1.5 -top-1.5 z-10 flex size-5 items-center justify-center rounded-full border border-border bg-background text-[12px] leading-none text-muted-foreground hover:text-foreground"
+						>
+							×
+						</button>
+					)}
+					{typeof preview === "string" ? (
+						<button
+							type="button"
+							onClick={() =>
+								setEnlarged((url) => (url === preview ? null : preview))
+							}
+							className={cn(
+								"block",
+								enlarged === preview ? "cursor-zoom-out" : "cursor-zoom-in",
+							)}
+						>
+							<img
+								src={preview}
+								alt="Pasted"
+								className={cn(
+									"rounded-lg border border-border object-contain",
+									enlarged === preview
+										? "max-h-[60vh] max-w-full"
+										: "max-h-40 max-w-60",
+								)}
+							/>
+						</button>
+					) : (
+						<video
+							src={preview.url}
+							controls
+							muted
+							className="max-h-40 max-w-60 rounded-lg border border-border"
+						/>
+					)}
+				</div>
+			))}
 		</div>
 	);
 }
@@ -565,24 +998,12 @@ function OdinMark({ className }: { className?: string }) {
 	);
 }
 
-/** "Starting session…" / "Working…": Odin's icon nodding along, or at card
- *  density a pulsing dot. */
-function Activity({ label }: { label: string }) {
-	const compact = useContext(Compact);
-	return (
-		<div
-			className={cn(
-				"flex items-center text-working",
-				compact ? "gap-2 text-[11.5px]" : "gap-3 text-[12.5px]",
-			)}
-		>
-			{compact ? (
-				<span className="size-1.5 shrink-0 animate-pulse rounded-full bg-working" />
-			) : (
-				<OdinMark className="animate-[odin-nod_1.6s_ease-in-out_infinite]" />
-			)}
-			{label}
-		</div>
+/** Odin's icon nodding along while a turn runs, or at card density a pulsing dot. */
+function ActivityMark() {
+	return useContext(Compact) ? (
+		<span className="size-1.5 shrink-0 animate-pulse rounded-full bg-working" />
+	) : (
+		<OdinMark className="animate-[odin-nod_1.6s_ease-in-out_infinite]" />
 	);
 }
 
@@ -604,29 +1025,206 @@ export function splitActionItems(text: string): {
 	};
 }
 
+/**
+ * The block heads useLaunchTaskSession and the rules store put after a task's
+ * title and description: attachments, your context, standing rules, and the
+ * closing instructions. Keep these in step with those writers.
+ */
+const LAUNCH_SCAFFOLD =
+	/^(Attached files|Context and guidelines from me|This run was started by a schedule|Standing rules - follow each one|Work in the current workspace\.)/;
+
+/**
+ * The request you typed in a launch prompt - its title and description, without
+ * the scaffolding the launcher added after them. null when there is none to fold.
+ */
+export function launchRequest(text: string): string | null {
+	const blocks = text.split(/\n\n+/);
+	const at = blocks.findIndex(
+		(block, i) => i > 0 && LAUNCH_SCAFFOLD.test(block),
+	);
+	return at < 0 ? null : blocks.slice(0, at).join("\n\n");
+}
+
+/** An item that asks you to sign off - it gets an Approve button, "(you only)" or not. */
+export function isApprovalItem(item: string): boolean {
+	return /^\W*approve\b/i.test(item);
+}
+
 /** The numbered or bulleted lines of an ACTION ITEMS block; [] for "none". */
-export function actionItemList(text: string): string[] {
-	return [...text.matchAll(/^\s*(?:\d+[.)]|[-*])\s+(.+)$/gm)].map(
-		(match) => match[1]?.trim() ?? "",
+export const actionItemList = actionItemLines;
+
+/**
+ * An item that asks you to tell Claude something - a choice, a value, a
+ * preference. It gets a reply box instead of a bare "Do it".
+ */
+export function isAnswerItem(item: string): boolean {
+	return (
+		!isDoneItem(item) &&
+		/^\W*(tell|answer|decide|choose|pick|confirm|let me know|say)\b/i.test(item)
 	);
 }
 
 /**
- * What's on you, set apart in the board's Needs-you colour. In a live session
- * each item gets a "Do it" button that hands it back to Claude.
+ * "Tell me when you have authorized X" - the only reply is "done", so it gets
+ * a Done button and no reply box.
  */
-function ActionItems({
-	text,
+export function isDoneItem(item: string): boolean {
+	return (
+		/^\W*(tell me|let me know)\s+(when|once|after)\b/i.test(item) &&
+		itemOptions(item).options.length === 0
+	);
+}
+
+/**
+ * The choices Claude offered as a trailing "[A | B | C]", and the item without
+ * them. The launch prompt asks for that shape; no brackets means no choices.
+ */
+export function itemOptions(item: string): { text: string; options: string[] } {
+	// An option may hold a link ("after [#826](url) merges"); a button shows its words.
+	const match = item.match(
+		/\s*\[((?:[^[\]]|\[[^\]]*\]\([^)]*\))*\|(?:[^[\]]|\[[^\]]*\]\([^)]*\))*)\](?!\()\W*$/,
+	);
+	if (match?.index === undefined) return { text: item, options: [] };
+	return {
+		text: item.slice(0, match.index),
+		options: (match[1] ?? "")
+			.split("|")
+			.map((option) => option.replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").trim())
+			.filter(Boolean),
+	};
+}
+
+type DoItem = (
+	item: string,
+	number: number,
+	approve: boolean,
+	answer?: string,
+) => void;
+
+const ACTION_BUTTON =
+	"shrink-0 rounded-md border border-attention/40 px-2 py-0.5 text-[11px] font-medium text-attention hover:bg-attention/15 disabled:cursor-default disabled:opacity-50 disabled:hover:bg-transparent";
+
+/** A card's action buttons: text links, no box. */
+const CARD_ACTION_BUTTON =
+	"shrink-0 rounded px-1 text-left text-[11px] font-medium text-attention hover:underline disabled:cursor-default disabled:no-underline disabled:opacity-50";
+
+/** Claude marks what it can't do "(you only)"; handing it back is a dead-end turn. */
+export function isYouOnly(item: string): boolean {
+	return (
+		/\(you only\)\W*$/i.test(item) &&
+		!isApprovalItem(item) &&
+		!isAnswerItem(item) &&
+		itemOptions(item).options.length === 0
+	);
+}
+
+/** One action item: its button, number, text, and - for a question - the reply box and choices. */
+function ActionItemRow({
+	item,
+	number,
 	onDo,
+	buttonColumn,
 }: {
-	text: string;
-	onDo?: (item: string, number: number) => void;
+	item: string;
+	number: number;
+	onDo: DoItem;
+	/** Some item in the list has a button - line this one's number up with it. */
+	buttonColumn: boolean;
 }) {
+	const [sent, setSent] = useState(false);
+	const [answer, setAnswer] = useState("");
+	const compact = useContext(Compact);
+	const button = compact ? CARD_ACTION_BUTTON : ACTION_BUTTON;
+	const buttonWidth = compact ? "w-[52px]" : "w-[64px]";
+	const { text, options } = itemOptions(item);
+	const approve = isApprovalItem(item);
+	const done = !approve && isDoneItem(item);
+	const asks = !approve && (isAnswerItem(item) || options.length > 0);
+	const send = (reply?: string) => {
+		setSent(true);
+		onDo(text, number, approve, reply);
+	};
+	return (
+		<li className="flex items-start gap-2">
+			{/* The button leads the row - you scan for it first. */}
+			{isYouOnly(item) ? (
+				buttonColumn && <span className={cn(buttonWidth, "shrink-0")} />
+			) : (
+				<button
+					type="button"
+					title={
+						approve
+							? "Tell Claude you approve and to go ahead"
+							: asks
+								? "Send your answer to Claude"
+								: done
+									? "Tell Claude this is done"
+									: "Ask Claude to do this for you"
+					}
+					disabled={sent || (asks && !answer.trim())}
+					onClick={() => send(asks ? answer.trim() : done ? "Done" : undefined)}
+					className={cn(button, buttonWidth)}
+				>
+					{sent ? "Sent" : approve ? "Approve" : done ? "Done" : "Do it"}
+				</button>
+			)}
+			<span
+				className={cn(
+					"w-4 shrink-0 pt-px text-right tabular-nums text-muted-foreground",
+					compact ? "text-[12px]" : "text-[13px]",
+				)}
+			>
+				{number}.
+			</span>
+			<div className="min-w-0 flex-1">
+				<MarkdownRenderer
+					content={text}
+					style="default"
+					allowHtml={false}
+					className={compact ? CARD_MARKDOWN : COMPACT_MARKDOWN}
+				/>
+				{asks && !sent && (
+					<div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+						{options.map((option) => (
+							<button
+								key={option}
+								type="button"
+								title="Send this choice to Claude"
+								onClick={() => send(option)}
+								className={button}
+							>
+								{option}
+							</button>
+						))}
+						<input
+							value={answer}
+							onChange={(event) => setAnswer(event.target.value)}
+							onKeyDown={(event) => {
+								if (event.key === "Enter" && answer.trim()) send(answer.trim());
+							}}
+							placeholder={options.length ? "Or type your own" : "Your answer"}
+							className="min-w-[160px] flex-1 rounded-md border border-attention/30 bg-transparent px-2 py-0.5 text-[12px] outline-none placeholder:text-muted-foreground/70 focus:border-attention/60"
+						/>
+					</div>
+				)}
+			</div>
+		</li>
+	);
+}
+
+/**
+ * What's on you, set apart in the board's Needs-you colour. Each item gets a
+ * "Do it" button that hands it back to Claude (resuming an ended session
+ * first), except the ones Claude marked "(you only)". An item asking you to
+ * approve something gets "Approve" instead, which tells Claude to go ahead. An
+ * item asking you to tell Claude something gets a reply box, plus a button per
+ * choice when Claude listed them.
+ */
+function ActionItems({ text, onDo }: { text: string; onDo?: DoItem }) {
 	// text arrives linkified from ItemView.
 	const items = onDo ? actionItemList(text) : [];
-	const [sent, setSent] = useState<Set<number>>(new Set());
+	const buttonColumn = !items.every(isYouOnly);
 	const compact = useContext(Compact);
-	const markdown = compact ? CARD_MARKDOWN : COMPACT_MARKDOWN;
 	return (
 		<div
 			className={
@@ -648,44 +1246,14 @@ function ActionItems({
 			{onDo && items.length > 0 ? (
 				<ol className={cn("flex flex-col", compact ? "gap-0.5" : "gap-1")}>
 					{items.map((item, index) => (
-						<li
+						<ActionItemRow
 							// biome-ignore lint/suspicious/noArrayIndexKey: the list is fixed once written
 							key={index}
-							className="flex items-start gap-2"
-						>
-							{/* The button leads the row - you scan for it first. */}
-							<button
-								type="button"
-								title="Ask Claude to do this for you"
-								disabled={sent.has(index)}
-								onClick={() => {
-									setSent((prev) => new Set(prev).add(index));
-									onDo(item, index + 1);
-								}}
-								className={cn(
-									"shrink-0 text-[11px] font-medium text-attention disabled:cursor-default disabled:opacity-50",
-									compact
-										? "w-9 rounded px-1 text-left hover:underline disabled:no-underline"
-										: "w-[52px] rounded-md border border-attention/40 px-2 py-0.5 hover:bg-attention/15 disabled:hover:bg-transparent",
-								)}
-							>
-								{sent.has(index) ? "Sent" : "Do it"}
-							</button>
-							<span
-								className={cn(
-									"w-4 shrink-0 pt-px text-right tabular-nums text-muted-foreground",
-									compact ? "text-[12px]" : "text-[13px]",
-								)}
-							>
-								{index + 1}.
-							</span>
-							<MarkdownRenderer
-								content={item}
-								style="default"
-								allowHtml={false}
-								className={cn(markdown, "min-w-0 flex-1")}
-							/>
-						</li>
+							item={item}
+							number={index + 1}
+							onDo={onDo}
+							buttonColumn={buttonColumn}
+						/>
 					))}
 				</ol>
 			) : (
@@ -693,7 +1261,7 @@ function ActionItems({
 					content={text}
 					style="default"
 					allowHtml={false}
-					className={markdown}
+					className={compact ? CARD_MARKDOWN : COMPACT_MARKDOWN}
 				/>
 			)}
 		</div>
@@ -705,17 +1273,26 @@ const ItemView = memo(
 		item,
 		refs,
 		onDo,
+		workspaceId,
 	}: {
 		item: Item;
 		refs: Map<string, string>;
+		workspaceId: string;
 		/** Changes only when a new ref appears - the memo's cue to re-link. */
 		refsKey: string;
-		onDo?: (item: string, number: number) => void;
+		onDo?: DoItem;
 	}) {
 		const compact = useContext(Compact);
 		if (item.kind === "tool") return <ToolRow item={item} />;
+		if (item.kind === "compact") return <CompactRow item={item} />;
 		if (item.kind === "user")
-			return <UserBubble text={item.text} images={item.images} />;
+			return (
+				<UserBubble
+					text={item.text}
+					images={item.images}
+					workspaceId={workspaceId}
+				/>
+			);
 		const { body, actions } = splitActionItems(linkify(item.text, refs));
 		return (
 			<div className="select-text cursor-text">
@@ -734,6 +1311,7 @@ const ItemView = memo(
 	(prev, next) =>
 		prev.item === next.item &&
 		prev.refsKey === next.refsKey &&
+		prev.workspaceId === next.workspaceId &&
 		prev.onDo === next.onDo,
 );
 
@@ -758,6 +1336,11 @@ function ChatViewBody({
 	working = false,
 	onShowTerminal,
 	onStop,
+	onResumeWith,
+	onSend,
+	noTerminal = false,
+	placeholder,
+	onOpenSession,
 	focusComposer = true,
 }: {
 	paneId: string;
@@ -765,10 +1348,20 @@ function ChatViewBody({
 	cwd: string | undefined;
 	workspaceId: string;
 	working?: boolean;
-	/** Omitted for an ended session: nothing to type into, so no composer. */
+	/** Omitted for an ended session: its composer resumes via `onResumeWith`. */
 	onShowTerminal?: () => void;
 	/** Interrupt the turn - the drawer's Interrupt, so the card leaves Working too. */
 	onStop?: () => void;
+	/** Ended session: resume it with this as the opening message. */
+	onResumeWith?: (text: string) => void;
+	/** Sends a reply in place of typing it into the PTY - the raven's, which brings a dead PTY back first. */
+	onSend?: (text: string) => void;
+	/** Hide the links to the terminal view (the crow's panel has none). */
+	noTerminal?: boolean;
+	/** The reply box's prompt, in place of "Reply to Claude". */
+	placeholder?: string;
+	/** Follows a `#session=<paneId>` link in a reply (the raven writes them). */
+	onOpenSession?: (paneId: string) => void;
 	/** The composer takes the keyboard when this is (or turns) true. */
 	focusComposer?: boolean;
 	/** "compact" for a card (Home); the drawer keeps the default. */
@@ -793,7 +1386,12 @@ function ChatViewBody({
 		home && startCwd && sessionId
 			? transcriptPath(home, startCwd, sessionId)
 			: null;
-	const { items, missing, poke } = useLiveItems(path, workspaceId);
+	const { items, missing, poke, hasEarlier, earlierLoads, loadEarlier } =
+		useLiveItems(path, workspaceId);
+	// The whole view takes a file drop, not just the reply box: a drop on the
+	// conversation used to do nothing. The composer owns the attachments.
+	const dropRef = useRef<(files: File[]) => void>(undefined);
+	const [dragging, setDragging] = useState(false);
 	// PR and ticket refs this session has URLs for, so "#676" can link.
 	const refs = useMemo(
 		() =>
@@ -801,7 +1399,9 @@ function ChatViewBody({
 				items.map((item) =>
 					item.kind === "tool"
 						? `${JSON.stringify(item.input)} ${(item.result ?? "").slice(0, 20_000)}`
-						: item.text,
+						: item.kind === "compact"
+							? ""
+							: item.text,
 				),
 			),
 		[items],
@@ -820,8 +1420,33 @@ function ChatViewBody({
 			toast.error(error instanceof Error ? error.message : String(error));
 		}
 		for (const ms of [300, 1000, 2500]) setTimeout(poke, ms);
+		void screen.refetch();
 	};
 	const prompt = onShowTerminal ? asking(items) : null;
+	// The turn began with your last message; "Working..." counts from it, and
+	// opens to every command Claude has run since.
+	const turnIndex = items.findLastIndex(
+		(item) => item.kind === "user" && item.at !== undefined,
+	);
+	const turnStart =
+		turnIndex >= 0
+			? (items[turnIndex] as Extract<Item, { kind: "user" }>).at
+			: undefined;
+	const turnTools = items
+		.slice(turnIndex + 1)
+		.filter((item): item is Tool => item.kind === "tool");
+	const turnTokens = outputTokens(items.slice(turnIndex + 1));
+	const [showCommands, setShowCommands] = useState(false);
+	// Menus the transcript never sees, read off the live screen.
+	const screen = electronTrpc.terminal.readScreen.useQuery(
+		{ paneId },
+		{ enabled: !!onShowTerminal && !prompt, refetchInterval: POLL_MS },
+	);
+	const screenText = onShowTerminal && !prompt ? screen.data?.text : null;
+	const screenMenu = useMemo(
+		() => (screenText ? parseScreenMenu(screenText) : null),
+		[screenText],
+	);
 	// What you just sent, shown at once - Claude writes it to the transcript a
 	// beat later, and that echo replaces it.
 	const [pending, setPending] = useState<
@@ -844,17 +1469,32 @@ function ChatViewBody({
 		// Claude takes a moment to write it; look again a few times meanwhile.
 		for (const ms of [150, 500, 1000]) setTimeout(poke, ms);
 		// ponytail: an echo that never matches (Claude rewrote it) just expires.
-		setTimeout(
-			() => setPending((list) => list.filter((sent) => sent.id !== id)),
-			30_000,
-		);
+		// Not mid-turn: Claude writes a queued message only when it takes it.
+		const expire = () =>
+			workingRef.current
+				? setTimeout(expire, 30_000)
+				: setPending((list) => list.filter((sent) => sent.id !== id));
+		setTimeout(expire, 30_000);
 	};
+	const workingRef = useRef(working);
+	workingRef.current = working;
 	const onSentRef = useRef(onSent);
 	onSentRef.current = onSent;
 	// Stable, so the memoized rows don't all re-render on every poll.
+	// A ref, so a fresh arrow from the drawer doesn't re-render every message.
+	const onResumeRef = useRef(onResumeWith);
+	onResumeRef.current = onResumeWith;
 	const doItem = useCallback(
-		(item: string, number: number) => {
-			const text = `Do action item ${number} for me: ${item}`;
+		(item: string, number: number, approve: boolean, answer?: string) => {
+			const text = approve
+				? `Approved - go ahead with action item ${number}: ${item}`
+				: answer !== undefined
+					? `Action item ${number} (${item}): ${answer}`
+					: `Do action item ${number} for me: ${item}`;
+			if (onResumeRef.current) {
+				onResumeRef.current(text);
+				return;
+			}
 			onSentRef.current(text);
 			void typeIntoClaude(write.mutateAsync, paneId, text).catch((error) =>
 				toast.error(error instanceof Error ? error.message : String(error)),
@@ -876,26 +1516,111 @@ function ChatViewBody({
 		const el = scrollRef.current;
 		if (el && pinnedRef.current) el.scrollTop = el.scrollHeight;
 	}, [items, pending]);
+	// Earlier rows land above what you're reading: keep it where it was, and
+	// don't animate them in.
+	const fromBottomRef = useRef<number | null>(null);
+	const fetchEarlier = () => {
+		const el = scrollRef.current;
+		if (!el || !hasEarlier || fromBottomRef.current !== null) return;
+		fromBottomRef.current = el.scrollHeight - el.scrollTop;
+		void loadEarlier().then((loaded) => {
+			if (!loaded) fromBottomRef.current = null;
+		});
+	};
+	// A window too short to scroll gives no scroll to load more on.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: items is the trigger - rows change scrollHeight
+	useEffect(() => {
+		const el = scrollRef.current;
+		if (el && el.scrollHeight <= el.clientHeight) fetchEarlier();
+	}, [items, hasEarlier]);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: earlierLoads is the trigger - it bumps with the prepended rows
+	useLayoutEffect(() => {
+		const el = scrollRef.current;
+		if (!el || fromBottomRef.current === null) return;
+		el.scrollTop = el.scrollHeight - fromBottomRef.current;
+		fromBottomRef.current = null;
+		for (const item of items) firstIdsRef.current?.add(item.id);
+	}, [earlierLoads]);
+	// Rows also grow after they mount (code blocks, images, markdown), so a
+	// switched-to session would stop short of the bottom; follow that too.
+	const contentRef = useRef<HTMLDivElement>(null);
+	useEffect(() => {
+		const el = scrollRef.current;
+		const content = contentRef.current;
+		if (!el || !content) return;
+		const observer = new ResizeObserver(() => {
+			if (pinnedRef.current) el.scrollTop = el.scrollHeight;
+		});
+		observer.observe(content);
+		return () => observer.disconnect();
+	}, []);
 	// A live session whose first prompt hasn't reached the transcript yet: the
 	// file doesn't exist ("Not on disk yet") or holds no turn so far.
+	// Claude's PreCompact hook marked the start; the boundary it writes when
+	// done ends it.
+	const compactStart = useCompacting((state) => state.since[paneId]);
+	const compacting =
+		compactStart !== undefined &&
+		!items.some(
+			(item) => item.kind === "compact" && (item.at ?? 0) >= compactStart,
+		)
+			? compactStart
+			: null;
 	const starting =
 		!!onShowTerminal &&
+		!screenMenu &&
 		items.length === 0 &&
 		pending.length === 0 &&
 		(!missing || missing.startsWith("Not on disk yet"));
 	return (
-		<div className="flex min-h-0 flex-1 flex-col">
+		// biome-ignore lint/a11y/noStaticElementInteractions: Page Up/Down from the composer jump the conversation to its top/bottom; a file dropped anywhere on it attaches
+		<div
+			className="flex min-h-0 flex-1 flex-col"
+			onDragOver={(event) => {
+				if (!dropRef.current || !event.dataTransfer.types.includes("Files"))
+					return;
+				event.preventDefault();
+				setDragging(true);
+			}}
+			onDragLeave={(event) => {
+				if (!event.currentTarget.contains(event.relatedTarget as Node))
+					setDragging(false);
+			}}
+			onDrop={(event) => {
+				if (!dropRef.current || !event.dataTransfer.types.includes("Files"))
+					return;
+				// Stop Electron from opening a dropped file in the window.
+				event.preventDefault();
+				setDragging(false);
+				dropRef.current([...event.dataTransfer.files]);
+			}}
+			onKeyDown={(event) => {
+				const el = scrollRef.current;
+				const top = isHotkey("CHAT_TO_TOP", event.nativeEvent);
+				if (!el || (!top && !isHotkey("CHAT_TO_BOTTOM", event.nativeEvent)))
+					return;
+				event.preventDefault();
+				el.scrollTop = top ? 0 : el.scrollHeight;
+			}}
+		>
 			<div
 				ref={scrollRef}
 				onScroll={(event) => {
 					const el = event.currentTarget;
 					pinnedRef.current =
 						el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+					if (el.scrollTop < el.clientHeight) fetchEarlier();
 				}}
 				// Links open in Odin's browser, like everywhere else on the board.
 				onClickCapture={(event) => {
 					const anchor = (event.target as HTMLElement).closest("a");
-					if (anchor?.href.startsWith("http")) {
+					const session = anchor
+						?.getAttribute("href")
+						?.match(/^#session=(.+)$/)?.[1];
+					if (session && onOpenSession) {
+						event.preventDefault();
+						onOpenSession(decodeURIComponent(session));
+					} else if (anchor?.href.startsWith("http")) {
 						event.preventDefault();
 						openUrl(anchor.href);
 					}
@@ -905,9 +1630,32 @@ function ChatViewBody({
 					compact ? "px-3 py-2.5" : "px-8 py-6",
 				)}
 			>
-				<div className={cn("flex flex-col", compact ? "gap-1.5" : "gap-2.5")}>
+				<div
+					ref={contentRef}
+					className={cn("flex flex-col", compact ? "gap-1.5" : "gap-2.5")}
+				>
 					{starting ? (
-						<Activity label="Starting session…" />
+						<div
+							className={cn(
+								"flex items-center text-working",
+								compact ? "gap-2 text-[11.5px]" : "gap-3 text-[12.5px]",
+							)}
+						>
+							<ActivityMark />
+							Starting session…
+							{/* Before its first turn the CLI can stop on a terminal-only
+							    prompt (folder trust, bypass-permissions warning) that no
+							    transcript ever shows. */}
+							{!noTerminal && (
+								<button
+									type="button"
+									onClick={onShowTerminal}
+									className="text-[11.5px] text-muted-foreground hover:text-foreground"
+								>
+									Stuck? Show terminal
+								</button>
+							)}
+						</div>
 					) : (
 						missing &&
 						items.length === 0 && (
@@ -918,22 +1666,44 @@ function ChatViewBody({
 					)}
 					{segments(items).map((segment, index, all) => {
 						const previous = all[index - 1];
+						const following = all[index + 1];
+						// A run's toggle sits at the end of the line before it.
+						if (
+							Array.isArray(segment) &&
+							!Array.isArray(previous) &&
+							previous?.kind === "text"
+						)
+							return null;
 						// A reply starts after your message (or at the top); its first
 						// block carries Claude's mark, the rest line up beside it.
 						const opensReply =
 							!(!Array.isArray(segment) && segment.kind === "user") &&
 							(index === 0 ||
-								(!Array.isArray(previous) && previous?.kind === "user"));
-						if (!Array.isArray(segment) && segment.kind === "user")
+								(!Array.isArray(previous) &&
+									(previous?.kind === "user" || previous?.kind === "compact")));
+						if (
+							!Array.isArray(segment) &&
+							(segment.kind === "user" || segment.kind === "compact")
+						)
 							return (
 								<ItemView
 									key={segment.id}
 									item={segment}
 									refs={refs}
 									refsKey={refsKey}
+									workspaceId={workspaceId}
 								/>
 							);
 						const key = Array.isArray(segment) ? segment[0]?.id : segment.id;
+						const itemView = !Array.isArray(segment) && (
+							<ItemView
+								item={segment}
+								refs={refs}
+								refsKey={refsKey}
+								workspaceId={workspaceId}
+								onDo={onShowTerminal || onResumeWith ? doItem : undefined}
+							/>
+						);
 						return (
 							<div
 								key={key}
@@ -950,14 +1720,11 @@ function ChatViewBody({
 								)}
 								<div className="min-w-0 flex-1">
 									{Array.isArray(segment) ? (
-										<ToolGroup tools={segment} />
+										<ToolGroup group={segment} />
+									) : Array.isArray(following) ? (
+										<ToolGroup group={following} lead={itemView} />
 									) : (
-										<ItemView
-											item={segment}
-											refs={refs}
-											refsKey={refsKey}
-											onDo={onShowTerminal ? doItem : undefined}
-										/>
+										itemView
 									)}
 								</div>
 							</div>
@@ -988,32 +1755,140 @@ function ChatViewBody({
 										onKeys={sendKeys}
 									/>
 								)}
-								<button
-									type="button"
-									onClick={onShowTerminal}
-									className="mt-1.5 text-[11.5px] text-muted-foreground hover:text-foreground"
-								>
-									Answer in Terminal View instead
-								</button>
+								{!noTerminal && (
+									<button
+										type="button"
+										onClick={onShowTerminal}
+										className="mt-1.5 text-[11.5px] text-muted-foreground hover:text-foreground"
+									>
+										Answer in Terminal View instead
+									</button>
+								)}
 							</div>
 						</div>
 					)}
-					{working && !prompt && !starting && <Activity label="Working…" />}
+					{screenMenu && (
+						<div className={cn("flex min-w-0 gap-3", ENTER)}>
+							{!compact && <OdinMark />}
+							<div className="min-w-0 flex-1">
+								<ScreenMenuCard
+									key={`${screenMenu.title}\n${screenMenu.options.join("\n")}`}
+									menu={screenMenu}
+									onKeys={sendKeys}
+								/>
+								{!noTerminal && (
+									<button
+										type="button"
+										onClick={onShowTerminal}
+										className="mt-1.5 text-[11.5px] text-muted-foreground hover:text-foreground"
+									>
+										Answer in Terminal View instead
+									</button>
+								)}
+							</div>
+						</div>
+					)}
+					{working && !prompt && !screenMenu && !starting && (
+						<div
+							className={cn(
+								"flex min-w-0 text-working",
+								compact
+									? "items-center gap-2 text-[11.5px]"
+									: "gap-3 text-[12.5px]",
+							)}
+						>
+							<ActivityMark />
+							{compacting === null ? (
+								<div className="flex min-w-0 flex-1 flex-col">
+									<button
+										type="button"
+										title={
+											showCommands
+												? "Hide the steps"
+												: "Show what Claude did this turn"
+										}
+										disabled={turnTools.length === 0}
+										onClick={() => setShowCommands(!showCommands)}
+										className={cn(
+											"flex items-center gap-3 self-start rounded-md enabled:hover:text-foreground",
+											compact ? "h-5" : "h-7",
+										)}
+									>
+										<span className="shrink-0">Working…</span>
+										{turnStart !== undefined && <Elapsed since={turnStart} />}
+										{turnTokens > 0 && (
+											<span
+												title="Tokens Claude has written this turn"
+												className="shrink-0 tabular-nums text-muted-foreground"
+											>
+												↓ {tokenLabel(turnTokens)} tokens
+											</span>
+										)}
+										{turnTools.length > 0 && (
+											<LuChevronRight
+												className={cn(
+													"size-3.5 shrink-0 text-muted-foreground transition-transform",
+													showCommands && "rotate-90",
+												)}
+											/>
+										)}
+									</button>
+									{showCommands && turnTools.length > 0 && (
+										// Same rows as a finished turn's Worked list: what each
+										// step did, opening to its command and output.
+										<div className="mt-1.5 max-h-[420px] overflow-y-auto rounded-lg border border-border bg-secondary/20 p-1.5 text-foreground">
+											{turnTools.map((tool) => (
+												<ToolRow key={tool.id} item={tool} />
+											))}
+										</div>
+									)}
+								</div>
+							) : (
+								<div
+									className={cn(
+										"flex items-center gap-3",
+										compact ? "h-5" : "h-7",
+									)}
+								>
+									Compacting conversation…
+									<Elapsed since={compacting} />
+								</div>
+							)}
+						</div>
+					)}
 				</div>
 			</div>
 			{onShowTerminal ? (
 				<>
 					{/* While a menu waits, typed text would land in it - the card answers. */}
-					{!prompt && (
+					{!prompt && !screenMenu && (
 						<Composer
 							paneId={paneId}
 							working={working}
 							onSent={onSent}
 							onStop={onStop}
+							onSend={onSend}
+							noTerminal={noTerminal}
+							placeholder={placeholder}
+							dropRef={dropRef}
+							dragging={dragging}
 							autoFocus={focusComposer}
 						/>
 					)}
 				</>
+			) : onResumeWith ? (
+				// Ended session: the first message resumes it.
+				<Composer
+					paneId={paneId}
+					working={false}
+					onSent={() => {}}
+					noTerminal={noTerminal}
+					onResume={onResumeWith}
+					placeholder="Reply to resume the session"
+					dropRef={dropRef}
+					dragging={dragging}
+					autoFocus={focusComposer}
+				/>
 			) : (
 				<div className="border-t border-border px-5 py-2 text-center text-[11.5px] text-muted-foreground">
 					Session ended - Resume to reply
@@ -1026,12 +1901,15 @@ function ChatViewBody({
 /**
  * Types a message into Claude's PTY and submits it. Text goes in as a
  * bracketed paste when it spans lines (a bare newline would submit early),
- * then Enter in its own write.
+ * then Enter in its own write. `now` submits with Claude's send-now chord
+ * (Ctrl+X Ctrl+S) instead: mid-turn it lands right away, not after the turn.
+ * Ctrl+Enter itself can't cross a PTY - it arrives as a plain Enter.
  */
 async function typeIntoClaude(
 	write: (input: { paneId: string; data: string }) => Promise<unknown>,
 	paneId: string,
 	text: string,
+	now = false,
 ) {
 	if (text)
 		await write({
@@ -1039,36 +1917,107 @@ async function typeIntoClaude(
 			data: text.includes("\n") ? `\x1b[200~${text}\x1b[201~` : text,
 		});
 	await new Promise((resolve) => setTimeout(resolve, 30));
-	await write({ paneId, data: "\r" });
+	await write({ paneId, data: now ? "\x18\x13" : "\r" });
 }
 
 /**
  * Its own component so a keystroke re-renders the box, not the conversation.
- * An image paste is Ctrl+V into the
- * PTY: Claude Code reads the clipboard image itself and attaches it. Claude
- * takes no video, so a pasted video file goes in as its path.
+ * A pasted or dropped image or video is saved and held as a preview with its
+ * path until you send, so its × can still drop it. Sending pastes each path
+ * into Claude's prompt, where an image path turns into an [Image #N]
+ * attachment and a video stays a path (Claude takes no video). Any other
+ * file goes into the draft as its path, as the terminal does with a drop.
  */
 function Composer({
 	paneId,
 	working,
 	onSent,
 	onStop,
+	noTerminal,
+	placeholder = "Reply to Claude",
+	onResume,
+	onSend,
+	dropRef,
+	dragging,
 	autoFocus,
 }: {
 	paneId: string;
 	working: boolean;
 	onSent: (text: string, previews?: Preview[]) => void;
 	onStop?: () => void;
+	noTerminal: boolean;
+	placeholder?: string;
+	/** Ended session: sending resumes it with the text instead of typing into a PTY. */
+	onResume?: (text: string) => void;
+	/** Sends in place of typing into the PTY; the sent bubble still shows. */
+	onSend?: (text: string) => void;
+	/** The view's drop zone hands dropped files here. */
+	dropRef: { current?: (files: File[]) => void };
+	dragging: boolean;
 	autoFocus: boolean;
 }) {
 	const compact = useContext(Compact);
-	const [draft, setDraft] = useState("");
+	const [draft, setDraft] = useState(() => draftFor(paneId));
+	useEffect(
+		() => useChatDrafts.getState().save(paneId, draft),
+		[paneId, draft],
+	);
 	// "!" on an empty box switches to bash mode, like the terminal's prompt.
 	const [bash, setBash] = useState(false);
-	const [previews, setPreviews] = useState<Preview[]>([]);
+	const [attached, setAttached] = useState<
+		{ preview: Preview; path: string }[]
+	>([]);
+	const attach = (files: File[], cite = false) => {
+		const media = files.filter(
+			(f) => f.type.startsWith("image/") || f.type.startsWith("video/"),
+		);
+		const others = cite
+			? files
+					.filter((f) => !media.includes(f))
+					.map((f) => window.webUtils.getPathForFile(f))
+					.filter(Boolean)
+			: [];
+		if (others.length > 0) {
+			const text = shellEscapePaths(others);
+			setDraft((d) => (d && !/\s$/.test(d) ? `${d} ${text}` : d + text));
+			inputRef.current?.focus();
+		}
+		if (media.length === 0) return others.length > 0;
+		void attachmentPaths(media).then(
+			(paths) =>
+				setAttached((list) => [
+					...list,
+					...media.map((file, index) => ({
+						path: paths[index] ?? "",
+						preview: file.type.startsWith("video/")
+							? { url: URL.createObjectURL(file), video: true as const }
+							: URL.createObjectURL(file),
+					})),
+				]),
+			(error) => toast.error(String(error)),
+		);
+		return true;
+	};
+	dropRef.current = (files) => attach(files, true);
 	const inputRef = useRef<HTMLTextAreaElement>(null);
 	const write = electronTrpc.terminal.write.useMutation();
 	const setChat = useSessionView((s) => s.setChat);
+	const sendNowKeys = useHotkeyDisplay("CHAT_SEND_NOW").text;
+	// Type `/` and the agent's skills/commands are searchable, like the New
+	// Session dialog. Picking one fills in `/name `; Enter then sends it.
+	const { data: skills = [] } = electronTrpc.skills.list.useQuery();
+	const [menuClosed, setMenuClosed] = useState(false);
+	const [selected, setSelected] = useState(0);
+	const token = bash ? undefined : skillToken(draft);
+	const matches = useMemo(
+		() => (token === undefined || menuClosed ? [] : matchSkills(skills, token)),
+		[skills, token, menuClosed],
+	);
+	const activeIndex = Math.min(selected, Math.max(matches.length - 1, 0));
+	const pickSkill = (name: string) => {
+		setDraft((text) => insertSkill(text, name));
+		setSelected(0);
+	};
 	useEffect(() => {
 		if (autoFocus) inputRef.current?.focus();
 	}, [autoFocus]);
@@ -1080,23 +2029,87 @@ function Composer({
 		el.style.height = "auto";
 		el.style.height = `${Math.min(el.scrollHeight, compact ? 96 : 220)}px`;
 	}, [draft]);
-	const send = async () => {
+	const send = async (now = false) => {
 		const body = draft.trim();
-		if (bash ? !body : !body && previews.length === 0) return;
+		const sending = bash ? [] : attached;
+		if (!body && sending.length === 0) return;
 		const text = bash ? `!${body}` : body;
+		const paths = sending.map((item) => item.path);
 		setDraft("");
+		// Now, not via the effect: sending can remount this box (a resume, a
+		// menu), and the new one would read the sent text back as a draft.
+		useChatDrafts.getState().save(paneId, "");
 		setBash(false);
-		setPreviews([]);
+		if (!bash) setAttached([]);
+		if (onResume) {
+			onResume([text, ...paths].filter(Boolean).join(" "));
+			return;
+		}
 		// ponytail: blob URLs are never revoked - a few per session.
-		onSent(text, previews);
+		onSent(
+			text,
+			sending.map((item) => item.preview),
+		);
+		if (onSend) {
+			onSend([text, ...paths].filter(Boolean).join(" "));
+			return;
+		}
 		try {
-			await typeIntoClaude(write.mutateAsync, paneId, text);
+			// A bracketed paste, not typing: only a pasted path becomes an attachment.
+			for (const path of paths)
+				await write.mutateAsync({ paneId, data: `\x1b[200~${path}\x1b[201~ ` });
+			// Claude reads a pasted image path off disk before it shows [Image #N],
+			// and an Enter that lands meanwhile is dropped: nothing sends. ~150ms
+			// was enough for a 6000x4000 JPEG; 500ms leaves room.
+			// ponytail: fixed wait, poll the screen for [Image #N] if it ever misses.
+			if (paths.length > 0)
+				await new Promise((resolve) => setTimeout(resolve, 500));
+			await typeIntoClaude(write.mutateAsync, paneId, text, now);
 		} catch (error) {
 			setDraft(body);
 			setBash(bash);
+			setAttached(sending);
 			toast.error(error instanceof Error ? error.message : String(error));
 		}
 	};
+	const skillMenu = matches.length > 0 && (
+		<div className="absolute inset-x-0 bottom-full mb-1.5 overflow-hidden rounded-[10px] border border-border bg-popover shadow-[0_12px_40px_rgba(0,0,0,0.5)]">
+			<div className="max-h-[240px] overflow-y-auto py-1">
+				{matches.map((skill, index) => (
+					<button
+						key={skill.name}
+						type="button"
+						onMouseEnter={() => setSelected(index)}
+						// The textarea keeps focus: mousedown fires before blur.
+						onMouseDown={(event) => {
+							event.preventDefault();
+							pickSkill(skill.name);
+						}}
+						className={cn(
+							"flex w-full items-baseline gap-2 px-3 py-1 text-left",
+							index === activeIndex && "bg-secondary",
+						)}
+					>
+						<span className="shrink-0 font-mono text-[12.5px] font-semibold text-foreground">
+							/{skill.name}
+						</span>
+						<span className="min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground">
+							{skill.description}
+						</span>
+					</button>
+				))}
+			</div>
+		</div>
+	);
+	const previewStrip = attached.length > 0 && (
+		<PreviewStrip
+			previews={attached.map((item) => item.preview)}
+			onRemove={(index) =>
+				setAttached((list) => list.filter((_, i) => i !== index))
+			}
+			className={compact ? "mb-1.5" : "mb-2"}
+		/>
+	);
 	const input = (
 		<textarea
 			ref={inputRef}
@@ -1108,29 +2121,35 @@ function Composer({
 					setBash(true);
 					setDraft(value.slice(1));
 				} else setDraft(value);
+				setMenuClosed(false);
 			}}
 			onPaste={(event) => {
-				const files = [...event.clipboardData.files];
-				const images = files.filter((f) => f.type.startsWith("image/"));
-				const videos = files.filter((f) => f.type.startsWith("video/"));
-				if (images.length === 0 && videos.length === 0) return;
-				event.preventDefault();
-				if (images.length > 0) write.mutate({ paneId, data: "\x16" });
-				const paths = videos
-					.map((file) => window.webUtils.getPathForFile(file))
-					.filter(Boolean);
-				if (paths.length > 0)
-					setDraft((text) => [text, ...paths].filter(Boolean).join(" "));
-				setPreviews((list) => [
-					...list,
-					...images.map((file) => URL.createObjectURL(file)),
-					...videos.map((file) => ({
-						url: URL.createObjectURL(file),
-						video: true as const,
-					})),
-				]);
+				if (attach([...event.clipboardData.files])) event.preventDefault();
 			}}
 			onKeyDown={(event) => {
+				if (matches.length > 0 && !event.nativeEvent.isComposing) {
+					// While the skill menu is open it owns these keys.
+					if (event.key === "Escape") {
+						event.preventDefault();
+						setMenuClosed(true);
+						return;
+					}
+					if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+						event.preventDefault();
+						const step = event.key === "ArrowDown" ? 1 : matches.length - 1;
+						setSelected((index) => (index + step) % matches.length);
+						return;
+					}
+					if (
+						(event.key === "Enter" && !event.shiftKey) ||
+						event.key === "Tab"
+					) {
+						event.preventDefault();
+						const match = matches[activeIndex];
+						if (match) pickSkill(match.name);
+						return;
+					}
+				}
 				if (
 					bash &&
 					!draft &&
@@ -1146,11 +2165,10 @@ function Composer({
 					!event.nativeEvent.isComposing
 				) {
 					event.preventDefault();
-					void send();
+					void send(isHotkey("CHAT_SEND_NOW", event.nativeEvent));
 				}
 			}}
-			placeholder={bash ? "Run a shell command" : "Reply to Claude"}
-			aria-label={bash ? "Run a shell command" : "Reply to Claude"}
+			placeholder={bash ? "Run a shell command" : placeholder}
 			className={cn(
 				"block w-full resize-none bg-transparent text-foreground outline-none",
 				compact
@@ -1166,13 +2184,13 @@ function Composer({
 		return (
 			<div
 				className={cn(
-					"border-t px-3 py-1.5",
+					"relative border-t px-3 py-1.5",
 					bash ? "border-pink-500/60" : "border-border",
+					dragging && "bg-primary/10",
 				)}
 			>
-				{previews.length > 0 && (
-					<PreviewStrip previews={previews} className="mb-1.5" />
-				)}
+				{skillMenu}
+				{previewStrip}
 				<div className="flex items-end gap-1.5">
 					{bash && (
 						<span className="font-mono text-[12.5px] leading-normal text-pink-500">
@@ -1181,7 +2199,7 @@ function Composer({
 					)}
 					<div className="min-w-0 flex-1 py-0.5">{input}</div>
 					{/* The rest only on the card you're in - unfocused ones stay a line. */}
-					{autoFocus && (
+					{autoFocus && !noTerminal && (
 						<button
 							type="button"
 							title="Terminal View (Settings > Appearance)"
@@ -1208,7 +2226,7 @@ function Composer({
 								type="button"
 								title="Send (Enter)"
 								aria-label="Send"
-								disabled={!draft.trim() && previews.length === 0}
+								disabled={!draft.trim() && attached.length === 0}
 								onClick={() => void send()}
 								className="flex size-6 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground hover:brightness-110 disabled:opacity-40"
 							>
@@ -1222,13 +2240,13 @@ function Composer({
 		<div className="px-4 pb-3 pt-1">
 			<div
 				className={cn(
-					"rounded-[14px] border border-border bg-background px-3 pb-2 pt-2.5 focus-within:border-primary/60",
+					"relative rounded-[14px] border border-border bg-background px-3 pb-2 pt-2.5 focus-within:border-primary/60",
 					bash && "border-pink-500/60 focus-within:border-pink-500",
+					dragging && "border-primary bg-primary/10",
 				)}
 			>
-				{previews.length > 0 && (
-					<PreviewStrip previews={previews} className="mb-2" />
-				)}
+				{skillMenu}
+				{previewStrip}
 				<div className="flex gap-1.5">
 					{bash && (
 						<span className="font-mono text-[13.5px] leading-relaxed text-pink-500">
@@ -1238,22 +2256,25 @@ function Composer({
 					{input}
 				</div>
 				<div className="mt-1.5 flex items-center gap-2">
-					<button
-						type="button"
-						title="Show sessions as their terminal (Settings > Appearance)"
-						onClick={() => setChat(false)}
-						className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-secondary hover:text-foreground"
-					>
-						<LuSquareTerminal className="size-3.5" />
-						Terminal View
-					</button>
+					{!noTerminal && (
+						<button
+							type="button"
+							title="Show sessions as their terminal (Settings > Appearance)"
+							onClick={() => setChat(false)}
+							className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-secondary hover:text-foreground"
+						>
+							<LuSquareTerminal className="size-3.5" />
+							Terminal View
+						</button>
+					)}
 					{bash ? (
 						<span className="text-[11px] text-pink-500">
 							Bash mode · Backspace on empty to exit
 						</span>
 					) : (
 						<span className="text-[11px] text-faint-foreground">
-							Enter to send · Shift+Enter for a new line · ! for bash
+							Enter to send · {sendNowKeys} to send now · Shift+Enter for a new
+							line · ! for bash · / for skills
 						</span>
 					)}
 					{working ? (
@@ -1261,7 +2282,7 @@ function Composer({
 							type="button"
 							title="Stop Claude"
 							onClick={stop}
-							className="ml-auto flex size-7 items-center justify-center rounded-full bg-foreground text-background hover:opacity-85"
+							className="ml-auto flex size-7 shrink-0 items-center justify-center rounded-full bg-foreground text-background hover:opacity-85"
 						>
 							<span className="size-[9px] rounded-[2px] bg-background" />
 						</button>
@@ -1269,9 +2290,9 @@ function Composer({
 						<button
 							type="button"
 							title="Send (Enter)"
-							disabled={!draft.trim() && previews.length === 0}
+							disabled={!draft.trim() && attached.length === 0}
 							onClick={() => void send()}
-							className="ml-auto flex size-7 items-center justify-center rounded-full bg-primary text-[14px] font-bold text-primary-foreground hover:brightness-110 disabled:opacity-40"
+							className="ml-auto flex size-7 shrink-0 items-center justify-center rounded-full bg-primary text-[14px] font-bold text-primary-foreground hover:brightness-110 disabled:opacity-40"
 						>
 							↑
 						</button>

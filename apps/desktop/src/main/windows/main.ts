@@ -28,6 +28,8 @@ import {
 	extractWorkspaceIdFromUrl,
 	getNotificationTitle,
 } from "../lib/notifications/utils";
+import { setOdinApiRouter } from "../lib/odin-api";
+import { exitCause } from "../lib/terminal/exit-cause";
 import {
 	getInitialWindowBounds,
 	loadWindowState,
@@ -175,8 +177,10 @@ export async function MainWindow() {
 	if (ipcHandler) {
 		ipcHandler.attachWindow(window);
 	} else {
+		const appRouter = createAppRouter(getWindow);
+		setOdinApiRouter(appRouter);
 		ipcHandler = createIPCHandler({
-			router: createAppRouter(getWindow),
+			router: appRouter,
 			windows: [window],
 		});
 	}
@@ -248,6 +252,7 @@ export async function MainWindow() {
 					exitCode: event.exitCode,
 					signal: event.signal,
 					reason: event.reason,
+					cause: exitCause(event.exitCode, event.signal, event.reason),
 				});
 			},
 		);

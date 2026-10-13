@@ -9,6 +9,8 @@ export interface BriefMessage {
 	role: "user" | "assistant";
 	text: string;
 	at: string | null;
+	/** PR urls `gh pr create` printed: this session opened them. */
+	opened?: boolean;
 }
 
 export interface SessionBrief {
@@ -90,6 +92,34 @@ export function pullRequests(messages: BriefMessage[]): PullRequestLink[] {
 		}
 	}
 	return [...found.values()].reverse();
+}
+
+/**
+ * A PR's line in the brief: its title, once GitHub has sent it. A session that
+ * matches a dozen requests to PRs left a column of "odin #873, odin #880" that
+ * said nothing until you hovered each one.
+ */
+export function prLabel(
+	pr: Pick<PullRequestLink, "repo" | "number">,
+	title?: string | null,
+): string {
+	return title
+		? `#${pr.number} ${title}`
+		: `${pr.repo.split("/").pop()} #${pr.number}`;
+}
+
+/**
+ * PRs split by repo, each repo where its newest PR sits. A session that works
+ * across repos (a skill repo and the app it drives) mixed "#55" and "#893" in
+ * one list, and the title alone doesn't say which repo a PR is in.
+ */
+export function byRepo<T extends Pick<PullRequestLink, "repo">>(
+	prs: T[],
+): [repo: string, prs: T[]][] {
+	const groups = new Map<string, T[]>();
+	for (const pr of prs)
+		groups.set(pr.repo, [...(groups.get(pr.repo) ?? []), pr]);
+	return [...groups];
 }
 
 export interface NotionPageLink {
@@ -602,11 +632,32 @@ export function actionItems(messages: BriefMessage[]): string[] {
 	const last = messages.findLast((m) => m.role === "assistant")?.text ?? "";
 	const at = last.toUpperCase().lastIndexOf("ACTION ITEMS");
 	if (at < 0) return [];
-	return last
-		.slice(at + "ACTION ITEMS".length)
-		.split("\n")
-		.map((line) => line.match(/^\s*(?:\d+[.)]|[-*])\s+(.+)/)?.[1]?.trim())
-		.filter((item): item is string => !!item);
+	return actionItemLines(last.slice(at + "ACTION ITEMS".length));
+}
+
+/**
+ * The numbered or bulleted lines of an ACTION ITEMS block. An item with
+ * indented sub-items is a heading ("Still waiting:"), not an item: each
+ * sub-item becomes one, carrying the heading so it reads alone.
+ */
+export function actionItemLines(block: string): string[] {
+	const items: { text: string; heading: boolean; child: boolean }[] = [];
+	let base = -1;
+	for (const line of block.split("\n")) {
+		const m = line.match(/^(\s*)(?:\d+[.)]|[-*])\s+(.+)/);
+		if (!m?.[2]) continue;
+		const indent = m[1]?.length ?? 0;
+		const text = m[2].trim();
+		const parent = items.findLast((i) => !i.child);
+		if (base < 0 || indent <= base || !parent) {
+			base = base < 0 ? indent : Math.min(base, indent);
+			items.push({ text, heading: false, child: false });
+			continue;
+		}
+		parent.heading = true;
+		items.push({ text: `${parent.text} ${text}`, heading: false, child: true });
+	}
+	return items.filter((i) => !i.heading).map((i) => i.text);
 }
 
 // "Merge PR #12", "Review and merge #12", "Get repo#12 merged" - a merge is the
@@ -688,7 +739,7 @@ export function mergeCheckUrls(messages: BriefMessage[]): string[] {
  * PR, not fetched yet) is not approved, and a reply after the items means you
  * already answered them.
  */
-type PrStates = Record<
+export type PrStates = Record<
 	string,
 	{
 		state: string;
@@ -698,6 +749,25 @@ type PrStates = Record<
 		mine?: boolean | null;
 	} | null
 >;
+
+/**
+ * A PR this session opened is yours, whoever GitHub says wrote it: an agent
+ * that opens it with a bot's token (a shared GitHub key) makes the author the
+ * bot, and the brief dropped it as a teammate's PR.
+ */
+export function claimOpened<T extends PrStates | undefined>(
+	messages: BriefMessage[],
+	states: T,
+): T {
+	if (!states) return states;
+	const opened = pullRequests(messages.filter((m) => m.opened));
+	const claimed = { ...states } as PrStates;
+	for (const { url } of opened) {
+		const pr = claimed[url];
+		if (pr) claimed[url] = { ...pr, mine: true };
+	}
+	return claimed as T;
+}
 
 /**
  * The checks still running on your open PRs in these states, by name. A

@@ -1,8 +1,8 @@
 import { useState } from "react";
+import { currentLaunchBlocker } from "renderer/hooks/useTaskQueue";
 import { electronTrpc } from "renderer/lib/electron-trpc";
 import { usePaneMeta } from "renderer/routes/_authenticated/_odin/hooks/usePaneMeta";
 import { claudeCli } from "renderer/stores/claude-command";
-import { launchLimits, useLaunchLimits } from "renderer/stores/launch-limits";
 import {
 	type OdinRule,
 	rulesPrompt,
@@ -13,7 +13,7 @@ import { useSessionInstructions } from "renderer/stores/session-instructions";
 import { useTabsStore } from "renderer/stores/tabs/store";
 import { SHELL_RULE } from "shared/constants";
 import { isVideoFile } from "shared/file-types";
-import { claimedCheckout, launchBlocker } from "shared/launch-gate";
+import { claimedCheckout } from "shared/launch-gate";
 
 function slugify(title: string): string {
 	return (
@@ -51,7 +51,7 @@ export const DEFAULT_SESSION_INSTRUCTIONS = [
 	"",
 	// Items that carry their own background and options turn the list
 	// back into a transcript; the reasoning already lives above it.
-	'Finish every reply with a section headed "ACTION ITEMS": a short numbered list of what I - the human reviewing this - have to do next (decide something, run or check something, unblock you). Anything you left open is an item: a PR not merged, a change not live yet, a question you are asking me. Shipped work is not: no "review this" for something already merged. One line per item, an imperative of about 12 words or fewer - no background, reasons or option lists (those belong above the section). If there is nothing for me to do, write "ACTION ITEMS: none" and say why in a few words.',
+	'Finish every reply with a section headed "ACTION ITEMS": a short numbered list of what I - the human reviewing this - have to do next (decide something, run or check something, unblock you). Anything you left open is an item: a PR not merged, a change not live yet, a question you are asking me. Shipped work is not: no "review this" for something already merged. One line per item, an imperative of about 12 words or fewer - no background, reasons or option lists (those belong above the section). When an item asks me to choose, end it with the choices in brackets, like "Tell me the export format [CSV | shareable page]". When an item tells me to open, check or watch something - a page, PR, file or app - put its link in the item. End an item with "(you only)" when you cannot do it yourself - no access, or the rules forbid it. If there is nothing for me to do, write "ACTION ITEMS: none" and say why in a few words.',
 ].join("\n");
 
 export function buildPrompt(
@@ -286,6 +286,29 @@ export function useLaunchTaskSession() {
 				workConfig?.odinRepoPath,
 			);
 
+			// A pinned --session-id is not proof Claude ever wrote the
+			// conversation: a card Done'd or snoozed before Claude took its prompt
+			// has none, and `claude --resume` then prints "No conversation found"
+			// and exits - a fresh pane whose whole history is that line. The board's
+			// Resume asks first; Remind me's Resume and Done's undo come through
+			// here, so ask here too.
+			if (resumeSessionId) {
+				try {
+					await utils.client.terminal.readClaudeTranscript.query({
+						sessionId: resumeSessionId,
+					});
+				} catch (error) {
+					// Only "no such conversation" is lost - an unreadable transcript
+					// still resumes.
+					if (String(error).includes("No transcript on this machine"))
+						return {
+							ok: false,
+							error:
+								"Claude never saved this conversation, so there is nothing to resume. Start the task again.",
+						};
+				}
+			}
+
 			// 0. Two gates - the Mac's headroom, and one agent at a time per
 			// checkout. Read once, and never blocking: a launch that has to
 			// wait still gets its card, and the queue runner starts the agent when
@@ -298,12 +321,10 @@ export function useLaunchTaskSession() {
 			let queuedReason: string | null = null;
 			if (now !== true && !noPrompt && !resumeSessionId) {
 				try {
-					queuedReason = launchBlocker(
-						await utils.client.resourceMetrics.getSnapshot.query(),
-						Object.values(useTabsStore.getState().panes),
+					queuedReason = await currentLaunchBlocker(
+						utils.client,
 						checkout,
 						workConfig?.odinRepoPath,
-						launchLimits(useLaunchLimits.getState()),
 					);
 				} catch {
 					queuedReason = null;
