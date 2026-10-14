@@ -1878,6 +1878,7 @@ export function ChatView({
 	const sendToClaude = useCallback(
 		(text: string) => {
 			if (onResumeRef.current) {
+				pinnedRef.current = true;
 				onResumeRef.current(text);
 				return;
 			}
@@ -1933,6 +1934,7 @@ export function ChatView({
 	const actionsId = lastActionsId(items);
 	const scrollRef = useRef<HTMLDivElement>(null);
 	const pinnedRef = useRef(true);
+	const lastScrollTopRef = useRef(0);
 	// What was already there when the drawer opened shows still; only rows
 	// that arrive after it animate in.
 	const firstIdsRef = useRef<Set<string> | null>(null);
@@ -2037,8 +2039,14 @@ export function ChatView({
 				ref={scrollRef}
 				onScroll={(event) => {
 					const el = event.currentTarget;
-					pinnedRef.current =
+					// Only scrolling up lets go of the bottom. Rows that grow, shrink
+					// or swap (your message's echo) move scrollTop too, and used to
+					// unpin it right after a send.
+					const up = el.scrollTop < lastScrollTopRef.current;
+					lastScrollTopRef.current = el.scrollTop;
+					const atBottom =
 						el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+					if (atBottom || up) pinnedRef.current = atBottom;
 					if (el.scrollTop < el.clientHeight) fetchEarlier();
 				}}
 				// Links open in Odin's browser, like everywhere else on the board.
@@ -2309,7 +2317,9 @@ export function ChatView({
 				<Composer
 					paneId={paneId}
 					working={false}
-					onSent={() => {}}
+					onSent={() => {
+						pinnedRef.current = true;
+					}}
 					noTerminal={noTerminal}
 					onResume={onResumeWith}
 					placeholder="Reply to resume the session"
@@ -2509,15 +2519,15 @@ function Composer({
 		useChatDrafts.getState().save(paneId, "");
 		setBash(false);
 		if (!bash) setAttached([]);
-		if (onResume) {
-			onResume([text, ...paths].filter(Boolean).join(" "));
-			return;
-		}
 		// ponytail: blob URLs are never revoked - a few per session.
 		onSent(
 			text,
 			sending.map((item) => item.preview),
 		);
+		if (onResume) {
+			onResume([text, ...paths].filter(Boolean).join(" "));
+			return;
+		}
 		if (onSend) {
 			onSend([text, ...paths].filter(Boolean).join(" "));
 			return;
