@@ -1,6 +1,9 @@
 import { EventEmitter } from "node:events";
+import { join } from "node:path";
+import { Worker } from "node:worker_threads";
 import { workspaces } from "@odin/local-db";
 import { track } from "main/lib/analytics";
+import { ODIN_HOME_DIR } from "main/lib/app-environment";
 import { appState } from "main/lib/app-state";
 import { localDb } from "main/lib/local-db";
 import { githubCliToken } from "../../github-token";
@@ -10,6 +13,7 @@ import {
 	getTerminalHostClient,
 	type TerminalHostClient,
 } from "../../terminal-host/client";
+import { terminalHostSocketPath } from "../../terminal-host/socket-path";
 import type { ListSessionsResponse } from "../../terminal-host/types";
 import { raceWithAbort, throwIfAborted } from "../abort";
 import { buildTerminalEnv, getDefaultShell } from "../env";
@@ -37,6 +41,38 @@ interface PendingCreateOrAttach {
 /** Dimensions for a PTY we have to spawn before any view has measured itself. */
 const DEFAULT_PTY_COLS = 80;
 const DEFAULT_PTY_ROWS = 24;
+
+/** What main needs of the hold-key worker thread (src/main/hold-key-worker.ts). */
+interface HoldKeyWorker {
+	postMessage(message: {
+		type: "hold" | "release";
+		sessionId: string;
+		data?: string;
+		everyMs?: number;
+	}): void;
+}
+
+function holdKeyWorkerScriptPath(): string {
+	try {
+		// Lazy require avoids test/runtime issues where electron is unavailable.
+		const { app } = require("electron") as typeof import("electron");
+		const appPath = app?.getAppPath?.() ?? process.cwd();
+		return join(appPath, "dist", "main", "hold-key-worker.js");
+	} catch {
+		return join(process.cwd(), "dist", "main", "hold-key-worker.js");
+	}
+}
+
+/** Makes the worker; a test swaps `create` for a fake. */
+export const holdKeyWorker = {
+	create: (): HoldKeyWorker =>
+		new Worker(holdKeyWorkerScriptPath(), {
+			workerData: {
+				socketPath: terminalHostSocketPath(ODIN_HOME_DIR),
+				tokenPath: join(ODIN_HOME_DIR, "terminal-host.token"),
+			},
+		}),
+};
 
 export class DaemonTerminalManager extends EventEmitter {
 	private client!: TerminalHostClient;
@@ -648,6 +684,51 @@ export class DaemonTerminalManager extends EventEmitter {
 		}
 
 		this.client.writeNoAck({ sessionId: paneId, data });
+	}
+
+	/** The hold-key worker, for a daemon from before holdKey (see below). */
+	private holdWorker: HoldKeyWorker | null = null;
+
+	/**
+	 * Hold a key down: `data` every `everyMs` until releaseKey. The daemon
+	 * times it next to the PTY. A daemon from an older build (UNKNOWN_REQUEST)
+	 * gets a worker thread instead: its own clock and its own line to the
+	 * daemon, so neither the renderer's stalls nor main's (several a minute
+	 * over 100ms, measured) open the gap Claude reads as the key let go.
+	 */
+	async holdKey(params: {
+		paneId: string;
+		data: string;
+		everyMs: number;
+	}): Promise<void> {
+		const { paneId, data, everyMs } = params;
+		const session = this.sessions.get(paneId);
+		if (!session || !session.isAlive) {
+			throw new Error(`Terminal session ${paneId} not found or not alive`);
+		}
+		try {
+			await this.client.holdKey({ sessionId: paneId, data, everyMs });
+		} catch {
+			this.holdWorker ??= holdKeyWorker.create();
+			this.holdWorker.postMessage({
+				type: "hold",
+				sessionId: paneId,
+				data,
+				everyMs,
+			});
+		}
+	}
+
+	async releaseKey(params: { paneId: string }): Promise<void> {
+		this.holdWorker?.postMessage({
+			type: "release",
+			sessionId: params.paneId,
+		});
+		try {
+			await this.client.releaseKey({ sessionId: params.paneId });
+		} catch {
+			// An older daemon never held it.
+		}
 	}
 
 	ackColdRestore(paneId: string): void {
