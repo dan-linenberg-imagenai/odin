@@ -30,6 +30,7 @@ import {
 	getVideoMimeType,
 	isPreviewableVideoFile,
 } from "shared/file-types";
+import { freshTldr, sameReply, tldrPlacement } from "shared/latest-reply";
 import {
 	insertSkill,
 	matchSkills,
@@ -52,7 +53,15 @@ type Item =
 			/** When you sent it (ms) - a turn's start. Unset for a mid-turn queued message. */
 			at?: number;
 	  }
-	| { kind: "text"; id: string; text: string; msg?: string; out?: number }
+	| {
+			kind: "text";
+			id: string;
+			text: string;
+			msg?: string;
+			out?: number;
+			/** When Claude wrote it (ms) - matches the brief to the reply it read. */
+			at?: number;
+	  }
 	| {
 			kind: "tool";
 			id: string;
@@ -244,6 +253,7 @@ export function applyLines(items: Item[], lines: Line[]): Item[] {
 						text: block.text,
 						msg,
 						out,
+						at,
 					});
 				else if (block.type === "tool_use" && block.id) {
 					toolIndex.set(block.id, next.length);
@@ -1266,15 +1276,42 @@ function ActionItemRow({
  * item asking you to tell Claude something gets a reply box, plus a button per
  * choice when Claude listed them.
  */
-function ActionItems({ text, onDo }: { text: string; onDo?: DoItem }) {
+function ActionItems({
+	text,
+	onDo,
+	tldr,
+	full = false,
+	onToggle,
+}: {
+	text: string;
+	onDo?: DoItem;
+	/** The latest reply's TL;DR, which leads this card instead of a box of its own. */
+	tldr?: Tldr | null;
+	full?: boolean;
+	onToggle?: () => void;
+}) {
 	// text arrives linkified from ItemView.
 	const items = onDo ? actionItemList(text) : [];
 	const buttonColumn = !items.every(isYouOnly);
 	return (
 		<div className="@container mt-2 rounded-xl border border-attention/35 bg-attention/[0.07] px-4 py-3">
-			<div className="mb-1.5 text-[11px] font-semibold uppercase tracking-[.08em] text-attention">
+			<div className="mb-1.5 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[.08em] text-attention">
 				Action items
+				{tldr?.long && onToggle && (
+					<FoldToggle full={full} onToggle={onToggle} />
+				)}
 			</div>
+			{tldr && (
+				<div
+					data-testid="reply-tldr"
+					className="mb-2 text-[13px] leading-relaxed text-foreground"
+				>
+					<span className="mr-1.5 text-[11px] font-semibold uppercase tracking-[.08em] text-muted-foreground">
+						TL;DR
+					</span>
+					{tldr.last}
+				</div>
+			)}
 			{onDo && items.length > 0 ? (
 				<ol className="flex flex-col gap-1">
 					{items.map((item, index) => (
@@ -1370,6 +1407,94 @@ function AwsSsoLogin({ onSend }: { onSend: (text: string) => void }) {
 	);
 }
 
+type Tldr = NonNullable<ReturnType<typeof freshTldr>>;
+
+/** A long reply cut to its first lines, fading out, until you ask for all of it. */
+function FoldedReply({
+	folded,
+	children,
+}: {
+	folded: boolean;
+	children: ReactNode;
+}) {
+	return (
+		<div
+			className={cn(
+				folded &&
+					"max-h-[6.5rem] overflow-hidden [mask-image:linear-gradient(to_bottom,black_55%,transparent)]",
+			)}
+		>
+			{children}
+		</div>
+	);
+}
+
+/** Switches a long latest reply between folded on its TL;DR and shown whole. */
+function FoldToggle({
+	full,
+	onToggle,
+}: {
+	full: boolean;
+	onToggle: () => void;
+}) {
+	return (
+		<button
+			type="button"
+			onClick={onToggle}
+			className="ml-auto text-[12px] font-normal normal-case tracking-normal text-link hover:underline"
+		>
+			{full ? "Show TL;DR" : "Show full reply"}
+		</button>
+	);
+}
+
+/**
+ * The latest reply in a few lines, and whether it wants something from you.
+ * A long reply opens folded on this; the button switches between the two.
+ */
+function TldrCard({
+	tldr,
+	full,
+	onToggle,
+}: {
+	tldr: Tldr;
+	full: boolean;
+	onToggle: () => void;
+}) {
+	const needsYou = tldr.urgency === "needs-you";
+	return (
+		<div
+			data-testid="reply-tldr"
+			className={cn(
+				"mt-2 rounded-xl border px-4 py-2.5",
+				needsYou
+					? "border-attention/35 bg-attention/[0.07]"
+					: "border-border bg-secondary/30",
+			)}
+		>
+			<div className="mb-1 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[.08em] text-muted-foreground">
+				TL;DR
+				{tldr.urgency && (
+					<span
+						className={cn(
+							"rounded-full px-1.5 py-px text-[10px] tracking-[.04em]",
+							needsYou
+								? "bg-attention/15 text-attention"
+								: "bg-secondary text-muted-foreground",
+						)}
+					>
+						{needsYou ? "Needs you" : "FYI"}
+					</span>
+				)}
+				{tldr.long && <FoldToggle full={full} onToggle={onToggle} />}
+			</div>
+			<div className="text-[13px] leading-relaxed text-foreground">
+				{tldr.last}
+			</div>
+		</div>
+	);
+}
+
 const ItemView = memo(
 	function ItemView({
 		item,
@@ -1379,6 +1504,7 @@ const ItemView = memo(
 		onRun,
 		workspaceId,
 		hideActions = false,
+		tldr,
 	}: {
 		item: Item;
 		refs: Map<string, string>;
@@ -1392,7 +1518,11 @@ const ItemView = memo(
 		onRun?: (command: string) => Promise<void>;
 		/** An older reply's, or one still being followed by output: only the final card shows. */
 		hideActions?: boolean;
+		/** The latest reply's TL;DR, once the brief has read this very reply. */
+		tldr?: Tldr | null;
 	}) {
+		// A long latest reply opens on its TL;DR; this shows it whole.
+		const [full, setFull] = useState(false);
 		if (item.kind === "tool") return <ToolRow item={item} />;
 		if (item.kind === "compact") return <CompactRow item={item} />;
 		if (item.kind === "user")
@@ -1404,17 +1534,33 @@ const ItemView = memo(
 				/>
 			);
 		const { body, actions } = splitActionItems(linkify(item.text, refs));
+		const showsActions = !!actions && !hideActions;
+		const placement = tldrPlacement(tldr, showsActions);
+		const toggleFull = () => setFull((value) => !value);
 		return (
 			<div className="select-text cursor-text">
 				{body && (
-					<MarkdownRenderer
-						content={body}
-						style="default"
-						allowHtml={false}
-						className={COMPACT_MARKDOWN}
+					<FoldedReply folded={!!tldr?.long && !full}>
+						<MarkdownRenderer
+							content={body}
+							style="default"
+							allowHtml={false}
+							className={COMPACT_MARKDOWN}
+						/>
+					</FoldedReply>
+				)}
+				{placement === "card" && tldr && (
+					<TldrCard tldr={tldr} full={full} onToggle={toggleFull} />
+				)}
+				{showsActions && (
+					<ActionItems
+						text={actions}
+						onDo={onDo}
+						tldr={placement === "action-items" ? tldr : null}
+						full={full}
+						onToggle={toggleFull}
 					/>
 				)}
-				{actions && !hideActions && <ActionItems text={actions} onDo={onDo} />}
 				{onSend && needsAwsSsoLogin(item.text) && (
 					<AwsSsoLogin onSend={onSend} />
 				)}
@@ -1432,7 +1578,10 @@ const ItemView = memo(
 		prev.onDo === next.onDo &&
 		prev.onSend === next.onSend &&
 		prev.onRun === next.onRun &&
-		prev.hideActions === next.hideActions,
+		prev.hideActions === next.hideActions &&
+		prev.tldr?.last === next.tldr?.last &&
+		prev.tldr?.urgency === next.tldr?.urgency &&
+		prev.tldr?.long === next.tldr?.long,
 );
 
 /**
@@ -1634,7 +1783,25 @@ export function ChatView({
 		},
 		[sendToClaude],
 	);
-	const lastTextId = items.findLast((item) => item.kind === "text")?.id;
+	const lastText = items.findLast(
+		(item): item is Extract<Item, { kind: "text" }> => item.kind === "text",
+	);
+	const lastTextId = lastText?.id;
+	// The brief's TL;DR of the latest reply. Asked for once the turn is over -
+	// mid-turn the latest reply is a moving target - and shown only while the
+	// brief read this very reply: a newer one makes it a wrong TL;DR, so the
+	// card waits for the brief that catches up.
+	const { data: brief } = electronTrpc.terminal.summarizeClaudeSession.useQuery(
+		{ sessionId: sessionId ?? "", settled: true },
+		{
+			enabled: !!sessionId && !!lastText && !working,
+			retry: false,
+			staleTime: 30_000,
+			refetchInterval: (query) =>
+				sameReply(lastText?.at, query.state.data?.replyAt) ? false : 15_000,
+		},
+	);
+	const tldr = working ? null : freshTldr(lastText, brief);
 	// Agents repeat their ACTION ITEMS in every reply; show one card, on the
 	// latest reply that has it. It stays while Claude works on your answer.
 	const actionsId = lastActionsId(items);
@@ -1829,6 +1996,7 @@ export function ChatView({
 								workspaceId={workspaceId}
 								onDo={onShowTerminal || onResumeWith ? doItem : undefined}
 								hideActions={segment.id !== actionsId}
+								tldr={segment.id === lastTextId ? tldr : null}
 								onRun={
 									// Only a live PTY runs a ! command; a resume or the raven's send can't.
 									onShowTerminal && !onSend ? runInClaude : undefined
