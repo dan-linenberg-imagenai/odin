@@ -14,6 +14,8 @@ export interface Watch {
 	paneId?: string;
 	/** The newest reply seen so far ("" = none yet). Unset until the first check. */
 	stamp?: string;
+	/** A reply from someone else you haven't opened the session for yet. */
+	reply?: string;
 }
 
 /**
@@ -25,7 +27,12 @@ export interface Watch {
 export const useReplyWatch = create<{
 	watches: Record<string, Watch>;
 	toggle: (key: string, title: string, paneId: string) => void;
-	setStamps: (stamps: Record<string, string>) => void;
+	setStamps: (
+		stamps: Record<string, string>,
+		replies?: Record<string, string>,
+	) => void;
+	/** The session was opened: its reply is read. */
+	seen: (paneId: string) => void;
 }>()(
 	persist(
 		(set) => ({
@@ -37,15 +44,36 @@ export const useReplyWatch = create<{
 						watches: on ? rest : { ...rest, [key]: { title, paneId } },
 					};
 				}),
-			setStamps: (stamps) =>
+			setStamps: (stamps, replies = {}) =>
 				set((s) => ({
 					watches: Object.fromEntries(
 						Object.entries(s.watches).map(([key, watch]) => [
 							key,
-							key in stamps ? { ...watch, stamp: stamps[key] } : watch,
+							key in stamps
+								? {
+										...watch,
+										stamp: stamps[key],
+										reply: replies[key] ?? watch.reply,
+									}
+								: watch,
 						]),
 					),
 				})),
+			seen: (paneId) =>
+				set((s) =>
+					Object.values(s.watches).some((w) => w.paneId === paneId && w.reply)
+						? {
+								watches: Object.fromEntries(
+									Object.entries(s.watches).map(([key, watch]) => [
+										key,
+										watch.paneId === paneId
+											? { ...watch, reply: undefined }
+											: watch,
+									]),
+								),
+							}
+						: s,
+				),
 		}),
 		{ name: "odin-reply-watch" },
 	),
@@ -105,11 +133,11 @@ export function newReplies(
 }
 
 /**
- * Check every watched session's thread on launch and every five minutes after, and ping
+ * Check every watched session's thread on launch and every minute after, and ping
  * for each one someone replied in. Mounted in the shell, so it runs whatever
  * screen is open.
  *
- * ponytail: one 5-minute poll, sequential Slack lookups (Slack's own gate
+ * ponytail: one 1-minute poll, sequential Slack lookups (Slack's own gate
  * throttles them). Fine for a handful of watches; batch if it grows to dozens.
  */
 export function useReplyWatcher(openSession: (paneId: string) => void): void {
@@ -127,10 +155,12 @@ export function useReplyWatcher(openSession: (paneId: string) => void): void {
 			const activity = await electronTrpcClient.work.threadActivity
 				.query({ slack: after("slack:"), jira: after("jira:") })
 				.catch(() => ({}) as Record<string, ThreadActivity>);
+			const replies: Record<string, string> = {};
 			for (const key of newReplies(watches, activity)) {
 				const watch = watches[key];
+				replies[key] = activity[key]?.text ?? "Someone replied in the thread.";
 				const note = new Notification(`New reply: ${watch?.title ?? key}`, {
-					body: activity[key]?.text ?? "Someone replied in the thread.",
+					body: replies[key],
 				});
 				note.onclick = () => {
 					window.focus();
@@ -141,10 +171,11 @@ export function useReplyWatcher(openSession: (paneId: string) => void): void {
 				Object.fromEntries(
 					Object.entries(activity).map(([key, a]) => [key, a.stamp]),
 				),
+				replies,
 			);
 		};
 		void tick();
-		const id = setInterval(() => void tick(), 5 * 60_000);
+		const id = setInterval(() => void tick(), 60_000);
 		return () => clearInterval(id);
 	}, []);
 }
@@ -169,10 +200,33 @@ export function WatchMark({ paneId }: { paneId: string }) {
 	);
 }
 
+/**
+ * The unread reply on a watched session's card, so a missed ping still shows.
+ * Opening the session clears it.
+ */
+export function WatchReply({ paneId }: { paneId: string }) {
+	const reply = useReplyWatch(
+		(s) => Object.values(s.watches).find((w) => w.paneId === paneId)?.reply,
+	);
+	if (!reply) return null;
+	return (
+		<div
+			title={reply}
+			className="mt-1 truncate text-[11.5px] font-medium text-attention"
+		>
+			<LuBellRing className="mr-1 inline size-3 align-[-2px]" aria-hidden />
+			New reply: {reply}
+		</div>
+	);
+}
+
 /** The drawer's pill for a watched session; clicking it stops the pings. */
 export function WatchPill({ paneId }: { paneId: string }) {
 	const thread = useWatchedThread(paneId);
 	const toggle = useReplyWatch((s) => s.toggle);
+	const seen = useReplyWatch((s) => s.seen);
+	// The drawer shows this session, so its reply is read.
+	useEffect(() => seen(paneId), [seen, paneId]);
 	if (!thread) return null;
 	return (
 		<button

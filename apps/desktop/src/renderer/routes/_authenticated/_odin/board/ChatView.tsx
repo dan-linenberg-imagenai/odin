@@ -2,6 +2,7 @@ import { odinIcon } from "@odin/ui/icons/preset-icons";
 import { toast } from "@odin/ui/sonner";
 import { cn } from "@odin/ui/utils";
 import {
+	isValidElement,
 	memo,
 	type ReactNode,
 	useCallback,
@@ -37,6 +38,7 @@ import {
 } from "shared/file-types";
 import { freshTldr, sameReply, tldrPlacement } from "shared/latest-reply";
 import { inputBoxRows, odinScreenStatus } from "shared/odin-screen-status";
+import stripAnsi from "strip-ansi";
 import {
 	insertSkill,
 	matchSkills,
@@ -45,9 +47,14 @@ import {
 import { attachmentPaths } from "../components/TaskBox";
 import { COMPACT_MARKDOWN } from "../components/TranscriptView";
 import { actionItemLines } from "./brief";
-import { PlanCard, QuestionCard, ScreenMenuCard } from "./ChatPrompts";
+import {
+	PlanCard,
+	QuestionCard,
+	ScreenAsideCard,
+	ScreenMenuCard,
+} from "./ChatPrompts";
 import { collectRefs, linkify } from "./chat-links";
-import { parseScreenMenu } from "./screen-menu";
+import { parseScreenAside, parseScreenMenu } from "./screen-menu";
 import { useHoldToTalk } from "./voice";
 
 type Item =
@@ -145,6 +152,13 @@ export function userText(text: string): string | null {
 	if (bash) return `!${bash[1]}`;
 	if (/^\s*<bash-stdout>/.test(text))
 		return text.replace(/<\/?bash-(stdout|stderr)>/g, "\n").trim() || null;
+	// A built-in command's reply (/cost, /context, /model): its output, plain.
+	if (/^\s*<local-command-std(out|err)>/.test(text))
+		return (
+			stripAnsi(
+				text.replace(/<\/?local-command-std(out|err)>/g, "\n"),
+			).trim() || null
+		);
 	if (/^\s*<(local-command|task-notification)/.test(text)) return null;
 	if (text.startsWith("Caveat:")) return null;
 	const stripped = text
@@ -320,6 +334,13 @@ type Sent = {
 	/** Claude never took it: no turn, nothing queued. */
 	lost?: boolean;
 };
+
+/**
+ * Sends still waiting on their echo, per pane. A resume swaps the ended
+ * session's view for the live one; the bubble rides along instead of
+ * vanishing until Claude has booted and written the message.
+ */
+const carried = new Map<string, Sent[]>();
 
 /**
  * Claude took something since the send: a user row that wasn't there, or the
@@ -814,10 +835,56 @@ const ToolGroup = memo(
 	},
 	// The array is rebuilt every render; its rows only change by reference.
 	(prev, next) =>
-		prev.lead === next.lead &&
+		sameLead(prev.lead, next.lead) &&
 		prev.group.length === next.group.length &&
 		prev.group.every((item, i) => item === next.group[i]),
 );
+
+interface ItemViewProps {
+	item: Item;
+	refs: Map<string, string>;
+	workspaceId: string;
+	paneId?: string;
+	/** Changes only when a new ref appears - the memo's cue to re-link. */
+	refsKey: string;
+	onDo?: DoItem;
+	/** Types a message into the session - the AWS sign-in retries with it. */
+	onSend?: (text: string) => void;
+	/** Runs a `! command` in the live session - set only while its PTY is up. */
+	onRun?: (command: string) => Promise<void>;
+	/** An older reply's, or one still being followed by output: only the final card shows. */
+	hideActions?: boolean;
+	/** The latest reply's TL;DR, once the brief has read this very reply. */
+	tldr?: Tldr | null;
+}
+
+function sameItemView(prev: ItemViewProps, next: ItemViewProps): boolean {
+	return (
+		prev.item === next.item &&
+		prev.refsKey === next.refsKey &&
+		prev.workspaceId === next.workspaceId &&
+		prev.paneId === next.paneId &&
+		prev.onDo === next.onDo &&
+		prev.onSend === next.onSend &&
+		prev.onRun === next.onRun &&
+		prev.hideActions === next.hideActions &&
+		prev.tldr?.last === next.tldr?.last &&
+		prev.tldr?.urgency === next.tldr?.urgency &&
+		prev.tldr?.long === next.tldr?.long
+	);
+}
+
+/** A lead is a fresh <ItemView> each render; compare it the way ItemView does. */
+function sameLead(prev: ReactNode, next: ReactNode): boolean {
+	return (
+		prev === next ||
+		(isValidElement(prev) &&
+			isValidElement(next) &&
+			prev.type === ItemView &&
+			next.type === ItemView &&
+			sameItemView(prev.props as ItemViewProps, next.props as ItemViewProps))
+	);
+}
 
 const kTokens = (n: number) => `${Math.round(n / 1000)}k`;
 
@@ -1644,98 +1711,66 @@ function TldrCard({
 	);
 }
 
-const ItemView = memo(
-	function ItemView({
-		item,
-		refs,
-		onDo,
-		onSend,
-		onRun,
-		workspaceId,
-		paneId,
-		hideActions = false,
-		tldr,
-	}: {
-		item: Item;
-		refs: Map<string, string>;
-		workspaceId: string;
-		paneId?: string;
-		/** Changes only when a new ref appears - the memo's cue to re-link. */
-		refsKey: string;
-		onDo?: DoItem;
-		/** Types a message into the session - the AWS sign-in retries with it. */
-		onSend?: (text: string) => void;
-		/** Runs a `! command` in the live session - set only while its PTY is up. */
-		onRun?: (command: string) => Promise<void>;
-		/** An older reply's, or one still being followed by output: only the final card shows. */
-		hideActions?: boolean;
-		/** The latest reply's TL;DR, once the brief has read this very reply. */
-		tldr?: Tldr | null;
-	}) {
-		// A long latest reply opens on its TL;DR; this shows it whole.
-		const [full, setFull] = useState(false);
-		if (item.kind === "tool") return <ToolRow item={item} />;
-		if (item.kind === "compact") return <CompactRow item={item} />;
-		if (item.kind === "user")
-			return (
-				<UserBubble
-					text={item.text}
-					images={item.images}
-					workspaceId={workspaceId}
-				/>
-			);
-		const { body, actions } = splitActionItems(linkify(item.text, refs));
-		const showsActions = !!actions && !hideActions;
-		const placement = tldrPlacement(tldr, showsActions);
-		const toggleFull = () => setFull((value) => !value);
+const ItemView = memo(function ItemView({
+	item,
+	refs,
+	onDo,
+	onSend,
+	onRun,
+	workspaceId,
+	paneId,
+	hideActions = false,
+	tldr,
+}: ItemViewProps) {
+	// A long latest reply opens on its TL;DR; this shows it whole.
+	const [full, setFull] = useState(false);
+	if (item.kind === "tool") return <ToolRow item={item} />;
+	if (item.kind === "compact") return <CompactRow item={item} />;
+	if (item.kind === "user")
 		return (
-			<div className="select-text cursor-text">
-				{body && (
-					<FoldedReply folded={!!tldr?.long && !full}>
-						<MarkdownRenderer
-							content={body}
-							style="default"
-							allowHtml={false}
-							className={COMPACT_MARKDOWN}
-						/>
-					</FoldedReply>
-				)}
-				{placement === "card" && tldr && (
-					<TldrCard tldr={tldr} full={full} onToggle={toggleFull} />
-				)}
-				{showsActions && (
-					<ActionItems
-						text={actions}
-						onDo={onDo}
-						paneId={paneId}
-						tldr={placement === "action-items" ? tldr : null}
-						full={full}
-						onToggle={toggleFull}
-					/>
-				)}
-				{onSend && needsAwsSsoLogin(item.text) && (
-					<AwsSsoLogin onSend={onSend} />
-				)}
-				{onRun &&
-					bangCommands(item.text).map((command) => (
-						<RunCommand key={command} command={command} onRun={onRun} />
-					))}
-			</div>
+			<UserBubble
+				text={item.text}
+				images={item.images}
+				workspaceId={workspaceId}
+			/>
 		);
-	},
-	(prev, next) =>
-		prev.item === next.item &&
-		prev.refsKey === next.refsKey &&
-		prev.workspaceId === next.workspaceId &&
-		prev.paneId === next.paneId &&
-		prev.onDo === next.onDo &&
-		prev.onSend === next.onSend &&
-		prev.onRun === next.onRun &&
-		prev.hideActions === next.hideActions &&
-		prev.tldr?.last === next.tldr?.last &&
-		prev.tldr?.urgency === next.tldr?.urgency &&
-		prev.tldr?.long === next.tldr?.long,
-);
+	const { body, actions } = splitActionItems(linkify(item.text, refs));
+	const showsActions = !!actions && !hideActions;
+	const placement = tldrPlacement(tldr, showsActions);
+	const toggleFull = () => setFull((value) => !value);
+	return (
+		<div className="select-text cursor-text">
+			{body && (
+				<FoldedReply folded={!!tldr?.long && !full}>
+					<MarkdownRenderer
+						content={body}
+						style="default"
+						allowHtml={false}
+						className={COMPACT_MARKDOWN}
+					/>
+				</FoldedReply>
+			)}
+			{placement === "card" && tldr && (
+				<TldrCard tldr={tldr} full={full} onToggle={toggleFull} />
+			)}
+			{showsActions && (
+				<ActionItems
+					text={actions}
+					onDo={onDo}
+					paneId={paneId}
+					tldr={placement === "action-items" ? tldr : null}
+					full={full}
+					onToggle={toggleFull}
+				/>
+			)}
+			{onSend && needsAwsSsoLogin(item.text) && <AwsSsoLogin onSend={onSend} />}
+			{onRun &&
+				bangCommands(item.text).map((command) => (
+					<RunCommand key={command} command={command} onRun={onRun} />
+				))}
+		</div>
+	);
+}, sameItemView);
 
 /**
  * A live session as Claude Code looks in the Claude desktop app: prose,
@@ -1755,6 +1790,7 @@ export function ChatView({
 	noTerminal = false,
 	placeholder,
 	onOpenSession,
+	resuming = false,
 }: {
 	paneId: string;
 	sessionId: string | null;
@@ -1775,6 +1811,8 @@ export function ChatView({
 	placeholder?: string;
 	/** Follows a `#session=<paneId>` link in a reply (the raven writes them). */
 	onOpenSession?: (paneId: string) => void;
+	/** Ended session on its way back: the footer says so in place of the composer. */
+	resuming?: boolean;
 }) {
 	const { data: home } = electronTrpc.window.getHomeDir.useQuery();
 	// Claude files the conversation under the directory it STARTED in - the
@@ -1862,15 +1900,48 @@ export function ChatView({
 		() => (screenText ? parseScreenMenu(screenText) : null),
 		[screenText],
 	);
+	const screenAside = useMemo(
+		() => (screenText ? parseScreenAside(screenText) : null),
+		[screenText],
+	);
 	// What you just sent, shown at once - Claude writes it to the transcript a
 	// beat later, and that echo replaces it.
-	const [pending, setPending] = useState<Sent[]>([]);
+	const [pending, setPending] = useState<Sent[]>(
+		() => carried.get(paneId) ?? [],
+	);
+	useEffect(() => {
+		if (pending.length) carried.set(paneId, pending);
+		else carried.delete(paneId);
+	}, [paneId, pending]);
 	useEffect(() => {
 		setPending((list) => list.filter((sent) => !isEchoed(items, sent)));
 	}, [items]);
+	// ponytail: an echo that never matches (Claude rewrote it) just expires.
+	// Not mid-turn or queued: Claude writes a queued message only when it takes it.
+	const expireLater = (id: number, text: string) => {
+		const expire = () =>
+			workingRef.current ||
+			yourQueued(queuedRef.current).some((queuedText) =>
+				queuedText.includes(text),
+			)
+				? setTimeout(expire, 30_000)
+				: setPending((list) =>
+						list.filter((sent) => sent.id !== id || sent.lost),
+					);
+		setTimeout(expire, 30_000);
+	};
+	// Carried in from the view that sent them: its timers died with it.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: once, on mount
+	useEffect(() => {
+		for (const sent of carried.get(paneId) ?? [])
+			expireLater(sent.id, sent.text);
+	}, []);
 	const onSent = (text: string, previews?: Preview[]) => {
 		const id = Date.now();
 		pinnedRef.current = true;
+		// A /btw never reaches the transcript - its answer card shows it instead,
+		// and a bubble waiting on an echo would read "Not delivered".
+		if (/^\/btw\s/.test(text)) return;
 		const seen = new Set(
 			itemsRef.current.flatMap((item) =>
 				item.kind === "user" ? [item.id] : [],
@@ -1881,9 +1952,9 @@ export function ChatView({
 		for (const ms of [150, 500, 1000]) setTimeout(poke, ms);
 		// Claude logs a message the moment it takes it, as a turn or queued
 		// mid-turn. Nothing by now: it never got there, and the bubble says so
-		// instead of waiting on a turn that isn't coming. Not for `onSend`,
-		// which may bring a dead PTY back first, or before a transcript loaded.
-		if (!onSend)
+		// instead of waiting on a turn that isn't coming. Not for `onSend` or a
+		// resume, which bring a dead PTY back first, or before a transcript loaded.
+		if (!onSend && !onResumeRef.current)
 			setTimeout(() => {
 				if (itemsRef.current.length === 0) return;
 				setPending((list) =>
@@ -1895,18 +1966,7 @@ export function ChatView({
 					),
 				);
 			}, 10_000);
-		// ponytail: an echo that never matches (Claude rewrote it) just expires.
-		// Not mid-turn or queued: Claude writes a queued message only when it takes it.
-		const expire = () =>
-			workingRef.current ||
-			yourQueued(queuedRef.current).some((queuedText) =>
-				queuedText.includes(text),
-			)
-				? setTimeout(expire, 30_000)
-				: setPending((list) =>
-						list.filter((sent) => sent.id !== id || sent.lost),
-					);
-		setTimeout(expire, 30_000);
+		expireLater(id, text);
 	};
 	const itemsRef = useRef(items);
 	itemsRef.current = items;
@@ -1924,7 +1984,7 @@ export function ChatView({
 		(message: string) => {
 			const text = withDismissals(paneId, message);
 			if (onResumeRef.current) {
-				pinnedRef.current = true;
+				onSentRef.current(text);
 				onResumeRef.current(text);
 				return;
 			}
@@ -2286,7 +2346,18 @@ export function ChatView({
 							</div>
 						</div>
 					)}
-					{working && !prompt && !screenMenu && !starting && (
+					{screenAside && (
+						<div className={cn("flex min-w-0 gap-3", ENTER)}>
+							<OdinMark />
+							<div className="min-w-0 flex-1">
+								<ScreenAsideCard
+									aside={screenAside}
+									onClose={() => void sendKeys(["\x1b"])}
+								/>
+							</div>
+						</div>
+					)}
+					{working && !prompt && !screenMenu && !screenAside && !starting && (
 						<div className="flex min-w-0 gap-3 text-[12.5px] text-working">
 							{/* Odin's icon, nodding along while Claude works. */}
 							<OdinMark className="animate-[odin-nod_1.6s_ease-in-out_infinite]" />
@@ -2344,8 +2415,8 @@ export function ChatView({
 			</div>
 			{onShowTerminal ? (
 				<>
-					{/* While a menu waits, typed text would land in it - the card answers. */}
-					{!prompt && !screenMenu && (
+					{/* While a menu or /btw waits, typed text would land in it - the card answers. */}
+					{!prompt && !screenMenu && !screenAside && (
 						<Composer
 							paneId={paneId}
 							working={working}
@@ -2364,9 +2435,7 @@ export function ChatView({
 				<Composer
 					paneId={paneId}
 					working={false}
-					onSent={() => {
-						pinnedRef.current = true;
-					}}
+					onSent={onSent}
 					noTerminal={noTerminal}
 					onResume={onResumeWith}
 					placeholder="Reply to resume the session"
@@ -2375,7 +2444,7 @@ export function ChatView({
 				/>
 			) : (
 				<div className="border-t border-border px-5 py-2 text-center text-[11.5px] text-muted-foreground">
-					Session ended - Resume to reply
+					{resuming ? "Resuming session…" : "Session ended - Resume to reply"}
 				</div>
 			)}
 		</div>

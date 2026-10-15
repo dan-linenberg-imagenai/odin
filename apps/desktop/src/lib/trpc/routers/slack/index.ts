@@ -520,8 +520,14 @@ async function reactionStillOn(
  * Read-only and best-effort: anything Slack won't answer comes back null and
  * reads as "couldn't check" on the Review screen, never as a reason to clear
  * the row.
+ *
+ * `fresh` skips the few-minute read cache, for "Ping me on replies": a reply
+ * read through it arrives up to five minutes late.
  */
-export async function slackThreadReplies(id: string): Promise<{
+export async function slackThreadReplies(
+	id: string,
+	{ fresh = false } = {},
+): Promise<{
 	replies: number;
 	/** The newest reply is mine - nobody is waiting on me here. */
 	lastReplyByMe: boolean;
@@ -568,7 +574,7 @@ export async function slackThreadReplies(id: string): Promise<{
 		reactions?: { name?: string; users?: string[] }[];
 	};
 	const get = (timestamp: string) =>
-		slackRead<SlackResponse & { message?: ThreadMessage }>(
+		(fresh ? slackApi : slackRead)<SlackResponse & { message?: ThreadMessage }>(
 			"reactions.get",
 			{ channel, timestamp, full: "true" },
 			token,
@@ -907,6 +913,22 @@ export const createSlackRouter = () => {
 				launchReaction: launchReaction(),
 			};
 		}),
+
+		/** Names for Slack user ids, so a copied <@U123> pastes as "@Name". */
+		userNames: publicProcedure
+			.input(z.object({ ids: z.array(z.string()) }))
+			.query(async ({ input }) => {
+				const token = slackToken();
+				if (!token) return {};
+				const pairs = await Promise.all(
+					input.ids.map(
+						async (id) => [id, await lookupUserName(id, token)] as const,
+					),
+				);
+				return Object.fromEntries(
+					pairs.filter((pair): pair is readonly [string, string] => !!pair[1]),
+				);
+			}),
 
 		/** Channel, author and opening line for each Slack link, keyed by url. */
 		previews: publicProcedure
