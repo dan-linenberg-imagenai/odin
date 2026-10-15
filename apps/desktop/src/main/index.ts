@@ -34,6 +34,7 @@ import {
 import { ensureProjectIconsDir, getProjectIconPath } from "./lib/project-icons";
 import { startWorktreePruner } from "./lib/prune-worktrees";
 import { runQuitCleanup } from "./lib/quit-sequence";
+import { forwardOAuthCallback } from "./lib/remote-connection/odin-core-client";
 import { startRemoteSessions } from "./lib/remote-connection/startup";
 import { initSentry } from "./lib/sentry";
 import { acquireSingleUiLock } from "./lib/single-ui-lock";
@@ -97,6 +98,28 @@ if (process.defaultApp) {
 }
 
 async function processDeepLink(url: string): Promise<void> {
+	// Running on a remote server, connections live there: so does the
+	// sign-in this callback finishes.
+	if (
+		isSlackOAuthCallback(url) ||
+		isNotionOAuthCallback(url) ||
+		isJiraOAuthCallback(url)
+	) {
+		try {
+			if (await forwardOAuthCallback(url)) {
+				focusMainWindow();
+				return;
+			}
+		} catch (error) {
+			console.error(
+				"[main] Forwarding the sign-in to the server failed:",
+				error,
+			);
+			focusMainWindow();
+			return;
+		}
+	}
+
 	// Slack OAuth callback, bounced here by the redirect page. Handled in the
 	// main process (it carries an auth code, and the token exchange needs the
 	// client secret) - never forwarded to the renderer as navigation.

@@ -12,6 +12,10 @@ import {
 	setHostServiceSecret,
 } from "renderer/lib/host-service-auth";
 import type { HostServiceAvailabilityStatus } from "renderer/lib/host-service-unavailable";
+import {
+	onRemoteCoreTargetChange,
+	setRemoteCoreTarget,
+} from "renderer/lib/remote-core-link";
 import { LOCAL_ORG_ID } from "shared/constants";
 
 interface LocalHostServiceContextValue {
@@ -69,9 +73,15 @@ export function LocalHostServiceProvider({
 			refetchInterval: 5_000,
 		});
 
+	const { data: remoteMode } =
+		electronTrpc.remoteConnections.isRemoteMode.useQuery(undefined, {
+			refetchInterval: 5_000,
+		});
+
 	electronTrpc.remoteConnections.onStatusChange.useSubscription(undefined, {
 		onData: () => {
 			utils.remoteConnections.getActive.invalidate();
+			utils.remoteConnections.isRemoteMode.invalidate();
 		},
 	});
 
@@ -82,6 +92,25 @@ export function LocalHostServiceProvider({
 	if (remoteHostUrl && activeRemote?.secret) {
 		setHostServiceSecret(remoteHostUrl, activeRemote.secret);
 	}
+	// Connections run on the server in remote mode (renderer/lib/remote-core-link).
+	setRemoteCoreTarget(
+		remoteMode === true,
+		remoteHostUrl && activeRemote?.secret
+			? { url: remoteHostUrl, secret: activeRemote.secret }
+			: null,
+	);
+	useEffect(
+		() =>
+			onRemoteCoreTargetChange(() => {
+				void utils.connections.invalidate();
+				void utils.work.invalidate();
+				void utils.slack.invalidate();
+				void utils.notion.invalidate();
+				void utils.backlogReview.invalidate();
+				void utils.workLog.invalidate();
+			}),
+		[utils],
+	);
 
 	const waitForHostReady = useCallback(
 		async (timeoutMs = 20_000): Promise<string | null> => {

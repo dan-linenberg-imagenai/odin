@@ -145,6 +145,15 @@ export const REMOTE_RUNTIME_DEPS = [
  */
 export const REMOTE_ARM64_DEPS = ["@anush008/tokenizers-linux-arm64-gnu@0.6.0"];
 
+/** Beside the backend bundle: the desktop local DB's migrations. */
+export const REMOTE_LOCAL_DB_MIGRATIONS_DIRNAME = "local-db-migrations";
+/**
+ * Where the electron stand-in lives: the odin folder's own node_modules, one
+ * level above the backend, so both require() and import() find it walking up
+ * from the bundle, and the backend's npm install never prunes it.
+ */
+export const REMOTE_ELECTRON_SHIM_DIR = "node_modules/electron";
+
 export const ALREADY_RUNNING_MARKER = "ODIN_ALREADY_RUNNING";
 export const STARTED_MARKER = "ODIN_STARTED";
 
@@ -244,6 +253,11 @@ export function buildRemoteStartCommand(
 		`DESKTOP_VITE_PORT=${shellQuote(String(params.vitePort))}`,
 		`ODIN_AGENT_HOOK_PORT=${shellQuote(String(params.hookPort))}`,
 		`ODIN_AGENT_HOOK_VERSION=${shellQuote(params.hookVersion)}`,
+		// The connections run here too (main/odin-core): the server's own
+		// odin.json and local DB, and the electron stand-in their modules load.
+		"ODIN_REMOTE_CORE=1",
+		`ODIN_CONFIG_PATH=${shellQuote(`${folder}/odin.json`)}`,
+		`ODIN_LOCAL_DB_MIGRATIONS=${shellQuote(`${folder}/backend/${REMOTE_LOCAL_DB_MIGRATIONS_DIRNAME}`)}`,
 		"NODE_ENV=production",
 	].join(" ");
 	const stamp = shellQuote(`${folder}/backend/.running-bundle`);

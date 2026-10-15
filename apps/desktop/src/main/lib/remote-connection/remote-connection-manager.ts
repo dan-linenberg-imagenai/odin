@@ -6,6 +6,7 @@ import * as os from "node:os";
 import path from "node:path";
 import { app } from "electron";
 import log from "electron-log/main";
+import { configPath as odinConfigPath } from "lib/trpc/routers/odin-config";
 import { env as sharedEnv } from "shared/env.shared";
 import { Client, type ConnectConfig, type SFTPWrapper, utils } from "ssh2";
 import { ODIN_HOME_DIR } from "../app-environment";
@@ -15,6 +16,10 @@ import {
 	pollHealthCheck,
 } from "../host-service-utils";
 import { HOOK_PROTOCOL_VERSION } from "../terminal/env";
+import {
+	ELECTRON_SHIM_PACKAGE_JSON,
+	ELECTRON_SHIM_SOURCE,
+} from "./electron-shim";
 import {
 	buildClaudeInstallCommand,
 	buildRemoteAgentFiles,
@@ -31,6 +36,8 @@ import {
 	hostKeyFingerprint,
 	parseTestOutput,
 	REMOTE_AUTH_PROBE_PATH,
+	REMOTE_ELECTRON_SHIM_DIR,
+	REMOTE_LOCAL_DB_MIGRATIONS_DIRNAME,
 	REMOTE_RUNTIME_DEPS,
 	shellQuote,
 	startCommandStdin,
@@ -42,6 +49,13 @@ import type {
 	RemoteConnectionStatusEvent,
 	TestConnectionResult,
 } from "./types";
+
+/** The desktop local DB's migrations, shipped for the server's connection code. */
+function localDbMigrationsSource(): string {
+	return app.isPackaged
+		? path.join(process.resourcesPath, "resources/migrations")
+		: path.join(app.getAppPath(), "../../packages/local-db/drizzle");
+}
 
 /** Organization scope for a remote backend - one host per remote for now. */
 const REMOTE_ORGANIZATION_ID = "remote";
@@ -456,6 +470,12 @@ export class RemoteConnectionManager {
 						migrationsSource,
 						`${backendDir}/${REMOTE_MIGRATIONS_DIRNAME}`,
 					);
+					await this.putDir(
+						client,
+						sftp,
+						localDbMigrationsSource(),
+						`${backendDir}/${REMOTE_LOCAL_DB_MIGRATIONS_DIRNAME}`,
+					);
 				} finally {
 					sftp.end();
 				}
@@ -469,6 +489,9 @@ export class RemoteConnectionManager {
 				});
 		}
 
+		// Every connect, before the backend starts: it cannot load without it.
+		await this.writeElectronShim(client, config.odinFolder);
+		await this.carryOverConnections(client, config);
 		await this.execChecked(
 			client,
 			buildNodeInstallCommand(config.odinFolder),
@@ -644,6 +667,69 @@ export class RemoteConnectionManager {
 			} satisfies RemoteConnectionStatusEvent);
 		}
 		if (this.desired) this.scheduleReconnect();
+	}
+
+	// ── Connections on the server ──────────────────────────────────────
+
+	/** The electron stand-in the server-side connection modules load (electron-shim.ts). */
+	private async writeElectronShim(
+		client: Client,
+		odinFolder: string,
+	): Promise<void> {
+		const dir = `${odinFolder}/${REMOTE_ELECTRON_SHIM_DIR}`;
+		await this.execChecked(
+			client,
+			`mkdir -p ${shellQuote(dir)}`,
+			"create the remote shims folder",
+		);
+		const sftp = await this.openSftp(client);
+		try {
+			await this.writeRemoteFile(
+				sftp,
+				`${dir}/index.js`,
+				ELECTRON_SHIM_SOURCE,
+				0o644,
+			);
+			await this.writeRemoteFile(
+				sftp,
+				`${dir}/package.json`,
+				ELECTRON_SHIM_PACKAGE_JSON,
+				0o644,
+			);
+		} finally {
+			sftp.end();
+		}
+	}
+
+	/**
+	 * On the first connect, bring the laptop's connections along: the server
+	 * gets a copy of odin.json (profiles, tokens, OAuth apps) and owns it from
+	 * then on - it refreshes the rotating Jira/GitHub tokens, so the laptop's
+	 * copy must never be pushed over it again.
+	 */
+	private async carryOverConnections(
+		client: Client,
+		config: RemoteConnectionConfig,
+	): Promise<void> {
+		const remotePath = `${config.odinFolder}/odin.json`;
+		const exists = await this.exec(client, `test -e ${shellQuote(remotePath)}`);
+		if (exists.code === 0) return;
+		const localPath = odinConfigPath();
+		if (!fs.existsSync(localPath)) return;
+		const sftp = await this.openSftp(client);
+		try {
+			await this.writeRemoteFile(
+				sftp,
+				remotePath,
+				await fs.promises.readFile(localPath, "utf8"),
+				0o600,
+			);
+			log.info(
+				`[remote-connection] carried the laptop's connections over to ${remotePath}`,
+			);
+		} finally {
+			sftp.end();
+		}
 	}
 
 	// ── Agent setup on the server ──────────────────────────────────────

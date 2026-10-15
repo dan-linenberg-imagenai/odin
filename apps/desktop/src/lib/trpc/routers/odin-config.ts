@@ -133,8 +133,11 @@ export interface OdinFileConfig {
 	pruneMergedWorktrees?: boolean;
 }
 
-/** Override exists so tests can point at a temp file instead of $HOME. */
-function configPath(): string {
+/**
+ * Override exists so tests can point at a temp file instead of $HOME, and so
+ * a remote server keeps its copy in the odin folder.
+ */
+export function configPath(): string {
 	return process.env.ODIN_CONFIG_PATH ?? join(homedir(), ".config/odin.json");
 }
 
