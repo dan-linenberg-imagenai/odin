@@ -16,6 +16,7 @@ import { protectedProcedure, router } from "../../index";
 import { createFromImportLocal } from "../project/handlers";
 import { ensureMainWorkspaceStrict } from "../project/utils/ensure-main-workspace";
 import { tryRevParseGitRoot } from "../project/utils/resolve-repo";
+import { markClaudeFolderTrusted } from "./claude-trust";
 
 /**
  * The desktop's Claude sessions, run on this host while a laptop is connected
@@ -159,6 +160,13 @@ export const remoteSessionsRouter = router({
 						),
 					)
 					.run();
+			}
+			// The folder was opened as a project in Odin; don't let Claude stop
+			// on its trust prompt with nobody there to answer it.
+			if (input.command && input.cwd) {
+				await markClaudeFolderTrusted(input.cwd).catch((error) =>
+					console.warn("[remote-sessions] could not pre-trust folder:", error),
+				);
 			}
 			const created = await createTerminalSessionInternal({
 				terminalId: input.paneId,
