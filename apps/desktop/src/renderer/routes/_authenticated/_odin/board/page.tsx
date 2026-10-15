@@ -2180,6 +2180,7 @@ function DevBoardPage() {
 		card.pane.odinContact ?? contactByPane[card.pane.id] ?? null;
 
 	const [isComposerOpen, setIsComposerOpen] = useState(false);
+	const [composerRepo, setComposerRepo] = useState("");
 	// A card whose conversation Claude no longer has. Resume stops and puts this
 	// here; the dialog it opens asks whether to start over from the card's brief.
 	const [lostCard, setLostCard] = useState<BoardCard | null>(null);
@@ -3027,6 +3028,16 @@ function DevBoardPage() {
 					.catch(() => null)
 			: null;
 		return repo?.worktree ?? repo?.checkout ?? sessionCwd(card.pane);
+	};
+	const openComposerOnCurrentRepo = () => {
+		setComposerRepo("");
+		setIsComposerOpen(true);
+		const sessionId = drawerCard && claudeSessionIdOf(drawerCard);
+		if (!sessionId) return;
+		void utils.repos.workingRepoName
+			.fetch({ claudeSessionId: sessionId }, { staleTime: 60_000 })
+			.then((repo) => setComposerRepo(repo?.owningClone ?? ""))
+			.catch(() => {});
 	};
 	const openShell = async (card: BoardCard) => {
 		if (!shellPaneOf(card)) {
@@ -4095,6 +4106,7 @@ function DevBoardPage() {
 				);
 			if (!prompt) return;
 			addTask(prompt, undefined, repoPath);
+			if (repoPath) useClaudeCommand.getState().addRecentRepo(repoPath);
 			setIsComposerOpen(false);
 			toast.success("Added to My Tasks");
 			return;
@@ -4116,6 +4128,7 @@ function DevBoardPage() {
 		});
 		setIsComposerOpen(false);
 		if (result.ok) {
+			if (repoPath) useClaudeCommand.getState().addRecentRepo(repoPath);
 			// Started from the drawer's session list: land in the new session.
 			if (drawerCard) usePendingFocus.getState().focus(result.paneId);
 			usePaneMeta.getState().setBrief(result.paneId, prompt || title);
@@ -4525,7 +4538,7 @@ function DevBoardPage() {
 				<button
 					type="button"
 					title="Describe a task and start an agent session"
-					onClick={() => setIsComposerOpen(true)}
+					onClick={openComposerOnCurrentRepo}
 					className={cn(
 						"rounded-lg px-2.5 py-1 text-[12px] font-semibold transition-colors",
 						BUTTON.primary,
@@ -5180,7 +5193,7 @@ function DevBoardPage() {
 												{!isSwitchListMin && (
 													<button
 														type="button"
-														onClick={() => setIsComposerOpen(true)}
+														onClick={openComposerOnCurrentRepo}
 														title="New session - describe a task and start an agent session, then open it here"
 														className="ml-3 flex shrink-0 items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
 													>
@@ -5577,6 +5590,7 @@ function DevBoardPage() {
 					heading="New Session"
 					placeholder="What should the agent do? (it picks the repo)"
 					repoPicker
+					defaultRepo={composerRepo}
 					modelPicker
 					backlogToggle
 					onCancel={() => setIsComposerOpen(false)}
