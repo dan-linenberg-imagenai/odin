@@ -185,6 +185,8 @@ interface BuildV2TerminalEnvParams {
 	 * no state change. See the router for rationale.
 	 */
 	hostAgentHookUrl?: string;
+	/** Port of the session tools a remote server serves (main/odin-core). */
+	sessionToolsPort?: string;
 }
 
 /**
@@ -209,6 +211,7 @@ export function buildV2TerminalEnv(
 		agentHookPort,
 		agentHookVersion,
 		hostAgentHookUrl,
+		sessionToolsPort,
 	} = params;
 
 	// Defense in depth - baseEnv is pre-stripped at init, but strip again
@@ -261,6 +264,11 @@ export function buildV2TerminalEnv(
 	// the electron endpoint when this URL isn't set.
 	if (hostAgentHookUrl) {
 		env.ODIN_HOST_AGENT_HOOK_URL = hostAgentHookUrl;
+	}
+	// On a remote server Odin serves the session tools (/read, /file, /odin)
+	// itself; sessions reach them the way they do on a laptop.
+	if (sessionToolsPort) {
+		env.ODIN_PORT = sessionToolsPort;
 	}
 
 	if (odinHomeDir) {

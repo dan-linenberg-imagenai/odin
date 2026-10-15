@@ -1332,6 +1332,7 @@ export async function createTerminalSessionInternal({
 		agentHookPort: process.env.ODIN_AGENT_HOOK_PORT || "",
 		agentHookVersion: process.env.ODIN_AGENT_HOOK_VERSION || "",
 		hostAgentHookUrl: getHostAgentHookUrl(),
+		sessionToolsPort: process.env.ODIN_SESSION_TOOLS_PORT,
 	});
 
 	let daemon: DaemonClient;

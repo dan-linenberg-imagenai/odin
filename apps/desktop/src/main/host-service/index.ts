@@ -98,7 +98,7 @@ async function main(): Promise<void> {
 	// only there: the laptop's own host-service never touches them.
 	if (process.env.ODIN_REMOTE_CORE === "1") {
 		const { mountOdinCore } = await import("main/odin-core/mount");
-		mountOdinCore(app, env.HOST_SERVICE_SECRET);
+		await mountOdinCore(app, env.HOST_SERVICE_SECRET);
 	}
 
 	const startedAt = Date.now();
