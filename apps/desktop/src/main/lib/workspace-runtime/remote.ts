@@ -81,6 +81,7 @@ export class RemoteTerminalRuntime
 
 	private readonly connections = new Map<string, PaneConnection>();
 	private readonly pendingAttach = new Map<string, Promise<SessionResult>>();
+	private readonly heldKeys = new Map<string, ReturnType<typeof setInterval>>();
 	private paneRecords: Record<string, RemotePaneRecord> = readPaneRecords();
 	private listCache: { at: number; value: ListSessionsResponse } | null = null;
 
@@ -189,6 +190,34 @@ export class RemoteTerminalRuntime
 		} else {
 			connection.pending.push(data);
 		}
+	}
+
+	/**
+	 * Hold a key: repeat `data` every `everyMs` until releaseKey. Timed here in
+	 * main, the closest Odin gets to a server PTY - the renderer's timers stall
+	 * when its window is busy.
+	 */
+	async holdKey({
+		paneId,
+		data,
+		everyMs,
+	}: {
+		paneId: string;
+		data: string;
+		everyMs: number;
+	}): Promise<void> {
+		await this.releaseKey({ paneId });
+		this.write({ paneId, data });
+		this.heldKeys.set(
+			paneId,
+			setInterval(() => this.write({ paneId, data }), Math.max(10, everyMs)),
+		);
+	}
+
+	async releaseKey({ paneId }: { paneId: string }): Promise<void> {
+		const timer = this.heldKeys.get(paneId);
+		if (timer) clearInterval(timer);
+		this.heldKeys.delete(paneId);
 	}
 
 	resize({
@@ -508,6 +537,7 @@ export class RemoteTerminalRuntime
 	}
 
 	private dropConnection(paneId: string): void {
+		void this.releaseKey({ paneId });
 		const connection = this.connections.get(paneId);
 		if (!connection) return;
 		this.connections.delete(paneId);

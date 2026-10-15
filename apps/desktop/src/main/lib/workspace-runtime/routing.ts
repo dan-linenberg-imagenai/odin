@@ -83,6 +83,12 @@ export class RoutingTerminalRuntime
 	write: TerminalRuntime["write"] = (params) =>
 		this.backendFor(params.paneId).write(params);
 
+	holdKey: TerminalRuntime["holdKey"] = (params) =>
+		this.backendFor(params.paneId).holdKey(params);
+
+	releaseKey: TerminalRuntime["releaseKey"] = (params) =>
+		this.backendFor(params.paneId).releaseKey(params);
+
 	resize: TerminalRuntime["resize"] = (params) =>
 		this.backendFor(params.paneId).resize(params);
 
