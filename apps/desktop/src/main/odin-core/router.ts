@@ -4,6 +4,7 @@ import { createBacklogReviewRouter } from "lib/trpc/routers/backlog-review";
 import { createConnectionsRouter } from "lib/trpc/routers/connections";
 import { createNotionRouter } from "lib/trpc/routers/notion";
 import { createSlackRouter } from "lib/trpc/routers/slack";
+import { claudeAuthProcedures } from "lib/trpc/routers/system";
 import { createWorkRouter } from "lib/trpc/routers/work";
 import { createWorkLogRouter } from "lib/trpc/routers/work-log";
 import { completeJiraOAuth, isJiraOAuthCallback } from "main/lib/jira-oauth";
@@ -35,6 +36,8 @@ export function createOdinCoreRouter() {
 	} satisfies Record<(typeof REMOTE_CORE_NAMESPACES)[number], unknown>;
 	return router({
 		...routers,
+		/** Claude's sign-in on this server, where sessions run (REMOTE_CORE_PROCEDURES). */
+		system: router(claudeAuthProcedures),
 		/** The window's stores, mirrored for the server's schedulers (state-store.ts). */
 		state: router({
 			get: publicProcedure
