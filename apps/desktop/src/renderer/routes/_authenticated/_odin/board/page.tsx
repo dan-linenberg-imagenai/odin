@@ -3868,29 +3868,6 @@ function DevBoardPage() {
 							)}
 						</span>
 					)}
-					{!isSwitchListMin && (
-						// ponytail: a span, not a button - it sits inside the row's button.
-						// biome-ignore lint/a11y/useSemanticElements: nested in a button
-						<span
-							role="button"
-							tabIndex={-1}
-							title={card.pane.odinStarred ? "Unstar" : "Star - pin to the top"}
-							aria-label={card.pane.odinStarred ? "Unstar" : "Star"}
-							aria-pressed={!!card.pane.odinStarred}
-							onClick={(event) => {
-								event.stopPropagation();
-								toggleStar(card.pane.id);
-							}}
-							onKeyDown={() => {}}
-							className={cn(
-								"ml-auto shrink-0 rounded-[4px] px-0.5 text-attention hover:bg-attention/15",
-								!card.pane.odinStarred &&
-									"opacity-0 group-hover/switch:opacity-100",
-							)}
-						>
-							{card.pane.odinStarred ? "★" : "☆"}
-						</span>
-					)}
 				</button>
 			</HoverCardTrigger>
 			<HoverCardContent
