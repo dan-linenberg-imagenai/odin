@@ -16,6 +16,11 @@ import {
 } from "../host-service-utils";
 import { HOOK_PROTOCOL_VERSION } from "../terminal/env";
 import {
+	buildClaudeInstallCommand,
+	buildRemoteAgentFiles,
+	mergeRemoteClaudeSettings,
+} from "./remote-agent-setup";
+import {
 	ALREADY_RUNNING_MARKER,
 	buildNodeInstallCommand,
 	buildProvisionCommand,
@@ -71,6 +76,9 @@ function readKnownHosts(): Record<string, string> {
 
 /** Log lines quoted back when the remote backend fails to come up. */
 const REMOTE_LOG_TAIL_LINES = 30;
+/** Backoff between reconnect attempts after the tunnel drops: 2s up to 1min. */
+const RECONNECT_BASE_DELAY_MS = 2_000;
+const RECONNECT_MAX_DELAY_MS = 60_000;
 
 interface CommandResult {
 	code: number | null;
@@ -115,6 +123,14 @@ export class RemoteConnectionManager {
 	private client: Client | null = null;
 	private tunnelServer: net.Server | null = null;
 	private active: ActiveRemote | null = null;
+	/**
+	 * The server the user chose to run on, kept while the tunnel is down. Odin
+	 * stays in remote mode for it - sessions are not re-homed to the laptop
+	 * because Wi-Fi blinked - and keeps reconnecting until disconnect().
+	 */
+	private desired: RemoteConnectionConfig | null = null;
+	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	private reconnectAttempt = 0;
 
 	onStatusChange(
 		listener: (event: RemoteConnectionStatusEvent) => void,
@@ -125,6 +141,25 @@ export class RemoteConnectionManager {
 
 	getActive(): ActiveRemote | null {
 		return this.active;
+	}
+
+	/**
+	 * Whether sessions run on a server: true from a successful connect until
+	 * disconnect(), including while the tunnel is down and reconnecting.
+	 */
+	isRemoteMode(): boolean {
+		return this.desired !== null;
+	}
+
+	/**
+	 * Re-enter remote mode for a server chosen in an earlier run (the app
+	 * restarted, or the laptop rebooted). Keeps retrying in the background
+	 * until it connects or the user disconnects.
+	 */
+	resume(config: RemoteConnectionConfig): void {
+		this.desired = config;
+		this.reconnectAttempt = 0;
+		this.attemptReconnect();
 	}
 
 	/** Probe reachability, the server's OS and CPU, and that the odin folder is writable. */
@@ -154,6 +189,16 @@ export class RemoteConnectionManager {
 	 * connection is closed first.
 	 */
 	async connect(config: RemoteConnectionConfig): Promise<ActiveRemote> {
+		this.clearReconnectTimer();
+		const active = await this.connectOnce(config);
+		this.desired = config;
+		this.reconnectAttempt = 0;
+		return active;
+	}
+
+	private async connectOnce(
+		config: RemoteConnectionConfig,
+	): Promise<ActiveRemote> {
 		this.closeActive();
 		const localPort = await findFreePort();
 		this.setStatus(config, "connecting", localPort, null);
@@ -165,6 +210,7 @@ export class RemoteConnectionManager {
 			client = readyClient;
 			resolved = await this.resolveConfig(readyClient, config);
 			const bundleHash = await this.provisionRemote(readyClient, resolved);
+			await this.setupRemoteAgents(readyClient, resolved);
 			const secret = await this.startRemoteBackend(
 				readyClient,
 				resolved,
@@ -240,6 +286,8 @@ export class RemoteConnectionManager {
 
 	/** Close the local side only; the remote daemon is left running. */
 	disconnect(): void {
+		this.desired = null;
+		this.clearReconnectTimer();
 		const previous = this.active;
 		this.closeActive();
 		this.active = null;
@@ -595,6 +643,146 @@ export class RemoteConnectionManager {
 				error: "SSH connection closed unexpectedly.",
 			} satisfies RemoteConnectionStatusEvent);
 		}
+		if (this.desired) this.scheduleReconnect();
+	}
+
+	// ── Agent setup on the server ──────────────────────────────────────
+
+	/**
+	 * Install Odin's hook scripts, `claude` wrapper and Claude hooks on the
+	 * server, so remote sessions report Working / Needs you / Done like local
+	 * ones. Best-effort: sessions still run without it, so a failure here is
+	 * logged, not fatal.
+	 */
+	private async setupRemoteAgents(
+		client: Client,
+		config: RemoteConnectionConfig,
+	): Promise<void> {
+		try {
+			const files = buildRemoteAgentFiles(config.odinFolder);
+			const dirs = [
+				...new Set(files.map((file) => path.posix.dirname(file.path))),
+			];
+			await this.execChecked(
+				client,
+				`mkdir -p ${dirs.map(shellQuote).join(" ")}`,
+				"create the remote hook folders",
+			);
+			const sftp = await this.openSftp(client);
+			try {
+				for (const file of files) {
+					await this.writeRemoteFile(sftp, file.path, file.content, file.mode);
+				}
+			} finally {
+				sftp.end();
+			}
+
+			const home = (await this.exec(client, 'printf %s "$HOME"')).stdout.trim();
+			if (home) {
+				const settingsPath = `${home}/.claude/settings.json`;
+				const current = await this.exec(
+					client,
+					`cat ${shellQuote(settingsPath)} 2>/dev/null`,
+				);
+				const merged = mergeRemoteClaudeSettings(
+					current.stdout,
+					config.odinFolder,
+				);
+				if (merged === null) {
+					log.warn(
+						`[remote-connection] ${settingsPath} is not a JSON object; left alone, so remote sessions report no status`,
+					);
+				} else if (merged !== current.stdout) {
+					await this.execChecked(
+						client,
+						`mkdir -p ${shellQuote(`${home}/.claude`)}`,
+						"create ~/.claude on the remote",
+					);
+					const settingsSftp = await this.openSftp(client);
+					try {
+						await this.writeRemoteFile(
+							settingsSftp,
+							settingsPath,
+							merged,
+							0o644,
+						);
+					} finally {
+						settingsSftp.end();
+					}
+				}
+			}
+
+			const install = await this.exec(
+				client,
+				buildClaudeInstallCommand(config.odinFolder),
+			);
+			if (install.code !== 0) {
+				log.warn(
+					`[remote-connection] installing Claude Code on the server failed: ${(install.stderr || install.stdout).trim()}`,
+				);
+			}
+		} catch (error) {
+			log.warn(
+				`[remote-connection] agent setup on the server failed: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+		}
+	}
+
+	private writeRemoteFile(
+		sftp: SFTPWrapper,
+		remotePath: string,
+		content: string,
+		mode: number,
+	): Promise<void> {
+		return new Promise((resolve, reject) => {
+			sftp.writeFile(remotePath, content, { mode }, (error) => {
+				if (error) {
+					reject(new Error(`Failed to write ${remotePath}: ${error.message}`));
+					return;
+				}
+				// writeFile's mode only applies on create; make it stick.
+				sftp.chmod(remotePath, mode, () => resolve());
+			});
+		});
+	}
+
+	// ── Reconnect ──────────────────────────────────────────────────────
+
+	private attemptReconnect(): void {
+		const config = this.desired;
+		if (!config) return;
+		this.connectOnce(config)
+			.then(() => {
+				this.reconnectAttempt = 0;
+			})
+			.catch((error) => {
+				log.warn(
+					`[remote-connection] reconnect to ${config.host} failed: ${
+						error instanceof Error ? error.message : String(error)
+					}`,
+				);
+				this.scheduleReconnect();
+			});
+	}
+
+	private scheduleReconnect(): void {
+		if (!this.desired || this.reconnectTimer) return;
+		const delay = Math.min(
+			RECONNECT_MAX_DELAY_MS,
+			RECONNECT_BASE_DELAY_MS * 2 ** this.reconnectAttempt,
+		);
+		this.reconnectAttempt += 1;
+		this.reconnectTimer = setTimeout(() => {
+			this.reconnectTimer = null;
+			this.attemptReconnect();
+		}, delay);
+	}
+
+	private clearReconnectTimer(): void {
+		if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+		this.reconnectTimer = null;
 	}
 
 	private closeActive(): void {

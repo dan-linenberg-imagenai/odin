@@ -171,6 +171,8 @@ interface BuildV2TerminalEnvParams {
 	themeType?: "dark" | "light";
 	cwd: string;
 	terminalId: string;
+	/** Desktop tab of a remote session's pane; the terminal id is its pane id. */
+	tabId?: string;
 	workspaceId: string;
 	workspacePath: string;
 	rootPath: string;
@@ -199,6 +201,7 @@ export function buildV2TerminalEnv(
 		themeType,
 		cwd,
 		terminalId,
+		tabId,
 		workspaceId,
 		workspacePath,
 		rootPath,
@@ -240,6 +243,12 @@ export function buildV2TerminalEnv(
 	env.PWD = cwd;
 
 	env.ODIN_TERMINAL_ID = terminalId;
+	// A remote session's terminal id is the desktop pane id; the agent hooks and
+	// the subagent cap key on ODIN_PANE_ID / ODIN_TAB_ID like local sessions do.
+	if (tabId) {
+		env.ODIN_PANE_ID = terminalId;
+		env.ODIN_TAB_ID = tabId;
+	}
 	env.ODIN_WORKSPACE_ID = workspaceId;
 	env.ODIN_WORKSPACE_PATH = workspacePath;
 	env.ODIN_ROOT_PATH = rootPath;

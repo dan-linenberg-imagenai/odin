@@ -29,6 +29,11 @@ export interface OdinFileConfig {
 	/** Legacy name for the same thing - still read, only ever cleared. */
 	slackQueueDbId?: string;
 	defaultRepo?: string;
+	/**
+	 * Where sessions start while they run on a remote server - a path on that
+	 * server. Kept apart from defaultRepo so switching back and forth keeps both.
+	 */
+	remoteDefaultRepo?: string;
 	/** Double-tap this modifier to show or hide Odin (main/lib/double-tap). */
 	doubleTapModifier?: string;
 

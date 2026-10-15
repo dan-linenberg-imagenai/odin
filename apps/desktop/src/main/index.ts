@@ -34,6 +34,7 @@ import {
 import { ensureProjectIconsDir, getProjectIconPath } from "./lib/project-icons";
 import { startWorktreePruner } from "./lib/prune-worktrees";
 import { runQuitCleanup } from "./lib/quit-sequence";
+import { startRemoteSessions } from "./lib/remote-connection/startup";
 import { initSentry } from "./lib/sentry";
 import { acquireSingleUiLock } from "./lib/single-ui-lock";
 import { completeSlackOAuth, isSlackOAuthCallback } from "./lib/slack-oauth";
@@ -462,6 +463,9 @@ if (!gotTheLock) {
 		// Must happen before renderer restore runs
 		await reconcileDaemonSessions();
 		prewarmTerminalRuntime();
+		// Before the window: a server chosen in an earlier run puts Odin back
+		// in remote mode, so the board never mistakes its sessions for dead.
+		startRemoteSessions();
 
 		const hostServiceCoordinator = getHostServiceCoordinator();
 

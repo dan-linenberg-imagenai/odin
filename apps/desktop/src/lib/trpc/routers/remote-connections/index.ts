@@ -6,10 +6,9 @@ import { safeStorage } from "electron";
 import { localDb } from "main/lib/local-db";
 import {
 	getRemoteConnectionManager,
-	type RemoteAuthMethod,
-	type RemoteConnectionConfig,
 	type RemoteConnectionStatusEvent,
 } from "main/lib/remote-connection";
+import { toConfig } from "main/lib/remote-connection/config";
 import { z } from "zod";
 import { publicProcedure, router } from "../..";
 
@@ -53,32 +52,6 @@ function encryptPassword(
 	return safeStorage.encryptString(plain).toString("base64");
 }
 
-function decryptPassword(encrypted: string | null): string | null {
-	if (!encrypted) return null;
-	try {
-		return safeStorage.decryptString(Buffer.from(encrypted, "base64"));
-	} catch {
-		return null;
-	}
-}
-
-function toConfig(
-	row: typeof remoteConnections.$inferSelect,
-): RemoteConnectionConfig {
-	return {
-		id: row.id,
-		name: row.name,
-		host: row.host,
-		sshPort: row.sshPort,
-		username: row.username,
-		authMethod: row.authMethod as RemoteAuthMethod,
-		sshKeyPath: row.sshKeyPath,
-		password: decryptPassword(row.passwordEncrypted),
-		odinFolder: row.odinFolder,
-		remoteHostServicePort: row.remoteHostServicePort,
-	};
-}
-
 function requireRow(id: string): typeof remoteConnections.$inferSelect {
 	const row = localDb
 		.select()
@@ -106,6 +79,14 @@ export const createRemoteConnectionsRouter = () => {
 
 		getActive: publicProcedure.query(() => {
 			return getRemoteConnectionManager().getActive();
+		}),
+
+		/**
+		 * Whether sessions run on a server, including while it reconnects. The
+		 * UI shows "Reconnecting" from this instead of falling back to local.
+		 */
+		isRemoteMode: publicProcedure.query(() => {
+			return getRemoteConnectionManager().isRemoteMode();
 		}),
 
 		create: publicProcedure.input(connectionInput).mutation(({ input }) => {
@@ -141,8 +122,8 @@ export const createRemoteConnectionsRouter = () => {
 			}),
 
 		delete: publicProcedure.input(idInput).mutation(({ input }) => {
-			const active = getRemoteConnectionManager().getActive();
-			if (active?.connectionId === input.id) {
+			const row = requireRow(input.id);
+			if (row.isActive) {
 				getRemoteConnectionManager().disconnect();
 			}
 			localDb
@@ -162,7 +143,7 @@ export const createRemoteConnectionsRouter = () => {
 		connect: publicProcedure.input(idInput).mutation(async ({ input }) => {
 			const row = requireRow(input.id);
 			const active = await getRemoteConnectionManager().connect(toConfig(row));
-			// Reflect the active flag in the DB so the UI survives a reload.
+			// The active flag is what brings remote mode back on the next start.
 			localDb
 				.update(remoteConnections)
 				.set({ isActive: false })
