@@ -532,6 +532,13 @@ await step(
 		// Remote server is a section of Settings > Advanced.
 		await rail("Settings");
 		await click("a", "Advanced");
+		// Advanced is tabbed; a Radix tab switches on mousedown, not click().
+		const tabbed = await page<boolean>(`(() => {
+			const e = __find('[role="tab"]', "Remote server");
+			e?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 }));
+			return !!e;
+		})()`);
+		if (!tabbed) throw new Error('no tab labelled "Remote server"');
 		await waitForText("Add a connection");
 		await click("a", "Back");
 	},
