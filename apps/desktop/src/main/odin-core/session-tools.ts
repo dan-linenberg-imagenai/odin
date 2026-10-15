@@ -8,6 +8,7 @@ import {
 	setOdinApiRouter,
 } from "main/lib/odin-api";
 import { callService, fetchFile, readLink } from "main/lib/read-link";
+import { patchPaneTags } from "./launcher";
 
 /**
  * The tools a session calls on `http://127.0.0.1:$ODIN_PORT` - `/read`,
@@ -116,6 +117,11 @@ async function handle(
 					`Failed: ${error instanceof Error ? error.message : String(error)}`,
 			);
 			return send(res, 200, `${clip(result)}\n`);
+		}
+		// Card tags: what an automation drops once it's done with a session.
+		if (action === "set" && form.get("store") === "sessions") {
+			const result = patchPaneTags(form.get("patch") ?? "");
+			return send(res, result.ok ? 200 : 400, `${result.message}\n`);
 		}
 		return send(
 			res,

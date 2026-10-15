@@ -21,6 +21,11 @@ export const NIGHT_QUEUE_KEY = "odin-night-queue";
 export const SERVER_CARDS_KEY = "server:cards";
 /** Server → laptop: the Night Agent's bookkeeping and log. */
 export const SERVER_NIGHT_KEY = "server:night";
+/**
+ * Server → laptop: tag changes a server session made to a card ($ODIN_PORT/odin
+ * action=set store=sessions) - an automation dropping the tag it acted on.
+ */
+export const SERVER_PANE_PATCHES_KEY = "server:pane-patches";
 /** Server only: when each automation last fired. */
 export const SERVER_RUNS_KEY = "server:automation-runs";
 /** Server only: Slack messages the auto-launcher already tried. */
@@ -45,6 +50,9 @@ export interface BoardPane {
 	initialCwd?: string;
 	odinQueued?: boolean;
 }
+
+/** Card tag changes made on the server, by pane id. t is when, in ms. */
+export type PanePatches = Record<string, { odinTags: string[]; at: number }>;
 
 /** A session a server scheduler started (or a queued one it was handed). */
 export interface ServerCard {

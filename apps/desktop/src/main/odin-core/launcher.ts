@@ -14,7 +14,9 @@ import {
 	type BoardPane,
 	LAUNCH_CONTEXT_KEY,
 	type LaunchContext,
+	type PanePatches,
 	SERVER_CARDS_KEY,
+	SERVER_PANE_PATCHES_KEY,
 	type ServerCard,
 	statusFromAgentEvent,
 } from "shared/server-board";
@@ -28,7 +30,12 @@ import {
 import type { Pane } from "shared/tabs-types";
 import { hostApi } from "./host-api";
 import { machineSnapshot } from "./machine";
-import { readJsonState, readStoreState, writeJsonState } from "./state-store";
+import {
+	readJsonState,
+	readStateEntry,
+	readStoreState,
+	writeJsonState,
+} from "./state-store";
 
 /**
  * Starting sessions on the server, for its schedulers: the same prompt file,
@@ -110,6 +117,9 @@ export async function boardView(): Promise<{
 	for (const pane of readJsonState<BoardPane[]>(BOARD_PANES_KEY, [])) {
 		panes.set(pane.id, pane);
 	}
+	// Tags a session changed here since the window last sent its board.
+	const mirroredAt = readStateEntry(BOARD_PANES_KEY)?.updatedAt ?? 0;
+	const patches = readJsonState<PanePatches>(SERVER_PANE_PATCHES_KEY, {});
 	for (const card of cards) {
 		const known = panes.get(card.paneId);
 		panes.set(card.paneId, {
@@ -124,7 +134,10 @@ export async function boardView(): Promise<{
 	}
 	const view = [...panes.values()].map((pane) => {
 		const status = live.get(pane.id);
-		return status ? { ...pane, status } : pane;
+		const patch = patches[pane.id];
+		const tags =
+			patch && patch.at > mirroredAt ? { odinTags: patch.odinTags } : {};
+		return { ...pane, ...tags, ...(status ? { status } : {}) };
 	});
 	return { panes: view, live };
 }
@@ -358,4 +371,46 @@ export function enqueueFromLaptop(
 					},
 				],
 	);
+}
+
+/**
+ * `$ODIN_PORT/odin action=set store=sessions` from a server session: only a
+ * card's tags can change here (an automation dropping the tag it acted on).
+ * Recorded for the server's own board view and for the window to apply.
+ */
+export function patchPaneTags(patchJson: string): {
+	ok: boolean;
+	message: string;
+} {
+	let patch: { panes?: Record<string, { odinTags?: unknown }> };
+	try {
+		patch = JSON.parse(patchJson);
+	} catch {
+		return { ok: false, message: "patch is not JSON." };
+	}
+	const entries = Object.entries(patch?.panes ?? {});
+	const valid = entries.filter(
+		([, fields]) =>
+			Object.keys(fields ?? {}).length === 1 &&
+			Array.isArray(fields.odinTags) &&
+			fields.odinTags.every((tag) => typeof tag === "string"),
+	);
+	if (!entries.length || valid.length !== entries.length) {
+		return {
+			ok: false,
+			message:
+				'On a server only card tags can change: patch={"panes":{"<paneId>":{"odinTags":[...]}}}.',
+		};
+	}
+	const patches = readJsonState<PanePatches>(SERVER_PANE_PATCHES_KEY, {});
+	const at = Date.now();
+	for (const [paneId, fields] of valid) {
+		patches[paneId] = { odinTags: fields.odinTags as string[], at };
+	}
+	// The newest few hundred: the window applies them within a sync.
+	const kept = Object.entries(patches)
+		.sort(([, a], [, b]) => b.at - a.at)
+		.slice(0, 300);
+	writeJsonState(SERVER_PANE_PATCHES_KEY, Object.fromEntries(kept));
+	return { ok: true, message: `Updated ${valid.length} session(s).` };
 }

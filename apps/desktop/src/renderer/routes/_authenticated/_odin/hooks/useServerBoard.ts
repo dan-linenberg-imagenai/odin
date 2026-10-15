@@ -13,8 +13,10 @@ import {
 	type BoardPane,
 	LAUNCH_CONTEXT_KEY,
 	type LaunchContext,
+	type PanePatches,
 	SERVER_CARDS_KEY,
 	SERVER_NIGHT_KEY,
+	SERVER_PANE_PATCHES_KEY,
 	type ServerCard,
 	type ServerNight,
 } from "shared/server-board";
@@ -44,6 +46,8 @@ const ADOPT_WITHIN_MS = 7 * 86_400_000;
 /** Server cards already put on this board (or closed from it), oldest first. */
 const ADOPTED_KEY = "odin-server-cards-adopted";
 const MAX_NIGHT_LOG = 300;
+/** The newest server tag patch this board has applied, in ms. */
+const PATCHES_AT_KEY = "odin-server-pane-patches-at";
 
 function readAdopted(): string[] {
 	try {
@@ -195,8 +199,30 @@ function applyNight(night: ServerNight): void {
 	});
 }
 
-/** Tasks this window queued: the server's queue starts them from here on. */
-async function handOffQueued(
+/** Card tags a server session changed (an automation done with a card). */
+function applyPatches(patches: PanePatches): void {
+	const since = Number(localStorage.getItem(PATCHES_AT_KEY) ?? 0);
+	const fresh = Object.entries(patches).filter(([, patch]) => patch.at > since);
+	if (!fresh.length) return;
+	useTabsStore.setState((state) => {
+		const panes = { ...state.panes };
+		for (const [paneId, patch] of fresh) {
+			const pane = panes[paneId];
+			if (pane) panes[paneId] = { ...pane, odinTags: patch.odinTags };
+		}
+		return { panes };
+	});
+	try {
+		localStorage.setItem(
+			PATCHES_AT_KEY,
+			String(Math.max(...fresh.map(([, patch]) => patch.at))),
+		);
+	} catch {
+		// Re-applying the same tags next sync is harmless.
+	}
+}
+
+/** Tasks this window queued: the server's queue starts them from here on. */ async function handOffQueued(
 	cards: ServerCard[],
 	handedOff: Set<string>,
 ): Promise<void> {
@@ -270,6 +296,7 @@ export function useServerBoard(): void {
 				const state = await readServerState([
 					SERVER_CARDS_KEY,
 					SERVER_NIGHT_KEY,
+					SERVER_PANE_PATCHES_KEY,
 				]);
 				const cards = (state[SERVER_CARDS_KEY] as ServerCard[]) ?? [];
 				const adopted = new Set(readAdopted());
@@ -295,6 +322,7 @@ export function useServerBoard(): void {
 						for (const card of fresh) adoptCard(card, ensured.workspace.id);
 				}
 				applyQueue(cards);
+				applyPatches((state[SERVER_PANE_PATCHES_KEY] as PanePatches) ?? {});
 				await handOffQueued(cards, handedOff);
 				const night = state[SERVER_NIGHT_KEY] as ServerNight | undefined;
 				if (night) applyNight(night);
