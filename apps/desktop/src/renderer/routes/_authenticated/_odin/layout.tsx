@@ -48,6 +48,7 @@ import { SearchAll } from "./components/SearchAll";
 import { SessionContextDialog } from "./components/SessionContextDialog";
 import { QuickAddTask } from "./components/TaskBox";
 import { UpdateBanner } from "./components/UpdateBanner";
+import { useStateMirror } from "./hooks/state-mirror";
 import { useAutomationRunner } from "./hooks/useAutomationRunner";
 import { usePeriodicSweep } from "./hooks/useBacklogReview";
 import {
@@ -361,6 +362,8 @@ function OdinShell() {
 
 	// The clock behind the Automations panel. Here rather than on that page:
 	// a schedule that only runs while you're looking at it isn't one.
+	// Remote mode: the server's schedulers read this state (state-mirror.ts).
+	useStateMirror();
 	useAutomationRunner();
 	useNightAgentRunner();
 	// And the backlog sweep, on its interval, so Review is already filled in.

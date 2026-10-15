@@ -38,6 +38,11 @@ export function onRemoteCoreTargetChange(listener: () => void): () => void {
 	return () => listeners.delete(listener);
 }
 
+/** Where the server's Odin core answers right now, or null (local mode, or offline). */
+export function getRemoteCoreTarget(): { url: string; secret: string } | null {
+	return remoteMode ? target : null;
+}
+
 export function routesToRemoteCore(path: string): boolean {
 	return remoteMode && isRemoteCorePath(path);
 }
