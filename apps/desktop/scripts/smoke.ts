@@ -289,7 +289,16 @@ async function expectHealthy() {
 			throw new Error(`"${crash}": ${body.slice(0, 400)}`);
 	}
 }
-const rail = (label: string) => click("button", label);
+/**
+ * A rail entry, or one behind its "More" menu. Radix opens that menu on
+ * pointerdown, so it takes a real mouse click rather than `.click()`.
+ */
+const MORE_MENU = ["Review", "Insights", "Session History"];
+async function rail(label: string) {
+	if (!MORE_MENU.includes(label)) return click("button", label);
+	await mouseClick('button[aria-label="More"]');
+	await click('[role="menuitem"]', label);
+}
 /** Every time the fake claude ran: its pid and the argv it was given. */
 function fakeClaudeRuns() {
 	return readdirSync(home)
@@ -369,6 +378,7 @@ const SCREENS: [string, string][] = [
 	["Review", "sweep now"],
 	["Automations", "add automation"],
 	["Insights", "who asks"],
+	["Night Agent", "after the picks"],
 	["Session History", "every session odin launched"],
 	["Dev Board", "next in line"],
 ];
@@ -386,6 +396,7 @@ await step("Tasks: every feed tab opens", async () => {
 	for (const tab of [
 		"All",
 		"Tasks",
+		"Docs",
 		"Slack",
 		"Jira",
 		"GitHub",
@@ -981,13 +992,13 @@ await step("right-click → Done takes the session off the board", async () => {
 			`!!document.querySelector('[data-session-menu] input[placeholder^="New tag"]')`,
 		);
 	if (await tagField()) throw new Error("the tag list starts open");
-	// Ping me on replies needs a Slack thread or Jira ticket; this one has neither.
+	// Ping me needs a Slack thread, Jira ticket or PR; this one has none.
 	if (
 		await page<boolean>(
-			`[...document.querySelectorAll("[data-session-menu] button")].some((b) => b.textContent.includes("Ping me on replies"))`,
+			`[...document.querySelectorAll("[data-session-menu] button")].some((b) => b.textContent.includes("Ping me on"))`,
 		)
 	)
-		throw new Error("Ping me on replies offered on a session with no thread");
+		throw new Error("Ping me offered on a session with no thread or PR");
 	await click("[data-session-menu] button", "▸Tags");
 	if (!(await tagField())) throw new Error("Tags didn't open the list");
 	// The menu's own Done - the card's ✓ Done would pass this step too.

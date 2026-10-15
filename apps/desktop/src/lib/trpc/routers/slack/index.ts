@@ -25,6 +25,7 @@ import {
 	rowsToVerify,
 	type SlackAttachment,
 	type SlackReactionsListItem,
+	slackTextToPlain,
 	threadParentTs,
 	toTitle,
 	untilNextQueued,
@@ -264,8 +265,12 @@ async function lookupUserName(
 	}
 }
 
-/** Mentions read as names, not ids. Lookups are cached, so re-syncs are free. */
-async function resolveMentions(text: string, token: string): Promise<string> {
+/**
+ * Mentions read as names, not ids: raw `<@U123>` markup is flattened first so
+ * no brackets are left around the name. Lookups are cached, so re-syncs are free.
+ */
+async function resolveMentions(raw: string, token: string): Promise<string> {
+	const text = slackTextToPlain(raw);
 	const ids = mentionedUserIds(text);
 	if (ids.length === 0) return text;
 	const names = new Map<string, string>();
@@ -627,6 +632,31 @@ export async function slackThreadReplies(
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * A watched thread as "Ping me on replies" shows it: its link, for when the
+ * session it was set on is gone, and the reply with names for mentions.
+ */
+export async function slackWatchedThread(
+	id: string,
+	text: string | null,
+): Promise<{ url: string | null; text: string | null }> {
+	const token = slackToken();
+	const [channelId = "", messageTs = ""] = id.split(":");
+	if (!token) return { url: null, text };
+	const me = await getIdentity(token).catch(() => null);
+	return {
+		url: me?.teamUrl
+			? buildPermalink({
+					teamUrl: me.teamUrl,
+					channelId,
+					messageTs,
+					threadTs: null,
+				})
+			: null,
+		text: text && (await resolveMentions(text, token)),
+	};
 }
 
 /**

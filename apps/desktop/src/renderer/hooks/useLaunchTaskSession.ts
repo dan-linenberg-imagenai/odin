@@ -27,6 +27,7 @@ export {
 	type OdinSource,
 	parseDataUrl,
 	quote,
+	WORKTREE_ASK_LINE,
 } from "shared/session-launch";
 
 /**
@@ -134,11 +135,24 @@ export function useLaunchTaskSession() {
 					error: "Workspace has no path - cannot launch a session",
 				};
 			}
-			const sessionCwd = repoPath || worktreePath;
+			// A resume passes its old cwd back as repoPath, so it never gets a second one.
+			const ownWorktree =
+				repoPath && repoPath !== worktreePath && !resumeSessionId
+					? await utils.client.repos.createSessionWorktree
+							.mutate({ repo: repoPath, title })
+							.catch((error) => {
+								console.warn(
+									"[launch] no worktree, using the checkout:",
+									error,
+								);
+								return null;
+							})
+					: null;
+			const sessionCwd = ownWorktree?.path || repoPath || worktreePath;
 			// The checkout this session claims - "" for a feed launch into the
 			// workspace folder, which is where agents start, not what they edit.
 			const checkout = claimedCheckout(
-				repoPath,
+				ownWorktree?.path ?? repoPath,
 				worktreePath,
 				workConfig?.odinRepoPath,
 			);
@@ -240,6 +254,7 @@ export function useLaunchTaskSession() {
 						guidelines,
 						useSessionInstructions.getState().instructions ??
 							DEFAULT_SESSION_INSTRUCTIONS,
+						ownWorktree,
 					),
 					encoding: "utf-8",
 				});

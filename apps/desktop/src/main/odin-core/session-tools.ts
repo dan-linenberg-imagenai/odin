@@ -8,11 +8,12 @@ import {
 	setOdinApiRouter,
 } from "main/lib/odin-api";
 import { callService, fetchFile, readLink } from "main/lib/read-link";
+import { createSessionWorktree } from "main/lib/session-worktree";
 import { patchPaneTags } from "./launcher";
 
 /**
  * The tools a session calls on `http://127.0.0.1:$ODIN_PORT` - `/read`,
- * `/file`, `/odin` (api, call, service) - served on a remote server, where its
+ * `/file`, `/odin` (api, call, service, worktree) - served on a remote server, where its
  * sessions run. Same protocol as the laptop's hook server
  * (main/lib/notifications/server.ts), backed by the connections running here,
  * so a session reads its Slack thread or Jira ticket with the laptop shut.
@@ -94,7 +95,7 @@ async function handle(
 		const form = new URLSearchParams(await readBody(req));
 		const action = form.get("action");
 		if (!action) {
-			return send(res, 400, "Need action: api, call or service.\n");
+			return send(res, 400, "Need action: api, call, service or worktree.\n");
 		}
 		if (action === "api") {
 			return send(res, 200, `${listProcedures(form.get("q") ?? "")}\n`);
@@ -117,6 +118,27 @@ async function handle(
 					`Failed: ${error instanceof Error ? error.message : String(error)}`,
 			);
 			return send(res, 200, `${clip(result)}\n`);
+		}
+		// Same answer as the laptop's (notifications/server.ts): the repo is on this server.
+		if (action === "worktree") {
+			const repo = form.get("repo");
+			if (!repo)
+				return send(res, 400, "Need repo: the main checkout's path.\n");
+			const made = await createSessionWorktree(
+				repo,
+				form.get("name") ?? "",
+			).catch(
+				(error) =>
+					`Failed: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			if (typeof made === "string") return send(res, 500, `${made}\n`);
+			if (!made)
+				return send(
+					res,
+					400,
+					`Not a main git checkout: ${repo}. Already in a worktree? Work there.\n`,
+				);
+			return send(res, 200, `${made.path}\n`);
 		}
 		// Card tags: what an automation drops once it's done with a session.
 		if (action === "set" && form.get("store") === "sessions") {

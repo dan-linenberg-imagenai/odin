@@ -9,7 +9,8 @@ import { clickupFetch } from "main/lib/read-link";
 import { z } from "zod";
 import { publicProcedure, router } from "../..";
 import { readOdinConfig, resolveGithubToken } from "../odin-config";
-import { slackThreadReplies } from "../slack";
+import { slackThreadReplies, slackWatchedThread } from "../slack";
+import { pullRequestState } from "../terminal/pr-state";
 
 /**
  * Odin fork: read-only "my work" feeds - Jira issues assigned to me and GitHub
@@ -347,14 +348,58 @@ interface JiraSearchResponse {
 	}[];
 }
 
-/** The newest reply on a watched thread. */
+/** The newest reply on a watched thread, or a watched PR's approval. */
 export interface ThreadActivity {
-	/** Slack ts or Jira comment time - changes when someone replies. "" = no replies yet. */
+	/**
+	 * Slack ts or Jira comment time - changes when someone replies. "" = no
+	 * replies yet. A PR: "approved" or "".
+	 */
 	stamp: string;
 	/** That newest reply is mine - nothing to ping about. */
 	byMe: boolean;
 	/** What it said, for the notification. */
 	text: string | null;
+	/** The thread itself, for Open when its session is gone. */
+	url: string | null;
+}
+
+/**
+ * Whether a PR is approved, through Odin's own GitHub connection. Null when
+ * that account can't see the PR - a second account's repo then goes through
+ * `gh`, which tries every account it's signed into.
+ */
+async function pullRequestApproval(
+	url: string,
+	token: string,
+): Promise<{ approved: boolean; title: string | null } | null> {
+	const [, owner, name, number] =
+		/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/.exec(url) ?? [];
+	if (!number) return null;
+	const response = await githubApiFetch(
+		"https://api.github.com/graphql",
+		{
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				query:
+					"query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){reviewDecision title}}}",
+				variables: { o: owner, r: name, n: Number(number) },
+			}),
+		},
+		token,
+	).catch(() => null);
+	if (!response?.ok) return null;
+	const payload = (await response.json().catch(() => null)) as {
+		data?: {
+			repository?: {
+				pullRequest?: { reviewDecision?: string | null; title?: string };
+			} | null;
+		};
+	} | null;
+	const pr = payload?.data?.repository?.pullRequest;
+	return pr
+		? { approved: pr.reviewDecision === "APPROVED", title: pr.title ?? null }
+		: null;
 }
 
 interface GithubSearchResponse {
@@ -720,8 +765,9 @@ export const createWorkRouter = () => {
 
 		/**
 		 * The newest reply on each watched thread, keyed like the task rows
-		 * (`slack:<channel>:<ts>`, `jira:<KEY>`) - what "Ping me on replies"
-		 * compares against what it saw last time. A row Slack or Jira won't
+		 * (`slack:<channel>:<ts>`, `jira:<KEY>`) - what "Ping me" compares
+		 * against what it saw last time. A watched PR (`pr:<url>`) reports its
+		 * approval the same way, so the same check pings once it's approved. A row Slack or Jira won't
 		 * answer for is left out, which reads as "nothing new".
 		 *
 		 * ponytail: Slack thread replies only - a DM answered inline, outside a
@@ -729,7 +775,11 @@ export const createWorkRouter = () => {
 		 */
 		threadActivity: publicProcedure
 			.input(
-				z.object({ slack: z.array(z.string()), jira: z.array(z.string()) }),
+				z.object({
+					slack: z.array(z.string()),
+					jira: z.array(z.string()),
+					prs: z.array(z.string().url()).default([]),
+				}),
 			)
 			.query(async ({ input }): Promise<Record<string, ThreadActivity>> => {
 				const out: Record<string, ThreadActivity> = {};
@@ -739,7 +789,21 @@ export const createWorkRouter = () => {
 						out[`slack:${id}`] = {
 							stamp: thread.lastReplyTs ?? "",
 							byMe: thread.lastReplyByMe,
-							text: thread.lastReplyText ?? null,
+							...(await slackWatchedThread(id, thread.lastReplyText ?? null)),
+						};
+				}
+				const token = input.prs.length ? await githubAccessToken() : null;
+				for (const url of input.prs) {
+					const pr =
+						(token && (await pullRequestApproval(url, token))) ||
+						(await pullRequestState(url));
+					if (pr)
+						out[`pr:${url}`] = {
+							stamp: pr.approved ? "approved" : "",
+							// Only the turn to approved is news; a push that dismisses it isn't.
+							byMe: !pr.approved,
+							text: pr.title,
+							url,
 						};
 				}
 				const keys = input.jira.filter((key) =>
@@ -776,6 +840,7 @@ export const createWorkRouter = () => {
 						text: last
 							? `${last.author?.displayName ?? "Someone"}: ${adfToText(last.body).replace(/\s+/g, " ").trim().slice(0, 300)}`
 							: null,
+						url: `${request.base}/browse/${issue.key}`,
 					};
 				}
 				return out;

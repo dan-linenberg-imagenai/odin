@@ -26,6 +26,7 @@ import {
 	useRef,
 	useState,
 } from "react";
+import { createPortal } from "react-dom";
 import type { IconType } from "react-icons";
 import {
 	LuBellRing,
@@ -36,6 +37,7 @@ import {
 	LuClock,
 	LuEye,
 	LuEyeOff,
+	LuFileText,
 	LuFlame,
 	LuGitMerge,
 	LuGitPullRequest,
@@ -82,6 +84,7 @@ import {
 	bySection,
 	SECTION_LABEL,
 } from "shared/board-section";
+import { SAVE_DOC_PROMPT } from "shared/constants";
 import { duplicateSessions } from "shared/duplicate-sessions";
 import { type BriefUrgency, latestReply, sameReply } from "shared/latest-reply";
 import { claimedCheckout } from "shared/launch-gate";
@@ -163,7 +166,7 @@ import {
 	slackThread,
 	sourceLink,
 } from "./brief";
-import { ChatView, interruptClaude } from "./ChatView";
+import { ChatView, interruptClaude, typeIntoClaude } from "./ChatView";
 import { DiffView } from "./DiffView";
 import { BOARD_COLUMN_MIN_W, NextInLine, TonightCount } from "./NextInLine";
 import { NightAgentLive } from "./NightAgentLive";
@@ -247,7 +250,10 @@ interface BoardCard {
  * keypress can't wait for that, and the xterm in the drawer already holds the
  * same rows.
  */
-/** Sessions View / Board View: icon-only, shown on the board and in the drawer. */
+/** The top bar's empty slot (layout.tsx) the board fills with ViewToggle. */
+const VIEW_TOGGLE_SLOT_ID = "odin-view-toggle";
+
+/** Sessions View / Board View: icon-only, in the top bar's slot. */
 function ViewToggle({
 	sessionsOpen,
 	sessionsDisabled,
@@ -263,7 +269,7 @@ function ViewToggle({
 }) {
 	const segment = (active: boolean) =>
 		cn(
-			"flex items-center px-2.5 py-1 disabled:opacity-40",
+			"flex items-center px-2 py-[3px] disabled:opacity-40",
 			active
 				? "bg-primary text-primary-foreground"
 				: "text-foreground/80 hover:bg-accent hover:text-foreground",
@@ -279,7 +285,7 @@ function ViewToggle({
 				onClick={onSessions}
 				className={segment(sessionsOpen)}
 			>
-				<LuSquareTerminal className="size-4" aria-hidden />
+				<LuSquareTerminal className="size-3.5" aria-hidden />
 			</button>
 			<button
 				type="button"
@@ -289,7 +295,7 @@ function ViewToggle({
 				onClick={onBoard}
 				className={segment(!sessionsOpen)}
 			>
-				<LuLayoutGrid className="size-4" aria-hidden />
+				<LuLayoutGrid className="size-3.5" aria-hidden />
 			</button>
 		</div>
 	);
@@ -478,7 +484,13 @@ function ScrollbackView({ card, live }: { card: BoardCard; live: boolean }) {
 	);
 }
 
-function useSessionThread(card: BoardCard | undefined): string | null {
+/**
+ * What "Ping me" watches for a session: its Slack thread or Jira ticket, and
+ * its PRs for approval: the one it launched on and the newest it opened. Not
+ * just the newest - a session often opens the PR you wait on, then a later one
+ * that auto-merges with no review and would never ping.
+ */
+function useSessionWatchKeys(card: BoardCard | undefined): string[] {
 	const paneId = card?.pane.id ?? "";
 	const mirrored = usePaneMeta((s) => s.sessionIdByPane[paneId]);
 	const added = usePaneMeta((s) => s.linksByPane[paneId]);
@@ -489,8 +501,8 @@ function useSessionThread(card: BoardCard | undefined): string | null {
 			{ sessionId: sessionId ?? "" },
 			{ enabled: !!sessionId, retry: false, staleTime: 60_000 },
 		);
-	if (!card) return null;
-	return sessionThread({
+	if (!card) return [];
+	const thread = sessionThread({
 		...card.pane,
 		brief,
 		links: [
@@ -500,6 +512,15 @@ function useSessionThread(card: BoardCard | undefined): string | null {
 			),
 		],
 	});
+	// ponytail: newest 5, one GitHub call each a minute; a merged one keeps
+	// costing its call until you stop pinging.
+	const prs = new Set(
+		[
+			launchPullRequest(card.pane.odinBrief),
+			...(transcript ? pullRequests(transcript.messages) : []),
+		].flatMap((pr) => (pr ? [`pr:${pr.url}`] : [])),
+	);
+	return [thread, ...[...prs].slice(0, 5)].filter((k): k is string => !!k);
 }
 
 /** The conversation behind a card, for the pills that read it. */
@@ -1469,9 +1490,11 @@ function TagMenu({
 	onDone,
 	onRemind,
 	watching,
+	watchWhat,
 	onWatch,
 	remote,
 	onRemote,
+	onSaveDoc,
 	onKeep,
 	onToggle,
 	onAdd,
@@ -1487,12 +1510,16 @@ function TagMenu({
 	onStar: () => void;
 	onDone: () => void;
 	onRemind: (day: string) => void;
-	/** Whether replies on the session's thread ping you; unset when it has no thread. */
+	/** Whether the session's thread or PR pings you; unset when it has neither. */
 	watching?: boolean;
+	/** What it watches, for the label: "replies", "approval" or both. */
+	watchWhat?: string;
 	onWatch: () => void;
 	/** Remote Control for this one session; unset unless Settings says "Selected sessions". */
 	remote?: boolean;
 	onRemote: () => void;
+	/** Set while the agent runs - it writes the doc, so a closed session can't. */
+	onSaveDoc?: () => void;
 	/** Set when the sweep suggests dropping this session. */
 	onKeep?: () => void;
 	onToggle: (tag: string) => void;
@@ -1571,7 +1598,7 @@ function TagMenu({
 				{watching !== undefined && (
 					<button
 						type="button"
-						title="A notification whenever someone else replies in this session's Slack thread or Jira ticket"
+						title="A notification whenever someone else replies in this session's Slack thread or Jira ticket, or its PR gets approved"
 						onClick={() => {
 							onWatch();
 							onClose();
@@ -1582,7 +1609,7 @@ function TagMenu({
 						)}
 					>
 						<LuBellRing className="size-3" aria-hidden />
-						{watching ? "Stop pinging me on replies" : "Ping me on replies"}
+						{watching ? "Stop pinging me" : `Ping me on ${watchWhat}`}
 					</button>
 				)}
 				{remote !== undefined && (
@@ -1600,6 +1627,20 @@ function TagMenu({
 					>
 						<LuRadioTower className="size-3" aria-hidden />
 						{remote ? "Turn off Remote Control" : "Turn on Remote Control"}
+					</button>
+				)}
+				{onSaveDoc && (
+					<button
+						type="button"
+						title="Ask the agent to save this session as a doc in ~/.odin/docs - pick it from Doc when you write a new task"
+						onClick={() => {
+							onSaveDoc();
+							onClose();
+						}}
+						className="flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left text-[12px] text-muted-foreground transition-colors hover:text-primary"
+					>
+						<LuFileText className="size-3" aria-hidden />
+						Save as doc
 					</button>
 				)}
 			</div>
@@ -2176,6 +2217,7 @@ function DevBoardPage() {
 		card.pane.odinContact ?? contactByPane[card.pane.id] ?? null;
 
 	const [isComposerOpen, setIsComposerOpen] = useState(false);
+	const [composerRepo, setComposerRepo] = useState("");
 	// A card whose conversation Claude no longer has. Resume stops and puts this
 	// here; the dialog it opens asks whether to start over from the card's brief.
 	const [lostCard, setLostCard] = useState<BoardCard | null>(null);
@@ -2286,6 +2328,8 @@ function DevBoardPage() {
 			if (event.key !== "Escape") return;
 			// A link open over the drawer takes this Esc and closes alone.
 			if (useInAppBrowser.getState().url) return;
+			// Huginn open over the drawer closes first, on its own listener.
+			if (document.querySelector("[data-crow-panel]")) return;
 			// A box opened over the pane cancels itself on Esc. Captured this
 			// early we'd swallow that keypress and close the drawer out from
 			// under it instead, so hand the key back and leave the drawer alone.
@@ -3023,6 +3067,16 @@ function DevBoardPage() {
 					.catch(() => null)
 			: null;
 		return repo?.worktree ?? repo?.checkout ?? sessionCwd(card.pane);
+	};
+	const openComposerOnCurrentRepo = () => {
+		setComposerRepo("");
+		setIsComposerOpen(true);
+		const sessionId = drawerCard && claudeSessionIdOf(drawerCard);
+		if (!sessionId) return;
+		void utils.repos.workingRepoName
+			.fetch({ claudeSessionId: sessionId }, { staleTime: 60_000 })
+			.then((repo) => setComposerRepo(repo?.owningClone ?? ""))
+			.catch(() => {});
 	};
 	const openShell = async (card: BoardCard) => {
 		if (!shellPaneOf(card)) {
@@ -4091,6 +4145,7 @@ function DevBoardPage() {
 				);
 			if (!prompt) return;
 			addTask(prompt, undefined, repoPath);
+			if (repoPath) useClaudeCommand.getState().addRecentRepo(repoPath);
 			setIsComposerOpen(false);
 			toast.success("Added to My Tasks");
 			return;
@@ -4112,6 +4167,7 @@ function DevBoardPage() {
 		});
 		setIsComposerOpen(false);
 		if (result.ok) {
+			if (repoPath) useClaudeCommand.getState().addRecentRepo(repoPath);
 			// Started from the drawer's session list: land in the new session.
 			if (drawerCard) usePendingFocus.getState().focus(result.paneId);
 			usePaneMeta.getState().setBrief(result.paneId, prompt || title);
@@ -4401,6 +4457,13 @@ function DevBoardPage() {
 		const card = switchCards[at + step];
 		if (card) openDrawer(card);
 	};
+	// The top bar (layout.tsx) owns the slot; it mounts before this page.
+	const [viewToggleSlot, setViewToggleSlot] = useState<HTMLElement | null>(
+		null,
+	);
+	useEffect(() => {
+		setViewToggleSlot(document.getElementById(VIEW_TOGGLE_SLOT_ID));
+	}, []);
 	// The drawer + session list without hunting for a card: needs-you first.
 	const openSessions = () => {
 		const [first] = switchCards;
@@ -4453,8 +4516,8 @@ function DevBoardPage() {
 		: undefined;
 
 	/** Done now; on `day` it pings and waits above the columns to be resumed. */
-	// The thread "Ping me on replies" watches for the right-clicked session.
-	const tagMenuThread = useSessionThread(tagMenuCard);
+	// What "Ping me" watches for the right-clicked session.
+	const tagMenuWatchKeys = useSessionWatchKeys(tagMenuCard);
 
 	// Cards are memoized, so they get one stable set of handlers that always
 	// call this render's versions.
@@ -4514,7 +4577,7 @@ function DevBoardPage() {
 				<button
 					type="button"
 					title="Describe a task and start an agent session"
-					onClick={() => setIsComposerOpen(true)}
+					onClick={openComposerOnCurrentRepo}
 					className={cn(
 						"rounded-lg px-2.5 py-1 text-[12px] font-semibold transition-colors",
 						BUTTON.primary,
@@ -4599,13 +4662,23 @@ function DevBoardPage() {
 						if (!isNextOpen) toggleNext();
 					}}
 				/>
-				<ViewToggle
-					sessionsOpen={false}
-					sessionsDisabled={switchCards.length === 0}
-					sessionsKey={openSessionsKey}
-					onSessions={openSessions}
-					onBoard={() => {}}
-				/>
+				{/* One toggle in the top bar, in the same spot whether the drawer is
+				    open or not - a copy in the toolbar and one in the drawer jumped
+				    across the screen on every click. */}
+				{viewToggleSlot &&
+					!inCatchUp &&
+					createPortal(
+						<ViewToggle
+							sessionsOpen={!!drawerCard}
+							sessionsDisabled={switchCards.length === 0}
+							sessionsKey={openSessionsKey}
+							onSessions={() => {
+								if (!drawerCard) openSessions();
+							}}
+							onBoard={() => setDrawerCard(null)}
+						/>,
+						viewToggleSlot,
+					)}
 				{/* A view toggle, not a filter - kept apart from search and the dropdown. */}
 				<button
 					type="button"
@@ -4658,12 +4731,22 @@ function DevBoardPage() {
 					onStar={() => toggleStar(tagMenu.paneId)}
 					onDone={() => tagMenuCard && doneAnywhere(tagMenuCard)}
 					onRemind={(day) => tagMenuCard && remindMe(tagMenuCard, day)}
-					watching={tagMenuThread ? !!watches[tagMenuThread] : undefined}
+					watching={
+						tagMenuWatchKeys.length
+							? Object.values(watches).some((w) => w.paneId === tagMenu.paneId)
+							: undefined
+					}
+					watchWhat={[
+						...new Set(
+							tagMenuWatchKeys.map((k) =>
+								k.startsWith("pr:") ? "approval" : "replies",
+							),
+						),
+					].join(" and ")}
 					onWatch={() =>
 						tagMenuCard &&
-						tagMenuThread &&
 						toggleWatch(
-							tagMenuThread,
+							tagMenuWatchKeys,
 							cardTitle(tagMenuCard),
 							tagMenuCard.pane.id,
 						)
@@ -4674,6 +4757,16 @@ function DevBoardPage() {
 							: undefined
 					}
 					onRemote={() => tagMenuCard && toggleRemote(tagMenuCard)}
+					onSaveDoc={
+						agentPaneIds.has(tagMenu.paneId)
+							? () =>
+									void typeIntoClaude(
+										terminalWrite.mutateAsync,
+										tagMenu.paneId,
+										SAVE_DOC_PROMPT,
+									).then(() => toast.success("Asked the agent to save a doc"))
+							: undefined
+					}
 					onToggle={(tag) => toggleTag(tagMenu.paneId, tag)}
 					onClose={() => setTagMenu(null)}
 				/>
@@ -5038,14 +5131,6 @@ function DevBoardPage() {
 										{drawerCard.pane.odinStarred ? "★" : "☆"}
 									</button>
 								</div>
-								{!inCatchUp && (
-									<ViewToggle
-										sessionsOpen
-										sessionsKey={openSessionsKey}
-										onSessions={() => {}}
-										onBoard={() => setDrawerCard(null)}
-									/>
-								)}
 								{drawerCard.pane.type === "terminal" && !inCatchUp && (
 									<button
 										type="button"
@@ -5167,7 +5252,7 @@ function DevBoardPage() {
 												{!isSwitchListMin && (
 													<button
 														type="button"
-														onClick={() => setIsComposerOpen(true)}
+														onClick={openComposerOnCurrentRepo}
 														title="New session - describe a task and start an agent session, then open it here"
 														className="ml-3 flex shrink-0 items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
 													>
@@ -5564,6 +5649,7 @@ function DevBoardPage() {
 					heading="New Session"
 					placeholder="What should the agent do? (it picks the repo)"
 					repoPicker
+					defaultRepo={composerRepo}
 					modelPicker
 					backlogToggle
 					onCancel={() => setIsComposerOpen(false)}

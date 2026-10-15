@@ -31,6 +31,9 @@ interface ClaudeCommandState {
 	remoteControl: RemoteControlMode;
 	/** "selected": the panes you turned it on for, newest last. */
 	remotePanes: string[];
+	/** New Session's one-click repos: the last ones started in, newest first. */
+	recentRepos: string[];
+	addRecentRepo: (repo: string) => void;
 	setCommands: (commands: string[]) => void;
 	setActive: (command: string) => void;
 	setModel: (model: string) => void;
@@ -39,6 +42,8 @@ interface ClaudeCommandState {
 	setRemoteControl: (remoteControl: RemoteControlMode) => void;
 	toggleRemotePane: (paneId: string) => void;
 }
+
+export const RECENT_REPOS = 5;
 
 /**
  * Settings → Advanced: what Odin types instead of `claude` when it starts or
@@ -59,6 +64,14 @@ export const useClaudeCommand = create<ClaudeCommandState>()(
 			startNow: false,
 			remoteControl: "off",
 			remotePanes: [],
+			recentRepos: [],
+			addRecentRepo: (repo) =>
+				set((s) => ({
+					recentRepos: [repo, ...s.recentRepos.filter((r) => r !== repo)].slice(
+						0,
+						RECENT_REPOS,
+					),
+				})),
 			setCommands: (commands) => set({ commands }),
 			setActive: (active) => set({ active }),
 			setModel: (model) => set({ model }),
