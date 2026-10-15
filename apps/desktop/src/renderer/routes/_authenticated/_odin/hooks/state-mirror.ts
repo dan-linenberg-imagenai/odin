@@ -1,9 +1,8 @@
-import { createTRPCProxyClient, httpLink } from "@trpc/client";
-import type { OdinCoreRouter } from "main/odin-core/router";
 import { useEffect } from "react";
 import {
 	getRemoteCoreTarget,
 	onRemoteCoreTargetChange,
+	remoteCoreClient,
 } from "renderer/lib/remote-core-link";
 import { useClaudeCommand } from "renderer/stores/claude-command";
 import { useDoneStore } from "renderer/stores/done";
@@ -13,7 +12,6 @@ import { useNextInLinePrompt } from "renderer/stores/next-in-line-prompt";
 import { useOdinRules } from "renderer/stores/odin-rules";
 import { useOneByOne } from "renderer/stores/one-by-one";
 import { useSessionInstructions } from "renderer/stores/session-instructions";
-import superjson from "superjson";
 import { useTitleOverrides } from "../all/title-overrides";
 import { useReminders } from "../components/Reminders";
 import { useReplyWatch } from "../components/ReplyWatch";
@@ -79,19 +77,7 @@ function writeMeta(meta: Record<string, number>): void {
 	}
 }
 
-function client() {
-	const target = getRemoteCoreTarget();
-	if (!target) return null;
-	return createTRPCProxyClient<OdinCoreRouter>({
-		links: [
-			httpLink({
-				url: `${target.url}/odin-trpc`,
-				transformer: superjson,
-				headers: () => ({ Authorization: `Bearer ${target.secret}` }),
-			}),
-		],
-	});
-}
+const client = remoteCoreClient;
 
 const storeByKey = new Map<string, PersistedStore>();
 for (const store of MIRRORED) {
@@ -161,8 +147,42 @@ async function sync(): Promise<void> {
 	}
 }
 
-/** Mount once (the Odin shell): mirrors while sessions run on a server. */
-export function useStateMirror(): void {
+/** Plain JSON keys last pushed (shared/server-board.ts), so an unchanged value isn't re-sent. */
+const lastPushed = new Map<string, string>();
+
+/**
+ * Push a plain JSON key the window owns (where sessions start, the board's
+ * cards, the Night Agent's queue) when its value changed.
+ */
+export async function mirrorJson(key: string, value: unknown): Promise<void> {
+	const api = client();
+	if (!api) return;
+	const json = JSON.stringify(value);
+	if (lastPushed.get(key) === json) return;
+	await api.state.set.mutate({ key, value: json, updatedAt: Date.now() });
+	lastPushed.set(key, json);
+}
+
+/** Server-written keys (`server:*`), parsed; a missing or unreadable one is absent. */
+export async function readServerState(
+	keys: string[],
+): Promise<Record<string, unknown>> {
+	const api = client();
+	if (!api) return {};
+	const entries = await api.state.get.query({ keys });
+	const parsed: Record<string, unknown> = {};
+	for (const [key, entry] of Object.entries(entries)) {
+		if (!entry) continue;
+		try {
+			parsed[key] = JSON.parse(entry.value);
+		} catch {
+			// Half-written or foreign - skip it this round.
+		}
+	}
+	return parsed;
+}
+
+/** Mount once (the Odin shell): mirrors while sessions run on a server. */ export function useStateMirror(): void {
 	useEffect(() => {
 		const unsubscribers = [...storeByKey].map(([key, store]) =>
 			store.subscribe(() => {
@@ -178,7 +198,11 @@ export function useStateMirror(): void {
 				console.warn("[state-mirror] sync failed:", error),
 			);
 		};
-		const stopTarget = onRemoteCoreTargetChange(runSync);
+		const stopTarget = onRemoteCoreTargetChange(() => {
+			// A different server (or a restarted one) gets every key again.
+			lastPushed.clear();
+			runSync();
+		});
 		const timer = setInterval(runSync, PULL_EVERY_MS);
 		runSync();
 		return () => {

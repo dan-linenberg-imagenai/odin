@@ -1,7 +1,10 @@
 import { timingSafeEqual } from "node:crypto";
 import { fetchRequestHandler } from "@trpc/server/adapters/fetch";
 import { REMOTE_CORE_PATH } from "shared/remote-core";
+import { configureHostApi } from "./host-api";
+import { configureLauncher } from "./launcher";
 import { createOdinCoreRouter } from "./router";
+import { startSchedulers } from "./scheduler";
 import { startSessionTools } from "./session-tools";
 
 /** The slice of host-service's Hono app this needs (desktop has no hono dep). */
@@ -31,6 +34,25 @@ export async function mountOdinCore(
 	const router = createOdinCoreRouter();
 	// Up before any session starts: their PTYs get its port as ODIN_PORT.
 	await startSessionTools(router);
+	configureHostApi(secret);
+	const core = router.createCaller({});
+	configureLauncher({ recordWork: (input) => core.workLog.record(input) });
+	// The clocks that start sessions run here, so they keep going with the
+	// laptop shut (scheduler.ts). Off for harnesses that only test the API.
+	if (process.env.ODIN_REMOTE_SCHEDULERS !== "0") {
+		startSchedulers({
+			slackReactions: () => core.slack.reactions(),
+			markSlackStarted: (id) => core.slack.markStarted({ id }),
+			rankNextInLine: (input) =>
+				core.backlogReview.rankNextInLine({ ...input, fresh: true }),
+			startedKeys: async () =>
+				new Set(
+					(await core.workLog.list({ limit: 1000 })).map(
+						(row) => row.externalId,
+					),
+				),
+		});
+	}
 	app.all(`${REMOTE_CORE_PATH}/*`, (c) => {
 		const req = c.req.raw;
 		if (!bearerMatches(req.headers.get("authorization"), secret)) {

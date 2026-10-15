@@ -1,6 +1,12 @@
-import { httpLink, TRPCClientError, type TRPCLink } from "@trpc/client";
+import {
+	createTRPCProxyClient,
+	httpLink,
+	TRPCClientError,
+	type TRPCLink,
+} from "@trpc/client";
 import { observable } from "@trpc/server/observable";
 import type { AppRouter } from "lib/trpc/routers";
+import type { OdinCoreRouter } from "main/odin-core/router";
 import { isRemoteCorePath, REMOTE_CORE_PATH } from "shared/remote-core";
 import superjson from "superjson";
 
@@ -16,13 +22,17 @@ import superjson from "superjson";
  * credentials.
  */
 let remoteMode = false;
+/** Whether main has said yet which mode this is. */
+let modeKnown = false;
 let target: { url: string; secret: string } | null = null;
 const listeners = new Set<() => void>();
 
 export function setRemoteCoreTarget(
-	mode: boolean,
+	modeOrUnknown: boolean | undefined,
 	next: { url: string; secret: string } | null,
 ): void {
+	if (modeOrUnknown !== undefined) modeKnown = true;
+	const mode = modeOrUnknown === true;
 	const changed =
 		mode !== remoteMode ||
 		next?.url !== target?.url ||
@@ -43,6 +53,39 @@ export function getRemoteCoreTarget(): { url: string; secret: string } | null {
 	return remoteMode ? target : null;
 }
 
+/**
+ * Whether sessions (and so the schedulers that start them) live on a remote
+ * server - true while it's offline too. The window's own schedulers stand
+ * down then: the server runs them (main/odin-core/scheduler.ts).
+ */
+export function isRemoteCoreMode(): boolean {
+	return remoteMode;
+}
+
+/**
+ * Whether the window's own schedulers (automations, Night Agent, Slack
+ * auto-launch, the queue) should run: only once main has said this is local
+ * mode. Before it answers, a tick could start on the laptop what the server
+ * starts too.
+ */
+export function runsLocalSchedulers(): boolean {
+	return modeKnown && !remoteMode;
+}
+
+/** The server's Odin core, typed - for the calls that aren't desktop routers. */
+export function remoteCoreClient() {
+	const current = getRemoteCoreTarget();
+	if (!current) return null;
+	return createTRPCProxyClient<OdinCoreRouter>({
+		links: [
+			httpLink({
+				url: `${current.url}${REMOTE_CORE_PATH}`,
+				transformer: superjson,
+				headers: () => ({ Authorization: `Bearer ${current.secret}` }),
+			}),
+		],
+	});
+}
 export function routesToRemoteCore(path: string): boolean {
 	return remoteMode && isRemoteCorePath(path);
 }

@@ -259,6 +259,9 @@ export function buildRemoteStartCommand(
 		`ODIN_CONFIG_PATH=${shellQuote(`${folder}/odin.json`)}`,
 		`ODIN_LOCAL_DB_MIGRATIONS=${shellQuote(`${folder}/backend/${REMOTE_LOCAL_DB_MIGRATIONS_DIRNAME}`)}`,
 		"NODE_ENV=production",
+		// The laptop's clock: automations' cron and the Night Agent's window
+		// are in your time, wherever the server is.
+		...laptopTimeZone(),
 	].join(" ");
 	const stamp = shellQuote(`${folder}/backend/.running-bundle`);
 	const hash = shellQuote(params.bundleHash);
@@ -345,4 +348,10 @@ export function checkHostKey(
 	const expected = known[hostId];
 	if (!expected) return "new";
 	return expected === fingerprint ? "match" : { expected };
+}
+
+/** `TZ=<zone>` for the server process, from this machine's own zone. */
+function laptopTimeZone(): string[] {
+	const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+	return zone && /^[\w+/-]+$/.test(zone) ? [`TZ=${shellQuote(zone)}`] : [];
 }

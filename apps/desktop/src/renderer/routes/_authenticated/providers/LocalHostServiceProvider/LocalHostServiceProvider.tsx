@@ -94,7 +94,8 @@ export function LocalHostServiceProvider({
 	}
 	// Connections run on the server in remote mode (renderer/lib/remote-core-link).
 	setRemoteCoreTarget(
-		remoteMode === true,
+		// Undefined until main answers: the window's schedulers wait for it.
+		remoteMode === undefined ? undefined : remoteMode === true,
 		remoteHostUrl && activeRemote?.secret
 			? { url: remoteHostUrl, secret: activeRemote.secret }
 			: null,

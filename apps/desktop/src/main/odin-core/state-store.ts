@@ -52,6 +52,22 @@ export function writeStateEntry(key: string, entry: StateEntry): void {
 	renameSync(temp, file);
 }
 
+/** A plain JSON key (shared/server-board.ts), or `fallback` when unset or unreadable. */
+export function readJsonState<T>(key: string, fallback: T): T {
+	const entry = readStateEntry(key);
+	if (!entry) return fallback;
+	try {
+		return JSON.parse(entry.value) as T;
+	} catch {
+		return fallback;
+	}
+}
+
+/** Write a server-owned key. Only the server's schedulers call this. */
+export function writeJsonState(key: string, value: unknown): void {
+	writeStateEntry(key, { value: JSON.stringify(value), updatedAt: Date.now() });
+}
+
 /** A mirrored store's current data, parsed (zustand persist's `{state}` envelope). */
 export function readStoreState<T>(key: string): T | null {
 	const entry = readStateEntry(key);

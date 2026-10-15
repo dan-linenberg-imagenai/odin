@@ -14,6 +14,7 @@ import {
 import { completeSlackOAuth, isSlackOAuthCallback } from "main/lib/slack-oauth";
 import type { REMOTE_CORE_NAMESPACES } from "shared/remote-core";
 import { z } from "zod";
+import { enqueueFromLaptop, serverLaunchBlocker } from "./launcher";
 import { readStateEntry, writeStateEntry } from "./state-store";
 
 /**
@@ -69,6 +70,45 @@ export function createOdinCoreRouter() {
 						updatedAt: input.updatedAt,
 					});
 					return { applied: true, current: null };
+				}),
+		}),
+		/**
+		 * The launch gate and queue, run on the server: the window asks here
+		 * whether a launch must wait (this machine's load, not the laptop's), and
+		 * hands its queued tasks over so they start with the laptop shut.
+		 */
+		launcher: router({
+			blocker: publicProcedure
+				.input(
+					z.object({ checkout: z.string(), except: z.string().optional() }),
+				)
+				.query(({ input }) =>
+					serverLaunchBlocker(input.checkout, input.except),
+				),
+			enqueue: publicProcedure
+				.input(
+					z.object({
+						paneId: z.string().min(1),
+						tabId: z.string().min(1),
+						sessionId: z.string(),
+						cwd: z.string().min(1),
+						checkout: z.string(),
+						title: z.string(),
+						tags: z.array(z.string()),
+						command: z.string().min(1),
+						reason: z.string(),
+					}),
+				)
+				.mutation(({ input }) => {
+					const { command, reason, ...card } = input;
+					enqueueFromLaptop({
+						...card,
+						brief: null,
+						contact: null,
+						pageId: null,
+						queued: { command, reason },
+					});
+					return { queued: true };
 				}),
 		}),
 		/**

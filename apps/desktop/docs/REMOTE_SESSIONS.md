@@ -85,19 +85,62 @@ In remote mode, a path the laptop can't see is a server path:
   liveness poll marks sessions that ended meanwhile - so after a night with the lid
   shut, the board shows what actually happened.
 
-## Out of scope here (next milestones)
+### 7. Connections run on the server
+With `ODIN_REMOTE_CORE=1` the server's host-service also serves Odin's own
+connection routers (`connections`, `work`, `slack`, `notion`, `backlogReview`,
+`workLog`) at `/odin-trpc` (`main/odin-core`), against the server's `odin.json`
+and local DB. The renderer sends those namespaces there in remote mode
+(`renderer/lib/remote-core-link.ts`), so feeds, token refresh and the queues keep
+going with the laptop shut. On first connect the laptop's `odin.json` is carried
+over if the server has none.
+- Sign-in starts on the server, which returns the authorize URL; the laptop opens
+  it, and the `odin://` callback is forwarded to `/odin-trpc/oauth.complete`, where
+  the sign-in's state and client secret are.
+- The desktop modules load on plain Node through a small `electron` stand-in
+  written to `<odin folder>/node_modules/electron`.
 
-These keep working for local sessions; for remote sessions they are degraded until
-ported:
+### 8. Session tools on the server
+`$ODIN_PORT` in a server session points at a loopback server in the same process
+(`main/odin-core/session-tools.ts`): `/read`, `/file` and `/odin` (`api`, `call`,
+`service`). The ones that drive the window (`/shell/run`, board actions) answer
+503 with a message saying so.
+
+### 9. The board's settings reach the server
+The stores the schedulers read (tasks and automations, Night Agent settings,
+rules, launch limits, Claude command, session instructions, reminders, reply
+watches) are mirrored to `<odin folder>/state` (`state-mirror.ts`): each change
+goes up, and on connect the side that changed last wins. The window also sends
+where sessions start, the board's cards and the Night Agent's queue
+(`shared/server-board.ts`). The server's own bookkeeping lives under `server:`
+keys, which nothing outside the server can write, so no key has two writers.
+
+### 10. Schedulers on the server
+`main/odin-core/scheduler.ts` runs the clocks that start sessions, so they work
+with the laptop shut, and the window's own copies stand down in remote mode:
+- Automations: due cron rows of the active profile, stamped in
+  `server:automation-runs`.
+- Slack auto-launch: messages carrying the launch reaction, once each.
+- The launch queue: the gate reads the server's CPU, memory and disk and its live
+  sessions. Tasks the window queues are handed over and started here.
+- Night Agent: picks first, then the model's ranking of Next in line as the
+  window last built it; one session at a time, logged in `server:night`.
+
+Each session started this way gets a card record (`server:cards`); the window
+puts it on the board when it next connects, attached to the running session
+(`useServerBoard`). The server process runs in the laptop's time zone, so cron
+times and the night window mean what they say.
+
+## Still on the laptop
+
+UI-facing, so fine to pause while the laptop is shut. They catch up when it opens:
+- Reminders and reply-watch banners (desktop notifications), and the Telegram bot.
+- Idle close and auto-resume, which act on the board's own view of each card.
+- The periodic backlog sweep, which fills the Review screen.
+- The header's load and disk chips, which still show the laptop (the launch gate
+  itself reads the server).
 - Transcript features reading `~/.claude/projects` (chat view, briefs, session
-  history search, looping detection): need host-service procedures over the
-  server's transcripts.
-- Diff tab, PR states, worktree storage and the pruner on server paths.
-- Night Agent, automations, Slack auto-launch and idle close: renderer timers today,
-  so they only fire while the laptop is open. Running them with the lid shut means a
-  server-side scheduler.
-- The launch gate and disk chip measure the laptop, not the server.
-- The `$ODIN_PORT` tools sessions call (`/read`, `/file`, `/odin`, `/shell/run`).
+  history search, looping detection), the diff tab and PR states for server
+  sessions.
 - A Sign in to Claude flow for the server (until then, sign in once in a session's
   terminal).
 
@@ -106,4 +149,8 @@ ported:
 - An end-to-end harness that drives the real `RemoteTerminalRuntime` against a real
   host-service on a Linux server: launch, stream, input, resize, tunnel drop and
   reconnect with status catch-up, exit, kill.
+- The same harness against the Odin core: connections and OAuth exchange, session
+  tools from inside a server PTY, the state mirror's rules, and the schedulers
+  (an automation firing, the queue held and released by the server's load, the
+  Night Agent starting a pick and waiting on it).
 - CI (lint, typecheck, tests, smoke) for the local path, which must not change.

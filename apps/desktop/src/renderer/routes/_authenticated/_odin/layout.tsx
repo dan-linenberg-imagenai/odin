@@ -60,6 +60,7 @@ import { useNightAgentRunner } from "./hooks/useNightAgentRunner";
 import { useOdinFeeds } from "./hooks/useOdinFeeds";
 import { useOdinProfile } from "./hooks/useOdinProfile";
 import { usePendingFocus } from "./hooks/usePendingFocus";
+import { useServerBoard } from "./hooks/useServerBoard";
 import { useSlackAutoLaunch } from "./hooks/useStartReaction";
 
 /**
@@ -362,8 +363,10 @@ function OdinShell() {
 
 	// The clock behind the Automations panel. Here rather than on that page:
 	// a schedule that only runs while you're looking at it isn't one.
-	// Remote mode: the server's schedulers read this state (state-mirror.ts).
+	// Remote mode: the server's schedulers read this state (state-mirror.ts),
+	// and the sessions they start land on the board from here.
 	useStateMirror();
+	useServerBoard();
 	useAutomationRunner();
 	useNightAgentRunner();
 	// And the backlog sweep, on its interval, so Review is already filled in.
