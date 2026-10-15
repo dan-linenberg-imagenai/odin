@@ -17,6 +17,7 @@ import { isRemoteSessionMode } from "main/lib/workspace-runtime/routing";
 import { z } from "zod";
 import { publicProcedure, router } from "../..";
 import { assertWorkspaceUsable } from "../workspaces/utils/usability";
+import { awsSsoLogin } from "./aws-sso";
 import { resolveTerminalThemeType } from "./theme-type";
 import { getWorkspaceTerminalContext, resolveCwd } from "./utils";
 
@@ -214,6 +215,28 @@ export const createTerminalRouter = () => {
 				terminal.cancelCreateOrAttach(input);
 				return { success: true };
 			}),
+
+		/** Refresh an expired AWS SSO token - Claude on Bedrock stops on one. */
+		awsSsoLogin: publicProcedure.mutation(() => awsSsoLogin()),
+
+		/**
+		 * Hold a key down in a session - `data` every `everyMs`, like a held
+		 * key's repeat - until releaseKey. Timed in main or the daemon, never
+		 * in the renderer: Claude's hold-to-talk lets go at a 100ms gap.
+		 */
+		holdKey: publicProcedure
+			.input(
+				z.object({
+					paneId: z.string(),
+					data: z.string().min(1).max(8),
+					everyMs: z.number().int().min(10).max(500),
+				}),
+			)
+			.mutation(({ input }) => terminal.holdKey(input)),
+
+		releaseKey: publicProcedure
+			.input(z.object({ paneId: z.string() }))
+			.mutation(({ input }) => terminal.releaseKey(input)),
 
 		write: publicProcedure
 			.input(
@@ -421,12 +444,22 @@ export const createTerminalRouter = () => {
 				}),
 			)
 			.query(async ({ input }) => {
-				const { searchSessions } = await import("main/lib/claude-sessions");
+				const { cachedBriefs, searchSessions } = await import(
+					"main/lib/claude-sessions"
+				);
+				const { cardTitles } = await import("main/lib/card-titles");
 				const { sessionPeople } = await import("./session-people");
+				// The name the board knew it by (a rename, kept after the card
+				// closes), else the brief's title - same order as Insights.
+				const titles: Record<string, string> = {};
+				for (const [id, brief] of await cachedBriefs())
+					if (brief.title) titles[id] = brief.title;
+				Object.assign(titles, cardTitles());
 				return searchSessions({
 					...input,
 					cursor: input.cursor ?? 0,
 					people: sessionPeople(),
+					titles,
 				});
 			}),
 
@@ -450,7 +483,10 @@ export const createTerminalRouter = () => {
 		 * mtime in the main process, so polling an idle session is a stat.
 		 */
 		summarizeClaudeSession: publicProcedure
-			.input(z.object({ sessionId: z.string() }))
+			// `settled`: the session stopped, so its final brief is written now.
+			.input(
+				z.object({ sessionId: z.string(), settled: z.boolean().optional() }),
+			)
 			.query(async ({ input }) => {
 				const { writeBrief } = await import("main/lib/claude-sessions");
 				return writeBrief(input);

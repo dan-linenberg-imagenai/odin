@@ -256,7 +256,9 @@ mock.module("./history-manager", () => ({
 	},
 }));
 
-const { DaemonTerminalManager } = await import("./daemon-manager");
+const { DaemonTerminalManager, holdKeyWorker } = await import(
+	"./daemon-manager"
+);
 
 describe("DaemonTerminalManager kill tracking", () => {
 	beforeEach(() => {
@@ -640,5 +642,53 @@ describe("DaemonTerminalManager kill tracking", () => {
 
 		await expect(manager.forceKillAll()).rejects.toThrow("probe failed");
 		expect(mockClient.killAllCalls).toBe(0);
+	});
+});
+
+describe("DaemonTerminalManager holdKey", () => {
+	beforeEach(() => {
+		mockClient = new MockTerminalHostClient();
+	});
+
+	it("hands the hold to the worker when the daemon has no holdKey", async () => {
+		const manager = new DaemonTerminalManager();
+		const paneId = "pane-hold-1";
+		(manager as unknown as { sessions: Map<string, SessionInfo> }).sessions.set(
+			paneId,
+			{
+				paneId,
+				workspaceId: "ws-1",
+				isAlive: true,
+				lastActive: Date.now(),
+				cwd: "",
+				pid: 123,
+				cols: 80,
+				rows: 24,
+			},
+		);
+		const messages: unknown[] = [];
+		const create = holdKeyWorker.create;
+		holdKeyWorker.create = () => ({
+			postMessage: (message: unknown) => {
+				messages.push(message);
+			},
+		});
+		try {
+			await manager.holdKey({ paneId, data: " ", everyMs: 30 });
+			await manager.releaseKey({ paneId });
+		} finally {
+			holdKeyWorker.create = create;
+		}
+		expect(messages).toEqual([
+			{ type: "hold", sessionId: paneId, data: " ", everyMs: 30 },
+			{ type: "release", sessionId: paneId },
+		]);
+	});
+
+	it("refuses a hold on a session that is not alive", async () => {
+		const manager = new DaemonTerminalManager();
+		await expect(
+			manager.holdKey({ paneId: "pane-gone", data: " ", everyMs: 30 }),
+		).rejects.toThrow("not found or not alive");
 	});
 });

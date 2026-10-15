@@ -3,6 +3,7 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { PR_RULES_HEADER } from "shared/odin-rules";
+import { type SessionUsage, transcriptUsage } from "./usage";
 
 /**
  * Search over Claude Code's own conversation transcripts.
@@ -421,6 +422,7 @@ export async function searchSessions({
 	maxFiles = 400,
 	root = projectsRoot(),
 	people = new Map(),
+	titles = {},
 	cursor = 0,
 }: {
 	query?: string;
@@ -431,6 +433,9 @@ export async function searchSessions({
 	root?: string;
 	/** session id → who asked, for the sessions Odin launched off a feed. */
 	people?: Map<string, SessionPerson>;
+	/** session id → the name the board gave it (a rename, the brief's title),
+	 *  which outranks anything the transcript says. */
+	titles?: Record<string, string>;
 } = {}): Promise<{
 	sessions: SessionSummary[];
 	scanned: number;
@@ -491,12 +496,14 @@ export async function searchSessions({
 				whoTerms.size === 0
 			)
 				continue;
-			const title = titleFor(
-				summary.cardTitle,
-				summary.aiTitle,
-				summary.prompt,
-				file.sessionId,
-			);
+			const title =
+				titles[file.sessionId] ||
+				titleFor(
+					summary.cardTitle,
+					summary.aiTitle,
+					summary.prompt,
+					file.sessionId,
+				);
 			scored.push({
 				// Who asked outweighs a title word: a full name matching both its
 				// terms beats a session that merely says "Ofek" a lot, which is
@@ -560,6 +567,8 @@ export interface TranscriptMessage {
 	role: "user" | "assistant";
 	text: string;
 	at: string | null;
+	/** PR urls `gh pr create` printed: this session opened them. */
+	opened?: true;
 }
 
 /** The conversation, prose only - the readable form of a session. */
@@ -633,6 +642,7 @@ export function parseTranscript(
 							role: "assistant",
 							text: urls.join("\n"),
 							at: typeof entry.timestamp === "string" ? entry.timestamp : null,
+							opened: true,
 						});
 				}
 			}
@@ -753,6 +763,8 @@ export async function readTranscript({
 	loop: ActiveLoop | null;
 	/** Odin rules that fired in this session, and on which PRs. */
 	rules: RuleFiring[];
+	/** Tokens, context and cost so far; null before the first reply. */
+	usage: SessionUsage | null;
 }> {
 	if (!isSafeSegment(sessionId) || (project && !isSafeSegment(project))) {
 		throw new Error("Invalid transcript reference");
@@ -769,6 +781,7 @@ export async function readTranscript({
 		prompt,
 		loop: activeLoop(jsonl),
 		rules: ruleFirings(jsonl),
+		usage: transcriptUsage(jsonl),
 	};
 }
 

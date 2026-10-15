@@ -8,9 +8,10 @@ import {
 } from "@odin/local-db";
 import { TRPCError } from "@trpc/server";
 import { eq } from "drizzle-orm";
-import { app, clipboard, shell } from "electron";
+import { app, clipboard, session, shell } from "electron";
 import { localDb } from "main/lib/local-db";
 import { externalUrlLogLabel, isSafeExternalUrl } from "main/lib/safe-url";
+import { IN_APP_BROWSER_PARTITION } from "shared/constants";
 import { z } from "zod";
 import { publicProcedure, router } from "../..";
 import { getWorkspace } from "../workspaces/utils/db-helpers";
@@ -22,6 +23,12 @@ import {
 	resolvePath,
 	spawnAsync,
 } from "./helpers";
+import {
+	claudeCodeSessionUrl,
+	hasClaudeCodeExtension,
+	vscodeFolderUrl,
+	vscodeWindowReady,
+} from "./vscode";
 
 /**
  * Wraps a tRPC handler so a `RelativePathWithoutCwdError` (thrown by
@@ -112,6 +119,18 @@ async function openPathInApp(
  */
 export const createExternalRouter = () => {
 	return router({
+		/**
+		 * Whether the in-app browser holds a Slack sign-in (Slack's `d` cookie).
+		 * Without one a Slack link there only shows Slack's login page - and on
+		 * Windows the cookie import can't bring one over.
+		 */
+		hasSlackSession: publicProcedure.query(async () => {
+			const cookies = await session
+				.fromPartition(IN_APP_BROWSER_PARTITION)
+				.cookies.get({ domain: "slack.com", name: "d" });
+			return cookies.length > 0;
+		}),
+
 		openUrl: publicProcedure.input(z.string()).mutation(async ({ input }) => {
 			if (!isSafeExternalUrl(input)) {
 				console.warn(
@@ -208,6 +227,47 @@ export const createExternalRouter = () => {
 						err,
 					);
 				}
+			}),
+
+		/**
+		 * A session's folder in VS Code. `open -a` first; VS Code's own
+		 * `vscode://` handler when that fails (no `code` CLI, a renamed app).
+		 * Throws when neither opened it.
+		 */
+		openFolderInVsCode: publicProcedure
+			.input(z.object({ path: z.string() }))
+			.mutation(async ({ input }) => {
+				if (!nodePath.isAbsolute(input.path)) {
+					throw new TRPCError({
+						code: "BAD_REQUEST",
+						message: `VS Code needs an absolute path (got ${JSON.stringify(input.path)}).`,
+					});
+				}
+				try {
+					await openPathInApp(input.path, "vscode");
+				} catch {
+					await shell.openExternal(vscodeFolderUrl(input.path));
+				}
+			}),
+
+		/**
+		 * A conversation in VS Code's Claude Code panel, in the window already
+		 * open on `path`. Returns false without that extension.
+		 */
+		sendSessionToVsCode: publicProcedure
+			.input(z.object({ path: z.string(), sessionId: z.string().uuid() }))
+			.mutation(async ({ input }) => {
+				if (!hasClaudeCodeExtension()) return false;
+				// The URL goes to VS Code's focused window, and is dropped until that
+				// window's Claude extension runs: wait for it (a cold start ~5s).
+				// ponytail: polled, 20s cap - then sent anyway.
+				for (let waited = 0; waited < 20_000; waited += 250) {
+					if (vscodeWindowReady(input.path)) break;
+					await new Promise((resolve) => setTimeout(resolve, 250));
+				}
+				await new Promise((resolve) => setTimeout(resolve, 500));
+				await shell.openExternal(claudeCodeSessionUrl(input.sessionId));
+				return true;
 			}),
 
 		copyPath: publicProcedure.input(z.string()).mutation(async ({ input }) => {

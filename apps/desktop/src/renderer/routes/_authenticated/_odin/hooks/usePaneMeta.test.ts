@@ -49,9 +49,40 @@ describe("todos", () => {
 			{ text: "check the migration" },
 		]);
 
+		s.editTodo("p4", 1, " check the down migration ");
+		s.editTodo("p4", 1, "  ");
+		expect(usePaneMeta.getState().todosByPane.p4?.[1]).toEqual({
+			text: "check the down migration",
+		});
+
 		s.updateTodo("p4", 0);
 		s.updateTodo("p4", 0);
 		expect("p4" in usePaneMeta.getState().todosByPane).toBe(false);
+	});
+});
+
+describe("addTodos", () => {
+	it("appends the agent's items once, after yours", () => {
+		const s = usePaneMeta.getState();
+		s.addTodo("p5", "mine");
+		s.addTodos("p5", ["Merge #12", " ", "Merge #12", "mine"]);
+		s.addTodos("p5", ["Merge #12", "Reply on the thread"]);
+		expect(usePaneMeta.getState().todosByPane.p5).toEqual([
+			{ text: "mine" },
+			{ text: "Merge #12", from: "Merge #12" },
+			{ text: "Reply on the thread", from: "Reply on the thread" },
+		]);
+	});
+	it("copies plain text, and an edited copy still counts as added", () => {
+		const s = usePaneMeta.getState();
+		s.addTodos("p6", ["Merge **PR #12** in [repo](https://x/12) with `bun`"]);
+		const [todo] = usePaneMeta.getState().todosByPane.p6;
+		expect(todo.text).toBe("Merge PR #12 in repo with bun");
+		usePaneMeta.setState((st) => ({
+			todosByPane: { ...st.todosByPane, p6: [{ ...todo, text: "edited" }] },
+		}));
+		s.addTodos("p6", ["Merge **PR #12** in [repo](https://x/12) with `bun`"]);
+		expect(usePaneMeta.getState().todosByPane.p6).toHaveLength(1);
 	});
 });
 

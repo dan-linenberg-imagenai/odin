@@ -11,6 +11,16 @@ export interface BriefLink {
 export interface BriefTodo {
 	text: string;
 	done?: boolean;
+	/** The agent's action item it was copied from - still "added" once edited. */
+	from?: string;
+}
+
+/** An action item as plain text: My notes shows no markdown. */
+export function plainText(markdown: string): string {
+	return markdown
+		.replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+		.replace(/(\*\*|__|`)(.+?)\1/g, "$2")
+		.trim();
 }
 
 export const linkUrl = (link: BriefLink | string) =>
@@ -66,8 +76,12 @@ export const usePaneMeta = create<{
 	setBrief: (paneId: string, brief: string) => void;
 	setNotes: (paneId: string, notes: string) => void;
 	addTodo: (paneId: string, text: string) => void;
+	/** Appends the agent's action items, skipping ones already on the list. */
+	addTodos: (paneId: string, texts: string[]) => void;
 	/** Done flips its tick; otherwise the to-do is removed. */
 	updateTodo: (paneId: string, index: number, done?: boolean) => void;
+	/** Empty text keeps the to-do as it was. */
+	editTodo: (paneId: string, index: number, text: string) => void;
 	addLink: (paneId: string, url: string, name?: string) => void;
 	removeLink: (paneId: string, url: string) => void;
 	setHidden: (paneId: string, url: string, hidden: boolean) => void;
@@ -121,6 +135,18 @@ export const usePaneMeta = create<{
 					];
 					return { todosByPane: { ...s.todosByPane, [paneId]: todos } };
 				}),
+			addTodos: (paneId, texts) =>
+				set((s) => {
+					const todos = s.todosByPane[paneId] ?? [];
+					const have = new Set(todos.map((t) => t.from ?? t.text));
+					const added = [...new Set(texts.map((t) => t.trim()))]
+						.filter((from) => from && !have.has(from))
+						.map((from) => ({ text: plainText(from), from }));
+					if (!added.length) return {};
+					return {
+						todosByPane: { ...s.todosByPane, [paneId]: [...todos, ...added] },
+					};
+				}),
 			updateTodo: (paneId, index, done) =>
 				set((s) => {
 					const todos = (s.todosByPane[paneId] ?? []).flatMap((todo, i) =>
@@ -133,6 +159,19 @@ export const usePaneMeta = create<{
 					const { [paneId]: _, ...rest } = s.todosByPane;
 					return {
 						todosByPane: todos.length ? { ...rest, [paneId]: todos } : rest,
+					};
+				}),
+			editTodo: (paneId, index, text) =>
+				set((s) => {
+					const todos = s.todosByPane[paneId];
+					if (!text.trim() || !todos?.[index]) return {};
+					return {
+						todosByPane: {
+							...s.todosByPane,
+							[paneId]: todos.map((todo, i) =>
+								i === index ? { ...todo, text: text.trim() } : todo,
+							),
+						},
 					};
 				}),
 			addLink: (paneId, url, name) =>

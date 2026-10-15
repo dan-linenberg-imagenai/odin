@@ -1,8 +1,8 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { dirname, join, relative, sep } from "node:path";
+import { copyFile, mkdtemp, readFile, rm } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { TRPCError } from "@trpc/server";
 import { getRemoteConnectionManager } from "main/lib/remote-connection/remote-connection-manager";
@@ -209,7 +209,10 @@ function diffOf(all: DiffFile[], note: string[] = []) {
 export async function renderDiff(
 	cwd: string,
 	transcript?: string,
+	wholeFile = false,
 ): Promise<RepoDiff> {
+	// ponytail: every line as context, so the panel shows the whole file.
+	const context = wholeFile ? ["-U1000000"] : [];
 	const git = async (args: string[]) =>
 		(
 			await execWithShellEnv("git", ["--no-pager", ...args], {
@@ -226,7 +229,7 @@ export async function renderDiff(
 	};
 
 	let source = "uncommitted changes";
-	let patch = await git(["diff", "--no-color", "HEAD"]);
+	let patch = await git(["diff", "--no-color", ...context, "HEAD"]);
 	const ownsFile = (path: string) =>
 		transcript === undefined || transcript.includes(path);
 	if (!patch.trim() || !splitPatch(patch).some((file) => ownsFile(file.path))) {
@@ -240,7 +243,7 @@ export async function renderDiff(
 			return nothing;
 		}
 		source = "last commit";
-		patch = await git(["show", "--no-color", "HEAD"]);
+		patch = await git(["show", "--no-color", ...context, "HEAD"]);
 	}
 
 	const all = splitPatch(patch);
@@ -259,6 +262,74 @@ export async function renderDiff(
 		note.push(`${others} file(s) changed by other sessions, not shown`);
 
 	return { ...diffOf(files, note), source, cwd };
+}
+
+/**
+ * The checkout as it is now - edits and new files alike - written as a git
+ * tree. A copy of the index takes the `add`, so the real index, the refs and
+ * the files are never touched; the copy keeps git's stat cache, so only the
+ * changed files get hashed.
+ */
+export async function snapshotTree(cwd: string): Promise<string> {
+	const run = async (args: string[], env?: NodeJS.ProcessEnv) =>
+		(
+			await execWithShellEnv("git", args, {
+				cwd,
+				env,
+				maxBuffer: 64 * 1024 * 1024,
+				timeout: 60_000,
+			})
+		).stdout.trim();
+	const index = resolve(cwd, await run(["rev-parse", "--git-path", "index"]));
+	const dir = await mkdtemp(join(tmpdir(), "odin-review-"));
+	const env = { GIT_INDEX_FILE: join(dir, "index") };
+	try {
+		if (existsSync(index)) await copyFile(index, env.GIT_INDEX_FILE);
+		else await run(["read-tree", "HEAD"], env);
+		await run(["add", "-A"], env);
+		return await run(["write-tree"], env);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+}
+
+/**
+ * What changed in a checkout since `since`, a tree `snapshotTree` wrote - the
+ * agent's answer to a review, without the change the review was about.
+ * New files show in full here, since both sides are trees.
+ */
+export async function renderSinceDiff(
+	cwd: string,
+	since: string,
+	transcript?: string,
+	wholeFile = false,
+): Promise<RepoDiff> {
+	const now = await snapshotTree(cwd);
+	const { stdout } = await execWithShellEnv(
+		"git",
+		[
+			"--no-pager",
+			"diff",
+			"--no-color",
+			...(wholeFile ? ["-U1000000"] : []),
+			since,
+			now,
+		],
+		{ cwd, maxBuffer: 64 * 1024 * 1024, timeout: 30_000 },
+	);
+	const all = splitPatch(stdout);
+	const files = all.filter(
+		(file) => transcript === undefined || transcript.includes(file.path),
+	);
+	const others = all.length - files.length;
+	return {
+		...diffOf(
+			files,
+			others ? [`${others} file(s) changed by other sessions, not shown`] : [],
+		),
+		source: "since review",
+		cwd,
+	};
 }
 
 /**
@@ -416,52 +487,85 @@ export const createReposRouter = (
 
 		diff: publicProcedure
 			.input(
-				z.object({
-					/**
-					 * The session's own checkout. Only known once its terminal has
-					 * mounted - the workspace's is the fallback, which is where a
-					 * session runs unless it picked a repo of its own.
-					 */
-					cwd: z.string().nullish(),
-					/**
-					 * The conversation running in this pane. Its transcript is the
-					 * only record of which repo the agent actually worked in.
-					 */
-					claudeSessionId: z.string().nullish(),
-					workspaceId: z.string(),
+				sessionCheckoutInput.extend({
 					/** Show this pull request's diff instead of the checkout's. */
 					pr: z.string().url().nullish(),
+					/** The whole of each file, not only the changed hunks. */
+					wholeFile: z.boolean().optional(),
+					/** Only what changed since this `reviewSnapshot` tree. */
+					since: z
+						.string()
+						.regex(/^[0-9a-f]{40,64}$/)
+						.nullish(),
 				}),
 			)
 			.query(async ({ input }) => {
 				if (input.pr) return renderPullRequestDiff(input.pr);
-				// The repo the agent worked in wins: Claude Code cds between repos
-				// and worktrees without the shell ever noticing, so `input.cwd` is
-				// often just the catch-all directory the pane was launched in.
-				const { transcriptOf, workingRepoOf } = await import(
-					"main/lib/claude-sessions"
-				);
-				const dir =
-					(input.claudeSessionId
-						? await workingRepoOf(input.claudeSessionId)
-						: null) ??
-					input.cwd ??
-					getWorkspaceTerminalContext(input.workspaceId).workspacePath;
-				if (!dir) {
-					throw new TRPCError({
-						code: "NOT_FOUND",
-						message: "No checkout known for this session yet.",
-					});
-				}
-				// What the session did, so another session's work in the same
-				// checkout isn't passed off as its own.
-				const transcript = input.claudeSessionId
-					? await transcriptOf(input.claudeSessionId)
-					: null;
-				return renderDiff(
-					dir,
-					transcript ? await readFile(transcript.path, "utf-8") : undefined,
-				);
+				const { dir, transcript } = await sessionCheckout(input);
+				return input.since
+					? renderSinceDiff(dir, input.since, transcript, input.wholeFile)
+					: renderDiff(dir, transcript, input.wholeFile);
+			}),
+
+		/** The session's checkout as it is now, for a later `diff` `since` it. */
+		reviewSnapshot: publicProcedure
+			.input(sessionCheckoutInput)
+			.mutation(async ({ input }) => {
+				const { dir } = await sessionCheckout(input);
+				return { tree: await snapshotTree(dir) };
 			}),
 	});
 };
+
+const sessionCheckoutInput = z.object({
+	/**
+	 * The session's own checkout. Only known once its terminal has
+	 * mounted - the workspace's is the fallback, which is where a
+	 * session runs unless it picked a repo of its own.
+	 */
+	cwd: z.string().nullish(),
+	/**
+	 * The conversation running in this pane. Its transcript is the
+	 * only record of which repo the agent actually worked in.
+	 */
+	claudeSessionId: z.string().nullish(),
+	workspaceId: z.string(),
+});
+
+/** The checkout a session's changes are in, and its transcript's text. */
+async function sessionCheckout(
+	input: z.infer<typeof sessionCheckoutInput>,
+): Promise<{ dir: string; transcript: string | undefined }> {
+	// The repo the agent worked in wins: Claude Code cds between repos
+	// and worktrees without the shell ever noticing, so `input.cwd` is
+	// often just the catch-all directory the pane was launched in.
+	// The worktree before the clone: an agent runs most of its commands in
+	// the clone before it cuts a worktree, but the changes are in the worktree.
+	const { transcriptOf, workingRepoOf, workingWorktreeOf } = await import(
+		"main/lib/claude-sessions"
+	);
+	const dir =
+		(input.claudeSessionId
+			? ((await workingWorktreeOf(input.claudeSessionId)) ??
+				(await workingRepoOf(input.claudeSessionId)))
+			: null) ??
+		input.cwd ??
+		getWorkspaceTerminalContext(input.workspaceId).workspacePath;
+	if (!dir) {
+		throw new TRPCError({
+			code: "NOT_FOUND",
+			message: "No checkout known for this session yet.",
+		});
+	}
+	// What the session did, so another session's work in the same
+	// checkout isn't passed off as its own.
+	const transcript = input.claudeSessionId
+		? await transcriptOf(input.claudeSessionId)
+		: null;
+	return {
+		dir,
+		transcript: transcript
+			? await readFile(transcript.path, "utf-8")
+			: undefined,
+	};
+}

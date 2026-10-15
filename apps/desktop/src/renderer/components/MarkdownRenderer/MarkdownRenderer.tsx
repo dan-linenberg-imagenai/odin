@@ -1,13 +1,44 @@
 import { cn } from "@odin/ui/utils";
 import { useRef } from "react";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import rehypeRaw from "rehype-raw";
-import rehypeSanitize from "rehype-sanitize";
+import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
 import { useMarkdownStyle } from "renderer/stores";
 import { SelectionContextMenu } from "./components";
 import { defaultConfig } from "./styles/default/config";
 import { tufteConfig } from "./styles/tufte/config";
+
+/** Images saved to ~/.odin/attachments (SafeImage allows the scheme too). */
+const ATTACHMENT_SCHEME = "odin-attachment";
+
+/** An image path an agent wrote, e.g. a screenshot it saved: main serves it under the scheme. */
+const LOCAL_IMAGE = /^(?:file:\/\/)?(\/[^?#]+\.(?:png|jpe?g|gif|webp))$/i;
+
+const safeDecode = (value: string) => {
+	try {
+		return decodeURI(value);
+	} catch {
+		return value;
+	}
+};
+
+/** react-markdown and rehype-sanitize both drop unknown schemes; keep ours. */
+export const keepAttachmentUrls = (url: string, key?: string) => {
+	if (url.startsWith(`${ATTACHMENT_SCHEME}://`)) return url;
+	const localPath = key === "src" && url.match(LOCAL_IMAGE)?.[1];
+	if (localPath)
+		return `${ATTACHMENT_SCHEME}://local${encodeURI(safeDecode(localPath))}`;
+	return defaultUrlTransform(url);
+};
+
+export const sanitizeSchema = {
+	...defaultSchema,
+	protocols: {
+		...defaultSchema.protocols,
+		src: [...(defaultSchema.protocols?.src ?? []), ATTACHMENT_SCHEME],
+	},
+};
 
 const styleConfigs = {
 	default: defaultConfig,
@@ -46,8 +77,11 @@ export function MarkdownRenderer({
 					<ReactMarkdown
 						remarkPlugins={[remarkGfm]}
 						rehypePlugins={
-							allowHtml ? [rehypeRaw, rehypeSanitize] : [rehypeSanitize]
+							allowHtml
+								? [rehypeRaw, [rehypeSanitize, sanitizeSchema]]
+								: [[rehypeSanitize, sanitizeSchema]]
 						}
+						urlTransform={keepAttachmentUrls}
 						components={config.components}
 					>
 						{content}

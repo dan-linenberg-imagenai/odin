@@ -5,8 +5,10 @@ import os from "node:os";
 import path from "node:path";
 import {
 	type CookieRow,
+	cookieDomains,
 	cookieKey,
 	decryptValue,
+	isConnectionCookie,
 	newestCookieDb,
 	toCookie,
 } from "./import-cookies";
@@ -54,6 +56,12 @@ describe("decryptValue", () => {
 			),
 		).toBe("plain");
 	});
+
+	test("a row with no encrypted value is empty, not an error", () => {
+		expect(decryptValue({ value: "", encrypted_value: null }, key, 24)).toBe(
+			"",
+		);
+	});
 });
 
 describe("toCookie", () => {
@@ -93,4 +101,35 @@ test("newestCookieDb skips a browser macOS won't let Odin read", () => {
 	} finally {
 		chmodSync(chrome, 0o755);
 	}
+});
+
+describe("cookieDomains", () => {
+	test("keeps only the connected sites, and Google only with Gmail", () => {
+		const all = ["slack", "jira", "github", "notion", "clickup"] as const;
+		const withGmail = cookieDomains([...all, "gmail"]);
+		const without = cookieDomains([...all]);
+		for (const host of [
+			".slack.com",
+			"imagen.atlassian.net",
+			".id.atlassian.com",
+			"github.com",
+			"www.notion.so",
+			"app.clickup.com",
+		])
+			expect(isConnectionCookie(host, without)).toBe(true);
+		for (const host of [
+			".google.com",
+			"accounts.google.com",
+			".chase.com",
+			"notslack.com",
+			"slack.com.evil.io",
+		])
+			expect(isConnectionCookie(host, without)).toBe(false);
+		expect(isConnectionCookie(".google.com", withGmail)).toBe(true);
+		expect(isConnectionCookie("mail.google.com", withGmail)).toBe(true);
+		const slackOnly = cookieDomains(["slack"]);
+		expect(isConnectionCookie(".slack.com", slackOnly)).toBe(true);
+		expect(isConnectionCookie("github.com", slackOnly)).toBe(false);
+		expect(isConnectionCookie("www.notion.so", slackOnly)).toBe(false);
+	});
 });

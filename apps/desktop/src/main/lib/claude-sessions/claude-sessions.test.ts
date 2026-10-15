@@ -294,6 +294,19 @@ describe("searchSessions", () => {
 		]);
 	});
 
+	test("the board's name for a session beats the launch line", async () => {
+		const root = fixtureRoot();
+		const { sessions: before } = await searchSessions({ root });
+		const id = before[0]?.sessionId ?? "";
+		const { sessions } = await searchSessions({
+			root,
+			titles: { [id]: "Renamed on the board" },
+		});
+		expect(sessions.find((s) => s.sessionId === id)?.title).toBe(
+			"Renamed on the board",
+		);
+	});
+
 	test("browsing pages through the store by cursor, searching never does", async () => {
 		const root = fixtureRoot();
 		const first = await searchSessions({ root, limit: 1 });
@@ -592,16 +605,19 @@ describe("parseTranscript / readTranscript", () => {
 				role: "assistant",
 				text: "https://github.com/danlinenberg/odin/pull/232",
 				at: "2026-09-27T07:32:00.000Z",
+				opened: true,
 			},
 			{
 				role: "assistant",
 				text: "https://github.com/a/b/pull/7",
 				at: "2026-09-27T07:32:00.000Z",
+				opened: true,
 			},
 			{
 				role: "assistant",
 				text: "https://github.com/a/b/pull/11",
 				at: "2026-09-27T07:32:00.000Z",
+				opened: true,
 			},
 			{ role: "assistant", text: "Merged as #232.", at: null },
 		]);

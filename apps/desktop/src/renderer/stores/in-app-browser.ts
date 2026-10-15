@@ -77,13 +77,34 @@ export function slackThread(url: string): SlackThread | null {
  * you chose your own browser, for all links or that site's. Any other link, and anything that isn't a web
  * page (mailto:, a file), goes to the system.
  */
+/** Bumps on every open, so a slow Slack check can't replace a newer link. */
+let opens = 0;
+
 export function openUrl(url: string): void {
+	const open = ++opens;
 	const site = linkSite(url);
 	const { external, browserSites } = useInAppBrowser.getState();
 	if (site && !external && !browserSites.includes(site)) {
-		useInAppBrowser.setState({ url: slackWebClientUrl(url) });
+		if (site !== "slack") {
+			useInAppBrowser.setState({ url });
+			return;
+		}
+		// Not signed in to Slack in here: your own browser is, and it hands
+		// the link to the Slack app - better than Slack's login page.
+		void electronTrpcClient.external.hasSlackSession
+			.query()
+			.catch(() => true)
+			.then((signedIn) => {
+				if (open !== opens) return;
+				if (signedIn) useInAppBrowser.setState({ url: slackWebClientUrl(url) });
+				else openExternally(url);
+			});
 		return;
 	}
+	openExternally(url);
+}
+
+function openExternally(url: string): void {
 	electronTrpcClient.external.openUrl.mutate(url).catch((error) => {
 		console.error("[openUrl] Failed to open URL:", url, error);
 	});

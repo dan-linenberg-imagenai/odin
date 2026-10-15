@@ -1,3 +1,5 @@
+import { cn } from "@odin/ui/utils";
+import { useState } from "react";
 import { LuImageOff } from "react-icons/lu";
 
 /**
@@ -6,7 +8,8 @@ import { LuImageOff } from "react-icons/lu";
  * ALLOWED:
  * - data: URLs (embedded base64 images)
  * - https:// URLs (GitHub user-attachments, avatars, etc.)
- * - odin-attachment:// (images pasted into a task, served from ~/.odin/attachments)
+ * - odin-attachment:// (images pasted into a task, or local image paths an agent
+ *   linked, which MarkdownRenderer rewrites to odin-attachment://local/...)
  *
  * BLOCKED (everything else):
  * - http:// (cleartext / mixed-content)
@@ -59,12 +62,30 @@ export function SafeImage({ src, alt, className }: SafeImageProps) {
 		);
 	}
 
-	// Safe to render - embedded data: URL
+	return <ZoomableImage src={src} alt={alt} className={className} />;
+}
+
+/** A thumbnail by default; a click toggles it to full width, like a pasted image in the chat. */
+function ZoomableImage({ src, alt, className }: SafeImageProps) {
+	const [enlarged, setEnlarged] = useState(false);
 	return (
-		<img
-			src={src}
-			alt={alt}
-			className={className ?? "max-w-full h-auto rounded-md my-4"}
-		/>
+		<button
+			type="button"
+			onClick={() => setEnlarged((value) => !value)}
+			className={cn(
+				"block",
+				enlarged ? "cursor-zoom-out" : "cursor-zoom-in",
+				className ?? "my-4",
+			)}
+		>
+			<img
+				src={src}
+				alt={alt}
+				className={cn(
+					"rounded-md border border-border object-contain",
+					enlarged ? "max-h-[80vh] max-w-full" : "max-h-40 max-w-60",
+				)}
+			/>
+		</button>
 	);
 }

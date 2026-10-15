@@ -2,12 +2,19 @@ import { describe, expect, test } from "bun:test";
 import {
 	actionItemList,
 	applyLines,
+	applyQueue,
+	arrived,
+	bangCommands,
 	elapsedLabel,
+	interruptClaude,
 	isAnswerItem,
 	isApprovalItem,
 	isDoneItem,
+	isEchoed,
 	isYouOnly,
 	itemOptions,
+	itemReply,
+	lastActionsId,
 	launchAttachments,
 	launchRequest,
 	outputTokens,
@@ -18,6 +25,7 @@ import {
 	toolDescription,
 	transcriptPath,
 	userText,
+	yourQueued,
 } from "./ChatView";
 
 describe("ChatView transcript", () => {
@@ -38,6 +46,24 @@ describe("ChatView transcript", () => {
 		expect(
 			userText("<bash-stdout>ok</bash-stdout><bash-stderr>warn</bash-stderr>"),
 		).toBe("ok\n\nwarn");
+	});
+
+	test("a ! block becomes a command to run; other blocks don't", () => {
+		const text = [
+			"Run this:",
+			"```",
+			"! aws sso login",
+			"```",
+			"Not this:",
+			"```bash",
+			"ls -la",
+			"```",
+			"```",
+			"!echo a &&",
+			"echo b",
+			"```",
+		].join("\n");
+		expect(bangCommands(text)).toEqual(["aws sso login", "echo a &&\necho b"]);
 	});
 
 	test("a message sent mid-turn shows as yours, its image too", () => {
@@ -231,6 +257,22 @@ describe("ChatView transcript", () => {
 		expect(splitActionItems("no list here").actions).toBeNull();
 	});
 
+	test("only the latest reply with action items shows its card", () => {
+		const text = (id: string, t: string) => ({
+			kind: "text" as const,
+			id,
+			text: t,
+		});
+		expect(
+			lastActionsId([
+				text("a", "x\nACTION ITEMS:\n1. Merge it"),
+				text("b", "y\nACTION ITEMS:\n1. Merge it"),
+				text("c", "no list here"),
+			]),
+		).toBe("b");
+		expect(lastActionsId([text("a", "no list")])).toBeUndefined();
+	});
+
 	test("action items list one entry per numbered or bulleted line", () => {
 		expect(actionItemList("1. Merge it\n2) Check `x` works")).toEqual([
 			"Merge it",
@@ -279,6 +321,12 @@ describe("ChatView transcript", () => {
 			options: ["yes", "after #826 merges"],
 		});
 		expect(itemOptions("Tell me the seniority.").options).toEqual([]);
+		expect(
+			itemOptions("Pick a fix [extension | write around it] (you only)"),
+		).toEqual({
+			text: "Pick a fix",
+			options: ["extension", "write around it"],
+		});
 	});
 });
 
@@ -352,6 +400,18 @@ describe("isYouOnly", () => {
 	test("an item Claude can do, or one asking for an answer, still gets one", () => {
 		expect(isYouOnly("Look at #740 if CI fails.")).toBe(false);
 		expect(isYouOnly("Tell me which repo to use (you only).")).toBe(false);
+	});
+});
+
+describe("itemReply", () => {
+	test("an empty answer box sends the item itself", () => {
+		expect(itemReply("Tell me commit and push to update PR #760", "  ")).toBe(
+			undefined,
+		);
+	});
+	test("a typed answer, or Done for a tell-me-when item", () => {
+		expect(itemReply("Tell me which repo to use", " odin ")).toBe("odin");
+		expect(itemReply("Tell me when you have signed in", "")).toBe("Done");
 	});
 });
 
@@ -442,5 +502,116 @@ describe("splitEarlier", () => {
 		const first = splitEarlier(file.subarray(0, 3), middle.head, true);
 		expect(first.lines).toEqual(['{"a":1}']);
 		expect(first.head.length).toBe(0);
+	});
+});
+
+describe("applyQueue", () => {
+	const op = (operation: string, content?: string) =>
+		({ type: "queue-operation", operation, content }) as never;
+	test("holds what Claude queued until it takes or drops it", () => {
+		let queue = applyQueue(
+			[],
+			[op("enqueue", "first"), op("enqueue", "second")],
+		);
+		expect(queue).toEqual(["first", "second"]);
+		queue = applyQueue(queue, [op("dequeue")]);
+		expect(queue).toEqual(["second"]);
+		queue = applyQueue(queue, [op("remove", "second")]);
+		expect(queue).toEqual([]);
+		// A task notice holds its place in the queue but is not shown as yours.
+		const withNotice = applyQueue(
+			[],
+			[
+				op("enqueue", "<task-notification>x</task-notification>"),
+				op("enqueue", "mine"),
+			],
+		);
+		expect(yourQueued(withNotice)).toEqual(["mine"]);
+		expect(applyQueue(withNotice, [op("dequeue")])).toEqual(["mine"]);
+		// Esc pulls everything back into the input.
+		expect(applyQueue(withNotice, [op("popAll", "mine")])).toEqual([]);
+	});
+	test("a message that lands as a turn leaves the queue, older leftovers too", () => {
+		// A real log: a resume left a notice and "Continue" behind, so the
+		// dequeue that took "dsasda" shifted "Continue" instead.
+		let queue = applyQueue(
+			[],
+			[
+				op("enqueue", "<task-notification>x</task-notification>"),
+				op("enqueue", "Continue"),
+				op("enqueue", "dsasda"),
+				op("dequeue"),
+			],
+		);
+		expect(yourQueued(queue)).toEqual(["Continue", "dsasda"]);
+		queue = applyQueue(queue, [
+			{ type: "user", message: { content: "dsasda" } } as never,
+		]);
+		expect(queue).toEqual([]);
+		// Mid-turn, it lands as a queued_command attachment.
+		queue = applyQueue(
+			["later"],
+			[{ attachment: { type: "queued_command", prompt: "later" } } as never],
+		);
+		expect(queue).toEqual([]);
+	});
+});
+
+describe("ChatView sent bubble", () => {
+	const old = { kind: "user", id: "a", text: "earlier message" };
+	test("a photo sent alone stays until a new row echoes it", () => {
+		const sent = { text: "", seen: new Set(["a"]) };
+		expect(isEchoed([old], sent)).toBe(false);
+		expect(isEchoed([old, { kind: "user", id: "b", text: "" }], sent)).toBe(
+			true,
+		);
+	});
+	test("an older row with the same words is not the echo", () => {
+		const sent = { text: "ok", seen: new Set(["a"]) };
+		expect(isEchoed([{ ...old, text: "ok then" }], sent)).toBe(false);
+	});
+});
+
+describe("arrived - Claude took the sent message", () => {
+	const sent = { text: "fix it", seen: new Set(["a"]) };
+	const old = { kind: "user", id: "a" };
+	test("nothing new and nothing queued: never got there", () => {
+		expect(arrived([old], [], sent)).toBe(false);
+	});
+	test("queued mid-turn counts", () => {
+		expect(arrived([old], ["fix it"], sent)).toBe(true);
+	});
+	test("any new user row counts - Claude rewrites some messages", () => {
+		expect(arrived([old, { kind: "user", id: "b" }], [], sent)).toBe(true);
+	});
+});
+
+describe("interruptClaude", () => {
+	const idle = `❯ \n${"─".repeat(20)}\n  ⏵⏵ bypass permissions on (shift+tab to cycle)`;
+	const busy = `✻ Cogitating… (5m 0s · ↓ 1k tokens)\n${"─".repeat(20)}\n❯ \n${"─".repeat(20)}\n  ⏵⏵ bypass permissions on`;
+	const run = async (screens: (string | null)[]) => {
+		const writes: string[] = [];
+		const sent = await interruptClaude(
+			async ({ data }) => writes.push(data),
+			async () => ({ text: screens.shift() ?? null }),
+			"pane",
+		);
+		return { sent, writes };
+	};
+	test("mid-turn: Ctrl+C, never Esc", async () => {
+		expect(await run([busy])).toEqual({ sent: true, writes: ["\x03"] });
+	});
+	test("at the prompt: no Ctrl+C - it would stop the background agents", async () => {
+		expect(await run([idle, idle])).toEqual({ sent: false, writes: [] });
+	});
+	test("the message Claude put back in its box is cleared", async () => {
+		const restored = `${"─".repeat(20)}\n❯ line one\n  line two\n${"─".repeat(20)}\n  ⏵⏵ bypass permissions on`;
+		expect(await run([busy, restored])).toEqual({
+			sent: true,
+			writes: ["\x03", "\x15\x7f\x15\x7f\x15"],
+		});
+	});
+	test("an unreadable screen still interrupts", async () => {
+		expect(await run([null])).toEqual({ sent: true, writes: ["\x03"] });
 	});
 });

@@ -9,6 +9,7 @@ import { clickupFetch } from "main/lib/read-link";
 import { z } from "zod";
 import { publicProcedure, router } from "../..";
 import { readOdinConfig, resolveGithubToken } from "../odin-config";
+import { slackThreadReplies } from "../slack";
 
 /**
  * Odin fork: read-only "my work" feeds - Jira issues assigned to me and GitHub
@@ -25,6 +26,43 @@ import { readOdinConfig, resolveGithubToken } from "../odin-config";
  * `base|project|issueType`. Screens change rarely; a restart re-asks.
  */
 const dueOnScreen = new Map<string, Promise<boolean>>();
+
+/**
+ * The Sprint field's id on each Jira site, by base URL. It's a custom field
+ * (customfield_10020 on most sites, not all), so it's found by its type once.
+ */
+const sprintFieldBySite = new Map<string, Promise<string | null>>();
+
+interface JiraSprintValue {
+	name?: string;
+	state?: string;
+	startDate?: string;
+	endDate?: string;
+}
+
+/**
+ * The sprint a ticket sits in the way Jira's backlog shows it: the active
+ * one, else the next one coming, else none - an open ticket whose sprints
+ * have all closed is back in the Backlog.
+ */
+export function currentSprint(value: unknown): JiraIssueRow["sprint"] {
+	if (!Array.isArray(value)) return null;
+	const sprints = (value as JiraSprintValue[]).filter((s) => s?.name);
+	const pick =
+		sprints.find((s) => s.state === "active") ??
+		sprints
+			.filter((s) => s.state === "future")
+			.sort((a, b) =>
+				(a.startDate ?? "~").localeCompare(b.startDate ?? "~"),
+			)[0];
+	if (!pick?.name) return null;
+	return {
+		name: pick.name,
+		state: pick.state === "active" ? "active" : "future",
+		startDate: pick.startDate ?? null,
+		endDate: pick.endDate ?? null,
+	};
+}
 
 function odinRepo(): string | null {
 	const repo = process.env.ODIN_REPO_DIR ?? readOdinConfig().odinRepo;
@@ -87,6 +125,13 @@ export interface JiraIssueRow {
 	description?: string | null;
 	/** The epic it sits under. Null when it has none, or its parent is a story. */
 	epic?: { key: string; title: string } | null;
+	/** The sprint it's in on Jira's board; null = the Backlog. */
+	sprint?: {
+		name: string;
+		state: "active" | "future";
+		startDate: string | null;
+		endDate: string | null;
+	} | null;
 }
 
 interface JiraParent {
@@ -112,7 +157,7 @@ export function epicOf(parent: JiraParent | undefined): JiraIssueRow["epic"] {
 }
 
 interface JiraComment {
-	author?: { displayName?: string };
+	author?: { displayName?: string; accountId?: string };
 	created?: string;
 	body?: unknown;
 }
@@ -297,8 +342,19 @@ interface JiraSearchResponse {
 			comment?: { comments?: JiraComment[] };
 			description?: unknown;
 			parent?: JiraParent;
+			[custom: string]: unknown;
 		};
 	}[];
+}
+
+/** The newest reply on a watched thread. */
+export interface ThreadActivity {
+	/** Slack ts or Jira comment time - changes when someone replies. "" = no replies yet. */
+	stamp: string;
+	/** That newest reply is mine - nothing to ping about. */
+	byMe: boolean;
+	/** What it said, for the notification. */
+	text: string | null;
 }
 
 interface GithubSearchResponse {
@@ -483,6 +539,30 @@ export const createWorkRouter = () => {
 					)
 					.catch(() => null);
 
+				let sprintFieldRequest = sprintFieldBySite.get(request.base);
+				if (!sprintFieldRequest) {
+					sprintFieldRequest = fetch(`${request.base}/rest/api/3/field`, {
+						headers,
+					})
+						.then(async (response) => {
+							if (!response.ok) return null;
+							const fields = (await response.json()) as {
+								id: string;
+								schema?: { custom?: string };
+							}[];
+							return (
+								fields.find(
+									(field) =>
+										field.schema?.custom ===
+										"com.pyxis.greenhopper.jira:gh-sprint",
+								)?.id ?? null
+							);
+						})
+						.catch(() => null);
+					sprintFieldBySite.set(request.base, sprintFieldRequest);
+				}
+				const sprintField = await sprintFieldRequest;
+
 				const search = async (
 					role: JiraIssueRow["role"],
 					match: string,
@@ -490,7 +570,7 @@ export const createWorkRouter = () => {
 					const jql = `${match}${openOnly} ORDER BY updated DESC`;
 					// Comment bodies are only worth their weight on the mention rows,
 					// where they are the point.
-					const fields = `summary,status,priority,project,issuetype,reporter,assignee,updated,created,duedate,description,parent${role === "mentioned" ? ",comment" : ""}`;
+					const fields = `summary,status,priority,project,issuetype,reporter,assignee,updated,created,duedate,description,parent${sprintField ? `,${sprintField}` : ""}${role === "mentioned" ? ",comment" : ""}`;
 					const response = await fetch(
 						`${request.base}/rest/api/3/search/jql?jql=${encodeURIComponent(jql)}&maxResults=100&fields=${fields}`,
 						{ headers },
@@ -526,6 +606,9 @@ export const createWorkRouter = () => {
 								.trim()
 								.slice(0, 3000) || null,
 						epic: epicOf(issue.fields?.parent),
+						sprint: sprintField
+							? currentSprint(issue.fields?.[sprintField])
+							: null,
 						mention: accountId
 							? latestMention(issue.fields?.comment?.comments ?? [], accountId)
 							: null,
@@ -634,6 +717,69 @@ export const createWorkRouter = () => {
 					);
 				},
 			),
+
+		/**
+		 * The newest reply on each watched thread, keyed like the task rows
+		 * (`slack:<channel>:<ts>`, `jira:<KEY>`) - what "Ping me on replies"
+		 * compares against what it saw last time. A row Slack or Jira won't
+		 * answer for is left out, which reads as "nothing new".
+		 *
+		 * ponytail: Slack thread replies only - a DM answered inline, outside a
+		 * thread, doesn't count. Add `channelLastTs` here if that's missed.
+		 */
+		threadActivity: publicProcedure
+			.input(
+				z.object({ slack: z.array(z.string()), jira: z.array(z.string()) }),
+			)
+			.query(async ({ input }): Promise<Record<string, ThreadActivity>> => {
+				const out: Record<string, ThreadActivity> = {};
+				for (const id of input.slack) {
+					const thread = await slackThreadReplies(id);
+					if (thread)
+						out[`slack:${id}`] = {
+							stamp: thread.lastReplyTs ?? "",
+							byMe: thread.lastReplyByMe,
+							text: thread.lastReplyText ?? null,
+						};
+				}
+				const keys = input.jira.filter((key) =>
+					/^[A-Z][A-Z0-9_]+-\d+$/.test(key),
+				);
+				const request = keys.length ? await jiraRequestContext() : null;
+				if (!request) return out;
+				const headers = {
+					Authorization: request.authorization,
+					Accept: "application/json",
+				};
+				const [me, search] = await Promise.all([
+					fetch(`${request.base}/rest/api/3/myself`, { headers })
+						.then(async (r) =>
+							r.ok
+								? ((await r.json()) as { accountId?: string }).accountId
+								: null,
+						)
+						.catch(() => null),
+					fetch(
+						`${request.base}/rest/api/3/search/jql?jql=${encodeURIComponent(`key in (${keys.join(",")})`)}&maxResults=100&fields=comment`,
+						{ headers },
+					)
+						.then(async (r) =>
+							r.ok ? ((await r.json()) as JiraSearchResponse) : {},
+						)
+						.catch((): JiraSearchResponse => ({})),
+				]);
+				for (const issue of search.issues ?? []) {
+					const last = issue.fields?.comment?.comments?.at(-1);
+					out[`jira:${issue.key}`] = {
+						stamp: last?.created ?? "",
+						byMe: !!me && last?.author?.accountId === me,
+						text: last
+							? `${last.author?.displayName ?? "Someone"}: ${adfToText(last.body).replace(/\s+/g, " ").trim().slice(0, 300)}`
+							: null,
+					};
+				}
+				return out;
+			}),
 
 		/**
 		 * Unread inbox mail. No OAuth: Gmail still takes Basic auth with an app

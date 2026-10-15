@@ -12,6 +12,7 @@ import {
 	pickClaudeCommand,
 	useClaudeCommand,
 } from "renderer/stores/claude-command";
+import { type CrowChat, useCrowChats } from "renderer/stores/crow-chats";
 import { useNextInLinePrompt } from "renderer/stores/next-in-line-prompt";
 import { useOneByOne } from "renderer/stores/one-by-one";
 import { useTabsStore } from "renderer/stores/tabs/store";
@@ -28,7 +29,7 @@ import { create } from "zustand";
 import { type PromptImage, sessionTitle } from "../components/OdinPromptDialog";
 import { readState, runAction, writeState } from "./crow-state";
 import { endSession, useDone } from "./useDone";
-import { taskPrompt, useMyTasks } from "./useOdinTasks";
+import { taskPrompt, useMyTasks, useOdinTasks } from "./useOdinTasks";
 import { useOdinWorkspace } from "./useOdinWorkspace";
 
 /**
@@ -51,11 +52,12 @@ export const crowPane = (panes: Record<string, Pane>): Pane | undefined =>
 /**
  * Claude, told it is the crow and how to drive Odin. On Haiku - the alias is
  * always the latest one - whatever model the board's sessions use. Without
- * Claude's own task list, so "add a task" reaches Odin's backlog.
+ * Claude's own task list, so "add a task" reaches Odin's backlog, and without
+ * its auto-memory, so "always do X" becomes an Odin rule, not a memory file.
  */
 const crowCli = () => {
 	const { commands, active } = useClaudeCommand.getState();
-	return `${pickClaudeCommand(commands, active)} --dangerously-skip-permissions --model haiku --disallowedTools TaskCreate,TaskGet,TaskList,TaskUpdate,TodoWrite --append-system-prompt ${quote(crowRule(import.meta.env.DEV ? "main" : `v${window.App.appVersion}`))}`;
+	return `${pickClaudeCommand(commands, active)} --dangerously-skip-permissions --model haiku --disallowedTools TaskCreate,TaskGet,TaskList,TaskUpdate,TodoWrite --settings ${quote(JSON.stringify({ autoMemoryEnabled: false }))} --append-system-prompt ${quote(crowRule(import.meta.env.DEV ? "main" : `v${window.App.appVersion}`))}`;
 };
 
 /** Long enough for a fresh spare to reach the daemon's session list. */
@@ -63,6 +65,15 @@ const SPAWN_GRACE_MS = 30_000;
 
 /** How long a question waits for Claude's prompt when the spare is still booting. */
 const READY_TIMEOUT_MS = 90_000;
+
+/**
+ * A turn silent this long is stuck (a hung tool, a request that never came
+ * back): Claude never takes a message typed behind it, so a follow-up resumes
+ * the conversation in a fresh process instead.
+ * ponytail: transcript silence, not a liveness probe - a real 10-minute
+ * tool call without a word also gets restarted.
+ */
+const STUCK_MS = 10 * 60_000;
 
 const sleep = (ms: number) => new Promise((done) => setTimeout(done, ms));
 
@@ -87,7 +98,7 @@ export const useCrowDialog = create<{
  * follows up in it, until ✓ Done in its drawer ends it.
  *
  * Mount once - the layout does: it also answers the crow's `/odin` calls.
- * Returns `ask`.
+ * Returns `ask`, and `resume` for an earlier chat.
  */
 export function useCrow() {
 	const utils = electronTrpc.useUtils();
@@ -185,16 +196,23 @@ export function useCrow() {
 		workspaceId: string,
 		cwd: string,
 	): Promise<boolean> => {
-		if (sessions.some((s) => s.sessionId === pane.id && s.isAlive)) return true;
+		const live = sessions.some((s) => s.sessionId === pane.id && s.isAlive);
+		if (live && pane.status !== "working") return true;
 		const id = pane.claudeSessionId;
-		const onDisk =
-			!!id &&
-			(await utils.client.terminal.readClaudeTranscript
-				.query({ sessionId: id })
-				.then(
-					() => true,
-					(error) => !String(error).includes("No transcript on this machine"),
-				));
+		const transcript = id
+			? await utils.client.terminal.readClaudeTranscript
+					.query({ sessionId: id })
+					.catch((error) =>
+						String(error).includes("No transcript on this machine")
+							? null
+							: undefined,
+					)
+			: null;
+		if (live) {
+			const at = transcript?.messages.at(-1)?.at;
+			if (!at || Date.now() - Date.parse(at) < STUCK_MS) return true;
+		}
+		const onDisk = transcript !== null;
 		if (!onDisk) return false;
 		await utils.client.terminal.kill
 			.mutate({ paneId: pane.id })
@@ -303,6 +321,13 @@ export function useCrow() {
 		// follow-up keeps the conversation's first question as its title.
 		if (!followUp) {
 			const title = sessionTitle(question, "Raven");
+			if (pane.claudeSessionId)
+				useCrowChats.getState().save({
+					sessionId: pane.claudeSessionId,
+					title,
+					cwd: place.cwd,
+					at: Date.now(),
+				});
 			store.setTabAutoTitle(pane.tabId, title);
 			store.setPaneAutoTitle(pane.id, title);
 			useTabsStore.setState((state) => ({
@@ -335,6 +360,53 @@ export function useCrow() {
 			await sleep(50);
 			await utils.client.terminal.write.mutate({ paneId: pane.id, data: "\r" });
 		})();
+		return true;
+	};
+
+	/** An earlier chat, back as the open conversation - Claude resumes it. */
+	const resume = async (chat: CrowChat): Promise<boolean> => {
+		const ensured = await ensureWorkspace();
+		if (!ensured.ok) return false;
+		const onDisk = await utils.client.terminal.readClaudeTranscript
+			.query({ sessionId: chat.sessionId })
+			.then(
+				() => true,
+				(error) => !String(error).includes("No transcript on this machine"),
+			);
+		if (!onDisk) {
+			useCrowChats.getState().drop(chat.sessionId);
+			toast.error("That chat is no longer on this Mac");
+			return false;
+		}
+		const open = crowPane(useTabsStore.getState().panes);
+		if (open) endSession(open.id);
+		const workspaceId = ensured.workspace.id;
+		const store = useTabsStore.getState();
+		const { tabId, paneId } = store.addTab(workspaceId, {
+			initialCwd: chat.cwd,
+		});
+		store.setTabAutoTitle(tabId, chat.title);
+		store.setPaneAutoTitle(paneId, chat.title);
+		useTabsStore.setState((state) => ({
+			panes: {
+				...state.panes,
+				[paneId]: {
+					...state.panes[paneId],
+					claudeSessionId: chat.sessionId,
+					odinTags: [CROW_TAG],
+				},
+			},
+		}));
+		await utils.client.terminal.createOrAttach.mutate({
+			paneId,
+			tabId,
+			workspaceId,
+			cwd: chat.cwd,
+			command: `cd ${quote(chat.cwd)} && ${crowCli()} --resume ${chat.sessionId}`,
+		});
+		useCrowChats.getState().save({ ...chat, at: Date.now() });
+		// The panel shows a conversation once the daemon lists it alive.
+		await utils.terminal.listDaemonSessions.invalidate();
 		return true;
 	};
 
@@ -394,7 +466,7 @@ export function useCrow() {
 		return () => clearInterval(timer);
 	}, []);
 
-	return ask;
+	return { ask, resume };
 }
 
 /** Start one backlog task on the board; its paneId, or null when it failed. */
@@ -474,7 +546,16 @@ function runOdinAction(
 		);
 	if (action === "add") {
 		if (!args.text?.trim()) return "Need text.";
+		const before = useOdinTasks.getState().tasks[0];
 		deps.add(args.text);
+		// start=true (the Telegram bot): launch it too, and answer with what it
+		// needs to watch the session. add() prepends, so the new task is first.
+		if (args.start === "true") {
+			const task = useOdinTasks.getState().tasks[0];
+			if (!task || task === before) return "Need text.";
+			void launchTask(task, deps);
+			return JSON.stringify({ id: task.id, title: task.title });
+		}
 		return `Added "${args.text.trim().split("\n")[0]}" to the backlog.`;
 	}
 	if (action === "start") {
@@ -514,10 +595,16 @@ function runOdinAction(
 				...(args.end && { end: args.end }),
 				...(max && { maxSessions: max }),
 			});
-		const now = useNextInLinePrompt.getState().offHours;
-		return now.enabled
+		const { offHours: now, nightLog } = useNextInLinePrompt.getState();
+		const status = now.enabled
 			? `Night Agent is on: ${now.start} to ${now.end}, at most ${now.maxSessions} sessions, one at a time from the top of Next in line.`
 			: "Night Agent is off.";
+		const log = nightLog
+			.slice(-60)
+			.map((entry) => `${new Date(entry.at).toLocaleString()}  ${entry.event}`);
+		return log.length
+			? `${status}\n\nWhat it did, newest last:\n${log.join("\n")}`
+			: `${status}\n\nNo night has run yet.`;
 	}
 	if (action === "state") return readState(args);
 	if (action === "set") return writeState(args);

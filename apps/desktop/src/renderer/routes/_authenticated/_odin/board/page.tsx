@@ -27,6 +27,8 @@ import {
 } from "react";
 import type { IconType } from "react-icons";
 import {
+	LuBellRing,
+	LuChevronDown,
 	LuChevronLeft,
 	LuChevronRight,
 	LuCircleCheck,
@@ -42,6 +44,8 @@ import {
 	LuPanelLeft,
 	LuPause,
 	LuPlay,
+	LuPlus,
+	LuRadioTower,
 	LuRepeat,
 	LuStar,
 	LuTerminal,
@@ -59,7 +63,12 @@ import { canClaimKeyboard } from "renderer/lib/keyboard";
 import { coldRestoreState } from "renderer/screens/main/components/WorkspaceView/ContentView/TabsContent/Terminal/state";
 import { Terminal } from "renderer/screens/main/components/WorkspaceView/ContentView/TabsContent/Terminal/Terminal";
 import * as terminalCache from "renderer/screens/main/components/WorkspaceView/ContentView/TabsContent/Terminal/v1-terminal-cache";
-import { claudeCli, useClaudeCommand } from "renderer/stores/claude-command";
+import {
+	claudeLaunch,
+	remoteControlName,
+	remoteControlOn,
+	useClaudeCommand,
+} from "renderer/stores/claude-command";
 import { useIdleClose } from "renderer/stores/idle-close";
 import { useSessionView } from "renderer/stores/session-view";
 import { useTabsStore } from "renderer/stores/tabs/store";
@@ -72,6 +81,7 @@ import {
 	SECTION_LABEL,
 } from "shared/board-section";
 import { duplicateSessions } from "shared/duplicate-sessions";
+import { type BriefUrgency, latestReply, sameReply } from "shared/latest-reply";
 import { claimedCheckout } from "shared/launch-gate";
 import { sessionUsageLabel } from "shared/machine-load";
 import { profileOf } from "shared/odin-profile";
@@ -82,7 +92,13 @@ import {
 	odinScreenWrite,
 	spacesForCursorForward,
 } from "shared/odin-screen-status";
-import { BOARD_TAGS, boardTags, normalizeTag } from "shared/odin-tags";
+import {
+	BOARD_TAGS,
+	boardTags,
+	CUSTOM_TAGS_KEY,
+	normalizeTag,
+	readCustomTags,
+} from "shared/odin-tags";
 
 /** Tags the card shows as their own pill instead of in the #tag line. */
 const PILL_TAGS = ["automation", "auto-started", "off-hours"];
@@ -102,6 +118,12 @@ import {
 import { PersonChip, personColor } from "../components/PersonChip";
 import { BUTTON, PILL } from "../components/pill";
 import { DueChip, OverdueMark, useReminders } from "../components/Reminders";
+import {
+	sessionThread,
+	useReplyWatch,
+	WatchMark,
+	WatchPill,
+} from "../components/ReplyWatch";
 import { TranscriptView } from "../components/TranscriptView";
 import { useBacklogReview, useReview } from "../hooks/useBacklogReview";
 import { CROW_TAG } from "../hooks/useCrow";
@@ -118,6 +140,7 @@ import type { BriefMessage } from "./brief";
 import {
 	actionItems,
 	ciRunning,
+	claimOpened,
 	elapsedLabel,
 	jiraIssue,
 	lastMessageAt,
@@ -134,11 +157,13 @@ import {
 	pullRequests,
 	reviewEnded,
 	reviewedPullRequest,
+	slackThread,
 	sourceLink,
 } from "./brief";
-import { ChatView } from "./ChatView";
+import { ChatView, interruptClaude } from "./ChatView";
 import { DiffView } from "./DiffView";
-import { BOARD_COLUMN_MIN_W, NextInLine } from "./NextInLine";
+import { BOARD_COLUMN_MIN_W, NextInLine, TonightCount } from "./NextInLine";
+import { NightAgentLive } from "./NightAgentLive";
 import { HoverBrief, MyTodos, SessionBrief } from "./SessionBrief";
 import {
 	PREFIX as REMIND_PREFIX,
@@ -146,6 +171,7 @@ import {
 	remindSession,
 	SessionReminders,
 } from "./SessionReminders";
+import { moveToVsCode } from "./vscode-move";
 
 /**
  * The same marks the feed tabs use, so a section header reads as its source at
@@ -228,6 +254,11 @@ function visibleScreen(paneId: string): string {
 			buffer.getLine(buffer.viewportY + row)?.translateToString(true) ?? "",
 		);
 	return lines.join("\n");
+}
+
+/** What a session is called on claude.ai under Remote Control. */
+function taskName(card: BoardCard): string {
+	return card.pane.odinTaskTitle ?? card.tabName;
 }
 
 /**
@@ -390,6 +421,30 @@ function ScrollbackView({ card, live }: { card: BoardCard; live: boolean }) {
 			</div>
 		</div>
 	);
+}
+
+function useSessionThread(card: BoardCard | undefined): string | null {
+	const paneId = card?.pane.id ?? "";
+	const mirrored = usePaneMeta((s) => s.sessionIdByPane[paneId]);
+	const added = usePaneMeta((s) => s.linksByPane[paneId]);
+	const brief = usePaneMeta((s) => s.briefByPane[paneId]);
+	const sessionId = card?.pane.claudeSessionId ?? mirrored ?? null;
+	const { data: transcript } =
+		electronTrpc.terminal.readClaudeTranscript.useQuery(
+			{ sessionId: sessionId ?? "" },
+			{ enabled: !!sessionId, retry: false, staleTime: 60_000 },
+		);
+	if (!card) return null;
+	return sessionThread({
+		...card.pane,
+		brief,
+		links: [
+			transcript ? slackThread(transcript.links ?? transcript.messages) : null,
+			...(added ?? []).map((link) =>
+				typeof link === "string" ? link : link.url,
+			),
+		],
+	});
 }
 
 /** The conversation behind a card, for the pills that read it. */
@@ -606,7 +661,7 @@ function useDropFor(pane: Pane | undefined) {
 
 function DropPill({ pane }: { pane: Pane }) {
 	const row = useDropFor(pane);
-	return row ? <DropHint evidence={row.evidence} /> : null;
+	return row ? <DropHint row={row} /> : null;
 }
 
 /** Another live card is on the same ask. The click opens it, to Done one. */
@@ -899,35 +954,18 @@ function ShellDot({
  * shell opens where the session launched - for feed sessions the catch-all
  * directory - while the agent cd'd into a worktree the shell never saw.
  */
-function ShellPlaceMenu({ card, shell }: { card: BoardCard; shell: Pane }) {
+function ShellPlaceMenu({
+	card,
+	shell,
+	onOpenInVsCode,
+}: {
+	card: BoardCard;
+	shell: Pane;
+	onOpenInVsCode: (dir: string) => void;
+}) {
 	const { data, here, inside, shellsIn } = useShellPlace(card, shell);
 	const write = electronTrpc.terminal.write.useMutation();
 	const updatePaneCwd = useTabsStore((s) => s.updatePaneCwd);
-	const openInApp = electronTrpc.external.openInApp.useMutation();
-	const copyText = electronTrpc.external.copyPath.useMutation();
-	/**
-	 * VS Code where the shell is, with the command that joins this
-	 * conversation on the clipboard for VS Code's terminal. Forked, so the two
-	 * don't both write into the live session.
-	 */
-	const openInVsCode = async (dir: string) => {
-		try {
-			await openInApp.mutateAsync({ path: dir, app: "vscode" });
-		} catch (error) {
-			return toast.error(`Couldn't open VS Code: ${String(error)}`);
-		}
-		const sessionId =
-			card.pane.claudeSessionId ??
-			usePaneMeta.getState().sessionIdByPane[card.pane.id];
-		if (!sessionId) return;
-		await copyText.mutateAsync(
-			`${claudeCli()} --resume ${sessionId} --fork-session`,
-		);
-		toast.success("Opened in VS Code", {
-			description:
-				"Paste in VS Code's terminal (⌃`) to join this session's conversation.",
-		});
-	};
 	const cd = (dir: string) => {
 		write.mutate({
 			paneId: shell.id,
@@ -1009,10 +1047,10 @@ function ShellPlaceMenu({ card, shell }: { card: BoardCard; shell: Pane }) {
 					<>
 						<DropdownMenuSeparator />
 						<DropdownMenuItem
-							title="Open this folder in VS Code, with this conversation's resume command on the clipboard"
+							title="Open this folder in VS Code, and continue this conversation there"
 							onSelect={() => {
 								const dir = here ?? targets[0]?.dir;
-								if (dir) void openInVsCode(dir);
+								if (dir) onOpenInVsCode(dir);
 							}}
 							className="flex items-center gap-2 text-xs"
 						>
@@ -1341,6 +1379,20 @@ function CardHoverContent({
  * The built-in list is closed (shared/odin-tags); the field at the bottom adds
  * your own, and × forgets one - its cards keep it in app-state, just unshown.
  */
+/** The tower a session wears beside its title while Remote Control is on for it. */
+function RemoteMark({ paneId }: { paneId: string }) {
+	const on = useClaudeCommand(
+		(s) => s.remoteControl === "selected" && s.remotePanes.includes(paneId),
+	);
+	if (!on) return null;
+	return (
+		<LuRadioTower
+			title="Remote Control on - follow it in claude.ai/code or the Claude app"
+			className="mr-1 inline size-3.5 align-[-2px] text-primary"
+		/>
+	);
+}
+
 function TagMenu({
 	x,
 	y,
@@ -1349,6 +1401,12 @@ function TagMenu({
 	customTags,
 	starred,
 	onStar,
+	onDone,
+	onRemind,
+	watching,
+	onWatch,
+	remote,
+	onRemote,
 	onKeep,
 	onToggle,
 	onAdd,
@@ -1362,6 +1420,14 @@ function TagMenu({
 	customTags: string[];
 	starred: boolean;
 	onStar: () => void;
+	onDone: () => void;
+	onRemind: (day: string) => void;
+	/** Whether replies on the session's thread ping you; unset when it has no thread. */
+	watching?: boolean;
+	onWatch: () => void;
+	/** Remote Control for this one session; unset unless Settings says "Selected sessions". */
+	remote?: boolean;
+	onRemote: () => void;
 	/** Set when the sweep suggests dropping this session. */
 	onKeep?: () => void;
 	onToggle: (tag: string) => void;
@@ -1371,6 +1437,9 @@ function TagMenu({
 }) {
 	const ref = useRef<HTMLDivElement>(null);
 	const [draft, setDraft] = useState("");
+	// Tags fold to one row: the list is long and most right-clicks are for
+	// Done or Remind.
+	const [isTagsOpen, setIsTagsOpen] = useState(false);
 
 	useEffect(() => {
 		const onKey = (event: KeyboardEvent) => {
@@ -1399,6 +1468,7 @@ function TagMenu({
 	return (
 		<div
 			ref={ref}
+			data-session-menu
 			style={{ left, top }}
 			className="fixed z-[60] w-[220px] rounded-[10px] border border-border bg-card p-2 shadow-[0_10px_30px_rgba(0,0,0,.5)]"
 		>
@@ -1413,6 +1483,61 @@ function TagMenu({
 				<span className="w-3 text-attention">★</span>
 				{starred ? "Unstar" : "Star"}
 			</button>
+			<button
+				type="button"
+				onClick={() => {
+					onDone();
+					onClose();
+				}}
+				className="flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left text-[12px] text-muted-foreground transition-colors hover:text-success"
+			>
+				<span className="w-3 text-success">✓</span>
+				Done
+			</button>
+			<div className="mb-1.5 border-b border-border pb-1.5">
+				<RemindButton
+					label="Remind me…"
+					onPick={(day) => {
+						onRemind(day);
+						onClose();
+					}}
+					className="flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left text-[12px] text-muted-foreground transition-colors hover:text-attention"
+				/>
+				{watching !== undefined && (
+					<button
+						type="button"
+						title="A notification whenever someone else replies in this session's Slack thread or Jira ticket"
+						onClick={() => {
+							onWatch();
+							onClose();
+						}}
+						className={cn(
+							"flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left text-[12px] transition-colors hover:text-primary",
+							watching ? "text-primary" : "text-muted-foreground",
+						)}
+					>
+						<LuBellRing className="size-3" aria-hidden />
+						{watching ? "Stop pinging me on replies" : "Ping me on replies"}
+					</button>
+				)}
+				{remote !== undefined && (
+					<button
+						type="button"
+						title="Follow and answer this session from claude.ai/code or the Claude app"
+						onClick={() => {
+							onRemote();
+							onClose();
+						}}
+						className={cn(
+							"flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left text-[12px] transition-colors hover:text-primary",
+							remote ? "text-primary" : "text-muted-foreground",
+						)}
+					>
+						<LuRadioTower className="size-3" aria-hidden />
+						{remote ? "Turn off Remote Control" : "Turn on Remote Control"}
+					</button>
+				)}
+			</div>
 			{onKeep && (
 				<button
 					type="button"
@@ -1427,51 +1552,66 @@ function TagMenu({
 					Keep
 				</button>
 			)}
-			<div className="mb-1.5 px-1 text-[10px] font-semibold uppercase tracking-[.4px] text-muted-foreground">
+			<button
+				type="button"
+				aria-expanded={isTagsOpen}
+				onClick={() => setIsTagsOpen(!isTagsOpen)}
+				className="flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left text-[12px] text-muted-foreground transition-colors hover:text-foreground"
+			>
+				<span className="w-3">{isTagsOpen ? "▾" : "▸"}</span>
 				Tags
-			</div>
-			<div className="flex max-h-[180px] flex-col overflow-y-auto">
-				{[...allTags, ...customTags].map((tag) => {
-					const on = tags.includes(tag);
-					return (
-						<div key={tag} className="group flex items-center">
-							<button
-								type="button"
-								onClick={() => onToggle(tag)}
-								className={cn(
-									"flex flex-1 items-center gap-2 rounded-md px-1.5 py-1 text-left text-[12px] transition-colors",
-									on
-										? "text-primary"
-										: "text-muted-foreground hover:text-foreground",
-								)}
-							>
-								<span className="w-3">{on ? "✓" : ""}</span>#{tag}
-							</button>
-							{customTags.includes(tag) && (
-								<button
-									type="button"
-									title="Remove this tag from the list"
-									onClick={() => onForget(tag)}
-									className="px-1.5 text-[12px] text-faint-foreground opacity-0 transition-opacity hover:text-foreground group-hover:opacity-100"
-								>
-									×
-								</button>
-							)}
-						</div>
-					);
-				})}
-			</div>
-			<input
-				value={draft}
-				onChange={(event) => setDraft(event.target.value)}
-				onKeyDown={(event) => {
-					if (event.key !== "Enter") return;
-					onAdd(draft);
-					setDraft("");
-				}}
-				placeholder="New tag…"
-				className="mt-1.5 w-full rounded-md border border-border bg-transparent px-1.5 py-1 text-[12px] text-foreground outline-none placeholder:text-faint-foreground focus:border-primary"
-			/>
+				{tags.length > 0 && (
+					<span className="min-w-0 flex-1 truncate text-right text-primary">
+						{tags.map((tag) => `#${tag}`).join(" ")}
+					</span>
+				)}
+			</button>
+			{isTagsOpen && (
+				<>
+					<div className="flex max-h-[180px] flex-col overflow-y-auto">
+						{[...allTags, ...customTags].map((tag) => {
+							const on = tags.includes(tag);
+							return (
+								<div key={tag} className="group flex items-center">
+									<button
+										type="button"
+										onClick={() => onToggle(tag)}
+										className={cn(
+											"flex flex-1 items-center gap-2 rounded-md px-1.5 py-1 text-left text-[12px] transition-colors",
+											on
+												? "text-primary"
+												: "text-muted-foreground hover:text-foreground",
+										)}
+									>
+										<span className="w-3">{on ? "✓" : ""}</span>#{tag}
+									</button>
+									{customTags.includes(tag) && (
+										<button
+											type="button"
+											title="Remove this tag from the list"
+											onClick={() => onForget(tag)}
+											className="px-1.5 text-[12px] text-faint-foreground opacity-0 transition-opacity hover:text-foreground group-hover:opacity-100"
+										>
+											×
+										</button>
+									)}
+								</div>
+							);
+						})}
+					</div>
+					<input
+						value={draft}
+						onChange={(event) => setDraft(event.target.value)}
+						onKeyDown={(event) => {
+							if (event.key !== "Enter") return;
+							onAdd(draft);
+							setDraft("");
+						}}
+						placeholder="New tag…"
+						className="mt-1.5 w-full rounded-md border border-border bg-transparent px-1.5 py-1 text-[12px] text-foreground outline-none placeholder:text-faint-foreground focus:border-primary"
+					/>
+				</>
+			)}
 		</div>
 	);
 }
@@ -1797,6 +1937,19 @@ function DevBoardPage() {
 			),
 		[daemonSessions],
 	);
+	// A just-launched session turns "working" before the next 5s poll lists its
+	// PTY, and "working" with no PTY is exactly what "⏸ died mid-turn" means.
+	// Ask the daemon again the moment one shows up instead of waiting it out.
+	const unlistedWorking = Object.values(panes)
+		.filter((pane) => pane.status === "working" && !alivePaneIds.has(pane.id))
+		.map((pane) => pane.id)
+		.sort()
+		.join(",");
+	// biome-ignore lint/correctness/useExhaustiveDependencies: the id list is the trigger
+	useEffect(() => {
+		if (unlistedWorking && daemonSessions)
+			void utils.terminal.listDaemonSessions.invalidate();
+	}, [unlistedWorking]);
 	// Panes whose PTY is alive but has no agent in it - Ctrl+C out of Claude and
 	// the shell outlives the conversation. Filled in by the screen scan below.
 	const [agentGonePaneIds, setAgentGonePaneIds] = useState<string[]>([]);
@@ -1841,6 +1994,11 @@ function DevBoardPage() {
 	// Working. Closed ones count - the approval usually lands after the session
 	// went quiet, and a card closed for idling keeps its column. The
 	// transcripts are the ones the cards' own pills already fetch.
+	// Each brief's URGENCY and the reply it judged, by session id - comes back
+	// with every brief warm (below), so no call of its own.
+	const [briefUrgency, setBriefUrgency] = useState<
+		Record<string, { urgency: BriefUrgency; replyAt: string }>
+	>({});
 	const mergeCandidates = Object.values(panes).flatMap((pane) => {
 		const sessionId = pane.claudeSessionId ?? sessionIdByPane[pane.id];
 		if (
@@ -1905,24 +2063,77 @@ function DevBoardPage() {
 			messages: BriefMessage[],
 			states: Parameters<typeof mergeReady>[1] | undefined,
 			brief: string | null | undefined,
+			candidate: (typeof mergeCandidates)[number],
 		) => boolean,
 		anyColumn = false,
 	) =>
 		mergeCandidates
-			.filter(({ brief, column }, i) => {
-				if (!anyColumn && column !== "permission") return false;
+			.filter((candidate, i) => {
+				if (!anyColumn && candidate.column !== "permission") return false;
 				const messages = mergeTranscripts[i]?.data?.messages;
-				return !!messages && test(messages, mergeStateQueries[i]?.data, brief);
+				return (
+					!!messages &&
+					test(
+						messages,
+						claimOpened(messages, mergeStateQueries[i]?.data),
+						candidate.brief,
+						candidate,
+					)
+				);
 			})
 			.map(({ paneId }) => paneId)
 			.join(",");
-	const mergeReadyKey = candidateKey(
-		(messages, states, brief) =>
-			onlyLookLeft(messages) ||
-			(!!states &&
-				(mergeReady(messages, states) ||
-					prsDropped(messages, states) ||
-					!!reviewEnded(reviewedPullRequest(brief, messages), states))),
+	/** All that's left is a click on what shipped: Done, whatever the column says. */
+	const finishedBarAClick = (
+		messages: BriefMessage[],
+		states: Parameters<typeof mergeReady>[1] | undefined,
+		brief: string | null | undefined,
+	) =>
+		onlyLookLeft(messages) ||
+		(!!states &&
+			(mergeReady(messages, states) ||
+				prsDropped(messages, states) ||
+				!!reviewEnded(reviewedPullRequest(brief, messages), states)));
+	const mergeReadyKey = candidateKey(finishedBarAClick);
+	// The brief's URGENCY per pane, while it judged the reply that's still the
+	// latest - a stale one says nothing about what the session wants now.
+	const urgencyKey = mergeCandidates
+		.map(({ paneId, sessionId }, i) => {
+			const judged = briefUrgency[sessionId];
+			const messages = mergeTranscripts[i]?.data?.messages;
+			return judged &&
+				messages &&
+				sameReply(latestReply(messages)?.at, judged.replyAt)
+				? `${paneId}:${judged.urgency}`
+				: "";
+		})
+		.filter(Boolean)
+		.join(",");
+	const urgencyByPane = useMemo(
+		() =>
+			new Map(
+				urgencyKey
+					? urgencyKey.split(",").map((entry) => {
+							const [paneId = "", urgency] = entry.split(":");
+							return [paneId, urgency as BriefUrgency];
+						})
+					: [],
+			),
+		[urgencyKey],
+	);
+	// Done cards whose latest reply asks you something: the Stop hook calls
+	// every unwatched turn end Done, so a question at the end of one landed
+	// there. Not when all that's left is a click - that stays Done.
+	const briefAsksKey = candidateKey(
+		(messages, states, brief, { paneId, column }) =>
+			column === "review" &&
+			urgencyByPane.get(paneId) === "needs-you" &&
+			!finishedBarAClick(messages, states, brief),
+		true,
+	);
+	const briefAsksPaneIds = useMemo(
+		() => new Set(briefAsksKey ? briefAsksKey.split(",") : []),
+		[briefAsksKey],
 	);
 	const droppedKey = candidateKey(
 		(messages, states, brief) =>
@@ -1947,7 +2158,10 @@ function DevBoardPage() {
 	// map only changes when a check starts or ends.
 	const ciKey = mergeCandidates
 		.map(({ paneId }, i) => {
-			const states = mergeStateQueries[i]?.data;
+			const states = claimOpened(
+				mergeTranscripts[i]?.data?.messages ?? [],
+				mergeStateQueries[i]?.data,
+			);
 			const checks = states ? ciRunning(states) : [];
 			return checks.length ? `${paneId}\t${checks.join("\t")}` : "";
 		})
@@ -1982,9 +2196,31 @@ function DevBoardPage() {
 				? "working"
 				: column === "permission" && mergeReadyPaneIds.has(paneId)
 					? "review"
-					: column,
-		[mergeReadyPaneIds, ciChecksByPane],
+					: column === "review" && briefAsksPaneIds.has(paneId)
+						? "permission"
+						: column,
+		[mergeReadyPaneIds, ciChecksByPane, briefAsksPaneIds],
 	);
+	// A reload paints cards before the daemon poll, transcripts and PR states
+	// answer, so they hop columns for a second. Hold a spinner until those
+	// first answers land, then never again. A disabled query (no PR urls)
+	// counts as answered. ponytail: 4s cap so a hung GitHub call can't blank
+	// the board.
+	const isAnswered = (query: { isFetched: boolean; fetchStatus: string }) =>
+		query.isFetched || query.fetchStatus === "idle";
+	const firstAnswersIn =
+		!isProfileLoading &&
+		daemonSessions !== undefined &&
+		[...loopQueries, ...mergeTranscripts, ...mergeStateQueries].every(
+			isAnswered,
+		);
+	const [isBoardSettled, setIsBoardSettled] = useState(false);
+	useEffect(() => {
+		if (isBoardSettled) return;
+		if (firstAnswersIn) return setIsBoardSettled(true);
+		const timer = setTimeout(() => setIsBoardSettled(true), 4_000);
+		return () => clearTimeout(timer);
+	}, [firstAnswersIn, isBoardSettled]);
 	/**
 	 * Live Claude that's been up a while. Continue is for nudging a session
 	 * that just came back (Resume, app/daemon restart) and is sitting idle;
@@ -2262,6 +2498,10 @@ function DevBoardPage() {
 		y: number;
 	} | null>(null);
 	const tagMenuDrop = useDropFor(tagMenu ? panes[tagMenu.paneId] : undefined);
+	const watches = useReplyWatch((s) => s.watches);
+	const remoteMode = useClaudeCommand((s) => s.remoteControl);
+	const remotePanes = useClaudeCommand((s) => s.remotePanes);
+	const toggleWatch = useReplyWatch((s) => s.toggle);
 	// One filter at a time, from the header dropdown: "tag:<tag>",
 	// "repo:<name>", "person:<name>", or "" for everything.
 	const [boardFilter, setBoardFilter] = useState("");
@@ -2289,17 +2529,11 @@ function DevBoardPage() {
 
 	// Tags you typed into the tag menu. Per machine, like the column above -
 	// Odin is local-only, so there's no other machine to sync them to.
-	const [customTags, setCustomTags] = useState<string[]>(() => {
-		try {
-			return JSON.parse(localStorage.getItem("odin:custom-tags") ?? "[]");
-		} catch {
-			return [];
-		}
-	});
+	const [customTags, setCustomTags] = useState<string[]>(readCustomTags);
 	const saveCustomTags = (next: string[]) => {
 		setCustomTags(next);
 		try {
-			localStorage.setItem("odin:custom-tags", JSON.stringify(next));
+			localStorage.setItem(CUSTOM_TAGS_KEY, JSON.stringify(next));
 		} catch {}
 	};
 
@@ -2357,6 +2591,88 @@ function DevBoardPage() {
 		}
 		setIsDiffOpen(false);
 		setIsShellOpen(true);
+	};
+	const openFolderInVsCode =
+		electronTrpc.external.openFolderInVsCode.useMutation();
+	const sendSessionToVsCode =
+		electronTrpc.external.sendSessionToVsCode.useMutation();
+	const copyText = electronTrpc.external.copyText.useMutation();
+	/**
+	 * The session moves to VS Code: its folder, and the same conversation in
+	 * VS Code's Claude Code panel, or its resume command on the clipboard
+	 * without that extension. Never two Claudes on one conversation: a turn
+	 * still running stays here, and an idle one is closed here once VS Code has
+	 * opened the folder (never before, so a failed open loses nothing), the way
+	 * idle sessions are - Resume brings it back.
+	 */
+	const openInVsCode = async (card: BoardCard, dir?: string) => {
+		const folder = dir ?? (await workDirOf(card));
+		if (!folder) return toast.error("This session has no folder to open");
+		const sessionId = claudeSessionIdOf(card);
+		const working = isWorkingNow(card.pane.id);
+		const moving = !!sessionId && !working;
+		const closeHere = async () => {
+			if (!agentPaneIds.has(card.pane.id)) return;
+			const column = withMergeReady(
+				boardColumn(
+					card.pane.status ?? "idle",
+					true,
+					card.pane.odinParked ?? false,
+				),
+				card.pane.id,
+			);
+			useTabsStore.setState((state) => ({
+				panes: {
+					...state.panes,
+					[card.pane.id]: {
+						...state.panes[card.pane.id],
+						odinClosedIn: column,
+					},
+				},
+			}));
+			await utils.client.terminal.kill
+				.mutate({ paneId: card.pane.id })
+				.catch(() => {});
+		};
+		const result = await moveToVsCode({
+			openFolder: () => openFolderInVsCode.mutateAsync({ path: folder }),
+			move:
+				moving && sessionId
+					? {
+							closeHere,
+							sendSession: () =>
+								sendSessionToVsCode.mutateAsync({ path: folder, sessionId }),
+						}
+					: undefined,
+		});
+		if (!result.opened) {
+			return toast.error("Couldn't open VS Code", {
+				description: `${String(result.error)}. The session is still running here.`,
+			});
+		}
+		const { inPanel } = result;
+		if (working) {
+			return toast.info("Opened the folder in VS Code", {
+				description:
+					"Claude is still working here, so the conversation stays in Odin. Open it again once the turn ends to move it.",
+			});
+		}
+		if (!sessionId || inPanel) {
+			return toast.success("Opened in VS Code", {
+				description: sessionId
+					? "The conversation continues in VS Code's Claude panel. Resume here brings it back."
+					: undefined,
+			});
+		}
+		const cwd = sessionCwd(card.pane);
+		await copyText.mutateAsync(
+			`${cwd ? `cd '${cwd.replaceAll("'", "'\\''")}' && ` : ""}${claudeLaunch(taskName(card), `--resume ${sessionId}`, card.pane.id)}`,
+		);
+		toast.success("Opened in VS Code", {
+			description:
+				"Paste in VS Code's terminal (⌃`) to continue this conversation there.",
+			duration: 30_000,
+		});
 	};
 	// Dev only: hold Vite's reloads while a session is open (see coalesceFullReloadPlugin).
 	const drawerOpen = !!drawerCard;
@@ -2671,6 +2987,25 @@ function DevBoardPage() {
 						? updatedAt(a) - updatedAt(b)
 						: updatedAt(b) - updatedAt(a)),
 		);
+	// Idle sits under the list, folded until opened; remembered per machine.
+	// Not in switchCards, so the next/prev keys still walk only what's in flight.
+	const idleSwitchCards = (cardsByStatus.get("idle") ?? []).toSorted(
+		(a, b) => updatedAt(b) - updatedAt(a),
+	);
+	const [isIdleSwitchOpen, setIsIdleSwitchOpen] = useState(() => {
+		try {
+			return localStorage.getItem("odin:drawer-sessions-idle") === "1";
+		} catch {
+			return false;
+		}
+	});
+	const toggleIdleSwitch = () => {
+		const next = !isIdleSwitchOpen;
+		setIsIdleSwitchOpen(next);
+		try {
+			localStorage.setItem("odin:drawer-sessions-idle", next ? "1" : "0");
+		} catch {}
+	};
 	// Minimized to a rail of status dots; remembered per machine.
 	const [isSwitchListMin, setIsSwitchListMin] = useState(() => {
 		try {
@@ -2751,6 +3086,7 @@ function DevBoardPage() {
 						applyAutoTags(r.tags);
 						// Missing until main restarts onto the procedure that returns it.
 						setBriefStatus(r.statuses ?? {});
+						setBriefUrgency(r.urgencies ?? {});
 						if (autoRename) applyAutoTitles(r.titles);
 					},
 				},
@@ -2905,6 +3241,28 @@ function DevBoardPage() {
 	};
 
 	/**
+	 * Remote Control for one session (Settings → Sessions → Selected sessions).
+	 * A live agent gets `/remote-control [Odin] <task>` typed at its prompt; a
+	 * closed one picks it up on its next Resume.
+	 */
+	const toggleRemote = (card: BoardCard) => {
+		const paneId = card.pane.id;
+		const wasOn = remoteControlOn(paneId);
+		useClaudeCommand.getState().toggleRemotePane(paneId);
+		const live = agentPaneIds.has(paneId);
+		if (wasOn)
+			return toast.info("Remote Control off from its next Resume", {
+				description: live
+					? "To disconnect now, type /remote-control in the session."
+					: undefined,
+			});
+		if (!live) return toast.success("Remote Control on from its next Resume");
+		const name = remoteControlName(taskName(card));
+		void sendContinue(paneId, `/remote-control ${name}`);
+		toast.success(`Remote Control on - "${name}"`);
+	};
+
+	/**
 	 * Pick a session back up. On a live PTY that's literally writing "Continue"
 	 * into the open prompt - nothing to reopen.
 	 *
@@ -2958,15 +3316,20 @@ function DevBoardPage() {
 	};
 
 	/** Ctrl+C the turn. Shared by the drawer's Interrupt and the chat's stop. */
-	const interruptPane = (paneId: string) => {
-		utils.client.terminal.write.mutate({ paneId, data: "\x03" });
+	const interruptPane = async (paneId: string) => {
+		const sent = await interruptClaude(
+			utils.client.terminal.write.mutate,
+			utils.client.terminal.readScreen.query,
+			paneId,
+		);
 		// Claude fires no Stop hook on an interrupt, so the card would read
 		// Working until the scan - and a second click would land Ctrl+C at the
-		// idle prompt and start quitting it. Same as Park.
+		// idle prompt and start quitting it. Same as Park. Not sent: Claude was
+		// already at its prompt, so the turn had ended.
 		useTabsStore.setState((state) => ({
 			panes: {
 				...state.panes,
-				[paneId]: { ...state.panes[paneId], status: "idle" },
+				[paneId]: { ...state.panes[paneId], status: sent ? "idle" : "review" },
 			},
 		}));
 	};
@@ -3024,7 +3387,11 @@ function DevBoardPage() {
 				}
 				queueResume(
 					card.pane,
-					`cd '${cwd}' && ${claudeCli()} --resume ${id} ${opening}`,
+					`cd '${cwd}' && ${claudeLaunch(
+						taskName(card),
+						`--resume ${id} ${opening}`,
+						card.pane.id,
+					)}`,
 					blocker,
 				);
 				return;
@@ -3123,11 +3490,11 @@ function DevBoardPage() {
 		// agent comes back with the job half done, so "Continue" rides on the
 		// command line. Typing it in once the TUI looked up raced Claude's boot
 		// - the write was swallowed and the card needed another Resume click.
-		const resumeCmd = `${
-			sessionId
-				? `${claudeCli()} --resume ${sessionId}`
-				: `${claudeCli()} --continue`
-		}${diedWorking || prompt ? ` ${opening}` : ""}`;
+		const resumeCmd = claudeLaunch(
+			taskName(card),
+			`${sessionId ? `--resume ${sessionId}` : "--continue"}${diedWorking || prompt ? ` ${opening}` : ""}`,
+			card.pane.id,
+		);
 		// You resumed it to work in it - bring it up. The drawer swaps its
 		// read-only history for the live terminal once the PTY is back, and that
 		// terminal takes the keyboard. Auto-resume never steals the screen.
@@ -3293,6 +3660,8 @@ function DevBoardPage() {
 		});
 		setIsComposerOpen(false);
 		if (result.ok) {
+			// Started from the drawer's session list: land in the new session.
+			if (drawerCard) usePendingFocus.getState().focus(result.paneId);
 			usePaneMeta.getState().setBrief(result.paneId, prompt || title);
 			usePaneMeta.getState().setTitle(result.paneId, title);
 			usePaneMeta.getState().setSessionId(result.paneId, result.sessionId);
@@ -3367,7 +3736,7 @@ function DevBoardPage() {
 	/**
 	 * Park a card by dragging it to Idle. Idle is the only drop target: the other
 	 * columns describe what the agent is actually doing, and dragging a card
-	 * can't make that true. A running turn is interrupted first (Esc) - a card
+	 * can't make that true. A running turn is interrupted first (Ctrl+C) - a card
 	 * sitting in Idle while its agent works would be a lie.
 	 */
 	const parkCard = async (card: BoardCard) => {
@@ -3389,9 +3758,11 @@ function DevBoardPage() {
 			),
 		);
 		if (card.pane.status === "working") {
-			await terminalWrite
-				.mutateAsync({ paneId: card.pane.id, data: "\x1b" })
-				.catch(() => {});
+			await interruptClaude(
+				terminalWrite.mutateAsync,
+				utils.client.terminal.readScreen.query,
+				card.pane.id,
+			).catch(() => {});
 		}
 		useTabsStore.setState((state) => ({
 			panes: {
@@ -3435,6 +3806,88 @@ function DevBoardPage() {
 	// The drawer's Done stays in the drawer: the next session opens and the
 	// finished row fades out of the side list before it ends.
 	const [leavingPaneId, setLeavingPaneId] = useState<string | null>(null);
+	// One row of the drawer's session list.
+	const switchRow = (card: BoardCard) => (
+		<HoverCard openDelay={1350}>
+			<HoverCardTrigger asChild>
+				<button
+					type="button"
+					onClick={() => openDrawer(card)}
+					onContextMenu={(event) => {
+						// Right-click → done, remind, star or tag.
+						event.preventDefault();
+						setTagMenu({
+							paneId: card.pane.id,
+							x: event.clientX,
+							y: event.clientY,
+						});
+					}}
+					className={cn(
+						"group/switch flex items-center gap-2 py-1.5 text-left text-xs transition-[translate,opacity] duration-[450ms]",
+						isSwitchListMin ? "justify-center" : "px-3",
+						card.pane.id === leavingPaneId
+							? "pointer-events-none -translate-x-6 bg-success/20 text-success-ink opacity-0"
+							: card.pane.id === drawerCard?.pane.id
+								? "bg-primary/15 font-semibold text-foreground"
+								: "text-muted-foreground hover:bg-accent hover:text-foreground",
+					)}
+				>
+					<span
+						className="size-2 shrink-0 rounded-full"
+						style={{
+							background: PANE_STATUS[card.status].dot,
+						}}
+					/>
+					{!isSwitchListMin && (
+						<span className="flex min-w-0 flex-col">
+							<span className="flex min-w-0 items-center gap-1.5">
+								<span className="truncate">
+									<WatchMark paneId={card.pane.id} />
+									<RemoteMark paneId={card.pane.id} />
+									{cardTitle(card)}
+								</span>
+							</span>
+							{switchStatus(card) && (
+								<span className="truncate text-[10.5px] font-normal text-faint-foreground">
+									{switchStatus(card)}
+								</span>
+							)}
+						</span>
+					)}
+					{!isSwitchListMin && (
+						// ponytail: a span, not a button - it sits inside the row's button.
+						// biome-ignore lint/a11y/useSemanticElements: nested in a button
+						<span
+							role="button"
+							tabIndex={-1}
+							title={card.pane.odinStarred ? "Unstar" : "Star - pin to the top"}
+							aria-label={card.pane.odinStarred ? "Unstar" : "Star"}
+							aria-pressed={!!card.pane.odinStarred}
+							onClick={(event) => {
+								event.stopPropagation();
+								toggleStar(card.pane.id);
+							}}
+							onKeyDown={() => {}}
+							className={cn(
+								"ml-auto shrink-0 rounded-[4px] px-0.5 text-attention hover:bg-attention/15",
+								!card.pane.odinStarred &&
+									"opacity-0 group-hover/switch:opacity-100",
+							)}
+						>
+							{card.pane.odinStarred ? "★" : "☆"}
+						</span>
+					)}
+				</button>
+			</HoverCardTrigger>
+			<HoverCardContent
+				side="right"
+				align="start"
+				className="max-h-[70vh] w-[400px] overflow-y-auto border-input bg-secondary p-3 shadow-[0_12px_40px_rgba(0,0,0,0.75)]"
+			>
+				<CardHoverContent card={card} text={cardText(card)} />
+			</HoverCardContent>
+		</HoverCard>
+	);
 	const markDoneInDrawer = (card: BoardCard) => {
 		const at = switchCards.findIndex((c) => c.pane.id === card.pane.id);
 		const next = switchCards[at + 1] ?? switchCards[at - 1];
@@ -3557,7 +4010,23 @@ function DevBoardPage() {
 		toast.success("All caught up");
 	};
 
+	// Done from wherever the card is: the open session moves the drawer on,
+	// another row in the drawer's list leaves the drawer where it is.
+	const doneAnywhere = (card: BoardCard) => {
+		if (card.pane.id === drawerCard?.pane.id) return markDoneInDrawer(card);
+		if (!drawerCard) return markDone(card);
+		toast.success("Done - removed from board", undoAction(endCard(card)));
+	};
+	const tagMenuCard = tagMenu
+		? [...cardsByStatus.values()]
+				.flat()
+				.find((c) => c.pane.id === tagMenu.paneId)
+		: undefined;
+
 	/** Done now; on `day` it pings and waits above the columns to be resumed. */
+	// The thread "Ping me on replies" watches for the right-clicked session.
+	const tagMenuThread = useSessionThread(tagMenuCard);
+
 	const remindMe = (card: BoardCard, day: string) => {
 		const sessionId =
 			card.pane.claudeSessionId ??
@@ -3579,7 +4048,7 @@ function DevBoardPage() {
 			},
 			day,
 		);
-		markDone(card);
+		doneAnywhere(card);
 		toast.success(`Reminding you ${day} - ${title.slice(0, 50)}`);
 	};
 
@@ -3670,12 +4139,18 @@ function DevBoardPage() {
 					</select>
 				)}
 
+				<span className="ml-auto" aria-hidden />
+				<NightAgentLive
+					onClick={() => {
+						if (!isNextOpen) toggleNext();
+					}}
+				/>
 				<button
 					type="button"
 					onClick={openSessions}
 					disabled={switchCards.length === 0}
 					title={`Open the first session in flight, with the session list beside it (${openSessionsKey})`}
-					className="ml-auto flex items-center gap-1.5 rounded-full border border-border bg-card px-2.5 py-1 text-[12px] font-medium text-muted-foreground hover:text-foreground disabled:opacity-50"
+					className="flex items-center gap-1.5 rounded-full border border-border bg-card px-2.5 py-1 text-[12px] font-medium text-muted-foreground hover:text-foreground disabled:opacity-50"
 				>
 					<LuPanelLeft className="size-3.5" aria-hidden />
 					Open sessions
@@ -3703,6 +4178,7 @@ function DevBoardPage() {
 						<LuEyeOff className="size-3.5" aria-hidden />
 					)}
 					Next in line
+					<TonightCount />
 				</button>
 			</div>
 
@@ -3729,6 +4205,24 @@ function DevBoardPage() {
 							: undefined
 					}
 					onStar={() => toggleStar(tagMenu.paneId)}
+					onDone={() => tagMenuCard && doneAnywhere(tagMenuCard)}
+					onRemind={(day) => tagMenuCard && remindMe(tagMenuCard, day)}
+					watching={tagMenuThread ? !!watches[tagMenuThread] : undefined}
+					onWatch={() =>
+						tagMenuCard &&
+						tagMenuThread &&
+						toggleWatch(
+							tagMenuThread,
+							cardTitle(tagMenuCard),
+							tagMenuCard.pane.id,
+						)
+					}
+					remote={
+						remoteMode === "selected"
+							? remotePanes.includes(tagMenu.paneId)
+							: undefined
+					}
+					onRemote={() => tagMenuCard && toggleRemote(tagMenuCard)}
 					onToggle={(tag) => toggleTag(tagMenu.paneId, tag)}
 					onClose={() => setTagMenu(null)}
 				/>
@@ -3839,11 +4333,18 @@ function DevBoardPage() {
 										!canCatchUp && "ml-auto",
 									)}
 								>
-									{cards.length}
+									{isBoardSettled ? cards.length : "-"}
 								</span>
 							</div>
 							<div className="flex flex-col gap-2 overflow-y-auto px-2 pt-0.5 pb-2.5">
-								{cards.length === 0 ? (
+								{!isBoardSettled ? (
+									<div className="flex justify-center py-6">
+										<output
+											aria-label="Loading sessions"
+											className="size-[14px] animate-spin rounded-full border-2 border-muted-foreground border-t-transparent"
+										/>
+									</div>
+								) : cards.length === 0 ? (
 									<div className="px-2 py-6 text-center text-xs text-muted-foreground">
 										Nothing here
 									</div>
@@ -3861,7 +4362,7 @@ function DevBoardPage() {
 													</div>
 												)}
 												{group.map((card) => (
-													<HoverCard key={card.pane.id} openDelay={350}>
+													<HoverCard key={card.pane.id} openDelay={1350}>
 														<HoverCardTrigger asChild>
 															{/* biome-ignore lint/a11y/useSemanticElements: a real <button> can't nest the reply <input>, so the card is a div with button semantics */}
 															<div
@@ -3886,7 +4387,7 @@ function DevBoardPage() {
 																}}
 																onClick={() => openDrawer(card)}
 																onContextMenu={(event) => {
-																	// Right-click → star or tag this session.
+																	// Right-click → done, remind, star or tag this session.
 																	event.preventDefault();
 																	setTagMenu({
 																		paneId: card.pane.id,
@@ -3915,6 +4416,8 @@ function DevBoardPage() {
 																		<OverdueMark
 																			itemKey={`session:${card.pane.id}`}
 																		/>
+																		<WatchMark paneId={card.pane.id} />
+																		<RemoteMark paneId={card.pane.id} />
 																		{cardTitle(card)}
 																	</div>
 																	<button
@@ -4376,6 +4879,24 @@ function DevBoardPage() {
 											{drawerLink.label} ↗
 										</button>
 									)}
+									<WatchPill paneId={drawerCard.pane.id} />
+									{remoteMode === "selected" && (
+										<button
+											type="button"
+											title="Follow and answer this session from claude.ai/code or the Claude app. Click to switch."
+											onClick={() => toggleRemote(drawerCard)}
+											className={cn(
+												"flex items-center gap-1 rounded-[5px] px-[7px] text-[11px] font-medium",
+												remotePanes.includes(drawerCard.pane.id)
+													? PILL.brand
+													: "bg-secondary text-muted-foreground hover:text-foreground",
+											)}
+										>
+											<LuRadioTower className="size-3" aria-hidden />
+											Remote Control
+											{remotePanes.includes(drawerCard.pane.id) ? " on" : ""}
+										</button>
+									)}
 									{sessionCwd(drawerCard.pane) && (
 										<span
 											title={sessionCwd(drawerCard.pane)}
@@ -4458,9 +4979,25 @@ function DevBoardPage() {
 											)}
 										</button>
 										{isShellOpen && drawerShell && (
-											<ShellPlaceMenu card={drawerCard} shell={drawerShell} />
+											<ShellPlaceMenu
+												card={drawerCard}
+												shell={drawerShell}
+												onOpenInVsCode={(dir) =>
+													void openInVsCode(drawerCard, dir)
+												}
+											/>
 										)}
 									</div>
+								)}
+								{drawerCard.pane.type === "terminal" && !inCatchUp && (
+									<button
+										type="button"
+										title="Open this session's worktree in VS Code and continue the conversation there"
+										onClick={() => void openInVsCode(drawerCard)}
+										className="shrink-0 rounded-md bg-secondary px-2 py-1 text-xs font-semibold text-muted-foreground hover:text-foreground"
+									>
+										VS Code
+									</button>
 								)}
 								{!catchUpLean && (
 									<button
@@ -4504,171 +5041,139 @@ function DevBoardPage() {
 								{/* The other sessions in flight, one click away - no Minimize
 								    and hunt for the card on the board. Hidden on a narrow
 								    drawer, where the chat needs the room. */}
-								{!inCatchUp && switchCards.length > 1 && (
-									<nav
-										aria-label="Sessions"
-										className={cn(
-											"hidden shrink-0 flex-col overflow-y-auto border-r border-border py-1.5 @3xl:flex",
-											isSwitchListMin ? "w-8" : "w-[210px]",
-										)}
-									>
-										<button
-											type="button"
-											title={
-												isSwitchListMin
-													? "Show session list"
-													: "Minimize session list"
-											}
-											aria-label={
-												isSwitchListMin
-													? "Show session list"
-													: "Minimize session list"
-											}
-											onClick={toggleSwitchList}
+								{!inCatchUp &&
+									switchCards.length + idleSwitchCards.length > 1 && (
+										<nav
+											aria-label="Sessions"
 											className={cn(
-												"mb-1 flex h-6 shrink-0 items-center text-muted-foreground hover:text-foreground",
-												isSwitchListMin ? "justify-center" : "justify-end px-2",
+												"hidden shrink-0 flex-col overflow-y-auto border-r border-border py-1.5 @3xl:flex",
+												isSwitchListMin ? "w-8" : "w-[210px]",
 											)}
 										>
-											{isSwitchListMin ? (
-												<LuChevronRight className="size-3.5" />
-											) : (
-												<LuChevronLeft className="size-3.5" />
-											)}
-										</button>
-										{!isSwitchListMin && (
-											<div className="mb-1 flex items-center gap-1.5 px-3 text-[11px] text-muted-foreground">
-												<select
-													value={switchSort}
-													onChange={(e) =>
-														pickSwitchSort(e.target.value as SwitchSort)
-													}
-													aria-label="Sort sessions"
-													title="Sort sessions"
-													className="min-w-0 cursor-pointer rounded border border-border bg-card px-1 py-0.5 outline-none hover:text-foreground"
-												>
-													{Object.entries(SWITCH_SORTS).map(
-														([value, label]) => (
-															<option key={value} value={value}>
-																{label}
-															</option>
-														),
-													)}
-												</select>
+											<div className="mb-1 flex h-6 shrink-0 items-center">
+												{!isSwitchListMin && (
+													<button
+														type="button"
+														onClick={() => setIsComposerOpen(true)}
+														title="New session - describe a task and start an agent session, then open it here"
+														className="ml-3 flex shrink-0 items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
+													>
+														<LuPlus className="size-3" />
+														New session
+													</button>
+												)}
 												<button
 													type="button"
-													onClick={toggleSwitchGrouped}
-													aria-pressed={isSwitchGrouped}
-													title="Group by status"
+													title={
+														isSwitchListMin
+															? "Show session list"
+															: "Minimize session list"
+													}
+													aria-label={
+														isSwitchListMin
+															? "Show session list"
+															: "Minimize session list"
+													}
+													onClick={toggleSwitchList}
 													className={cn(
-														"shrink-0 rounded border px-1 py-0.5 hover:text-foreground",
-														isSwitchGrouped
-															? "border-primary/50 bg-primary/15 text-foreground"
-															: "border-border bg-card",
+														"flex h-6 min-w-0 flex-1 items-center text-muted-foreground hover:text-foreground",
+														isSwitchListMin
+															? "justify-center"
+															: "justify-end px-2",
 													)}
 												>
-													Group
-												</button>
-												<span
-													className="ml-auto shrink-0 font-mono"
-													title={`Previous session ${prevSessionKey} - next session ${nextSessionKey}`}
-												>
-													{prevSessionKey} {nextSessionKey}
-												</span>
-											</div>
-										)}
-										{switchCards.map((card, index) => (
-											<Fragment key={card.pane.id}>
-												{isSwitchGrouped &&
-													card.status !== switchCards[index - 1]?.status &&
-													(isSwitchListMin ? (
-														index > 0 && (
-															<div className="mx-2 my-1 border-t border-border" />
-														)
+													{isSwitchListMin ? (
+														<LuChevronRight className="size-3.5" />
 													) : (
-														<div className="mt-2 mb-0.5 px-3 text-[10px] font-semibold uppercase tracking-[.4px] text-muted-foreground">
-															{PANE_STATUS[card.status].label}
-														</div>
-													))}
-												<HoverCard openDelay={350}>
-													<HoverCardTrigger asChild>
-														<button
-															type="button"
-															onClick={() => openDrawer(card)}
-															className={cn(
-																"group/switch flex items-center gap-2 py-1.5 text-left text-xs transition-all duration-[450ms]",
-																isSwitchListMin ? "justify-center" : "px-3",
-																card.pane.id === leavingPaneId
-																	? "pointer-events-none -translate-x-6 bg-success/20 text-success-ink opacity-0"
-																	: card.pane.id === drawerCard.pane.id
-																		? "bg-primary/15 font-semibold text-foreground"
-																		: "text-muted-foreground hover:bg-accent hover:text-foreground",
-															)}
-														>
-															<span
-																className="size-2 shrink-0 rounded-full"
-																style={{
-																	background: PANE_STATUS[card.status].dot,
-																}}
-															/>
-															{!isSwitchListMin && (
-																<span className="flex min-w-0 flex-col">
-																	<span className="truncate">
-																		{cardTitle(card)}
-																	</span>
-																	{switchStatus(card) && (
-																		<span className="truncate text-[10.5px] font-normal text-faint-foreground">
-																			{switchStatus(card)}
-																		</span>
-																	)}
-																</span>
-															)}
-															{!isSwitchListMin && (
-																// ponytail: a span, not a button - it sits inside the row's button.
-																// biome-ignore lint/a11y/useSemanticElements: nested in a button
-																<span
-																	role="button"
-																	tabIndex={-1}
-																	title={
-																		card.pane.odinStarred
-																			? "Unstar"
-																			: "Star - pin to the top"
-																	}
-																	aria-label={
-																		card.pane.odinStarred ? "Unstar" : "Star"
-																	}
-																	aria-pressed={!!card.pane.odinStarred}
-																	onClick={(event) => {
-																		event.stopPropagation();
-																		toggleStar(card.pane.id);
-																	}}
-																	onKeyDown={() => {}}
-																	className={cn(
-																		"ml-auto shrink-0 rounded-[4px] px-0.5 text-attention hover:bg-attention/15",
-																		!card.pane.odinStarred &&
-																			"opacity-0 group-hover/switch:opacity-100",
-																	)}
-																>
-																	{card.pane.odinStarred ? "★" : "☆"}
-																</span>
-															)}
-														</button>
-													</HoverCardTrigger>
-													<HoverCardContent
-														side="right"
-														align="start"
-														className="max-h-[70vh] w-[400px] overflow-y-auto border-input bg-secondary p-3 shadow-[0_12px_40px_rgba(0,0,0,0.75)]"
+														<LuChevronLeft className="size-3.5" />
+													)}
+												</button>
+											</div>
+											{!isSwitchListMin && (
+												<div className="mb-1 flex items-center gap-1.5 px-3 text-[11px] text-muted-foreground">
+													<select
+														value={switchSort}
+														onChange={(e) =>
+															pickSwitchSort(e.target.value as SwitchSort)
+														}
+														aria-label="Sort sessions"
+														title="Sort sessions"
+														className="shrink-0 cursor-pointer rounded border border-border bg-card px-1 py-0.5 outline-none hover:text-foreground"
 													>
-														<CardHoverContent
-															card={card}
-															text={cardText(card)}
-														/>
-													</HoverCardContent>
-												</HoverCard>
-											</Fragment>
-										))}
-									</nav>
-								)}
+														{Object.entries(SWITCH_SORTS).map(
+															([value, label]) => (
+																<option key={value} value={value}>
+																	{label}
+																</option>
+															),
+														)}
+													</select>
+													<button
+														type="button"
+														onClick={toggleSwitchGrouped}
+														aria-pressed={isSwitchGrouped}
+														title="Group by status"
+														className={cn(
+															"shrink-0 rounded border px-1 py-0.5 hover:text-foreground",
+															isSwitchGrouped
+																? "border-primary/50 bg-primary/15 text-foreground"
+																: "border-border bg-card",
+														)}
+													>
+														Group
+													</button>
+													<span
+														className="ml-auto min-w-0 truncate font-mono"
+														title={`Previous session ${prevSessionKey} - next session ${nextSessionKey}`}
+													>
+														{prevSessionKey} {nextSessionKey}
+													</span>
+												</div>
+											)}
+											{switchCards.map((card, index) => (
+												<Fragment key={card.pane.id}>
+													{isSwitchGrouped &&
+														card.status !== switchCards[index - 1]?.status &&
+														(isSwitchListMin ? (
+															index > 0 && (
+																<div className="mx-2 my-1 border-t border-border" />
+															)
+														) : (
+															<div className="mt-2 mb-0.5 px-3 text-[10px] font-semibold uppercase tracking-[.4px] text-muted-foreground">
+																{PANE_STATUS[card.status].label}
+															</div>
+														))}
+													{switchRow(card)}
+												</Fragment>
+											))}
+											{idleSwitchCards.length > 0 &&
+												(isSwitchListMin ? (
+													isIdleSwitchOpen && (
+														<div className="mx-2 my-1 border-t border-border" />
+													)
+												) : (
+													<button
+														type="button"
+														onClick={toggleIdleSwitch}
+														aria-expanded={isIdleSwitchOpen}
+														className="mt-2 mb-0.5 flex items-center gap-1 px-3 text-left text-[10px] font-semibold uppercase tracking-[.4px] text-muted-foreground hover:text-foreground"
+													>
+														{isIdleSwitchOpen ? (
+															<LuChevronDown className="size-3" />
+														) : (
+															<LuChevronRight className="size-3" />
+														)}
+														{PANE_STATUS.idle.label} ({idleSwitchCards.length})
+													</button>
+												))}
+											{isIdleSwitchOpen &&
+												idleSwitchCards.map((card) => (
+													<Fragment key={card.pane.id}>
+														{switchRow(card)}
+													</Fragment>
+												))}
+										</nav>
+									)}
 								<div className="flex min-h-0 min-w-0 flex-1 flex-col">
 									{isShellOpen && drawerShell ? (
 										// A shell in the same checkout, mounted like any other pane -
@@ -4694,6 +5199,7 @@ function DevBoardPage() {
 										drawerCard.pane.type === "terminal" ? (
 										<DiffView
 											key={drawerCard.pane.id}
+											paneId={drawerCard.pane.id}
 											cwd={sessionCwd(drawerCard.pane) ?? null}
 											claudeSessionId={drawerCard.pane.claudeSessionId ?? null}
 											workspaceId={drawerCard.workspaceId}
@@ -4726,7 +5232,7 @@ function DevBoardPage() {
 											onShowTerminal={() =>
 												setTerminalPaneId(drawerCard.pane.id)
 											}
-											onStop={() => interruptPane(drawerCard.pane.id)}
+											onStop={() => void interruptPane(drawerCard.pane.id)}
 										/>
 									) : agentPaneIds.has(drawerCard.pane.id) ? (
 										// Claude running - the real PTY, attached read/write. xterm is the
@@ -4839,25 +5345,27 @@ function DevBoardPage() {
 							)}
 							{/* The drawer keeps Esc for itself, so a turn needs its own stop:
 							    Ctrl+C, which stops Claude mid-turn. Only while working - at
-							    an idle prompt a second Ctrl+C quits Claude. */}
-							{drawerCard.pane.type === "terminal" && (
-								<button
-									type="button"
-									disabled={!isWorkingNow(drawerCard.pane.id)}
-									title={
-										isWorkingNow(drawerCard.pane.id)
-											? "Stop the agent (sends Ctrl+C to the session)"
-											: "Nothing to interrupt - the agent isn't working"
-									}
-									onClick={() => interruptPane(drawerCard.pane.id)}
-									className={cn(
-										"rounded-[7px] px-3 py-1.5 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-50",
-										BUTTON.secondary,
-									)}
-								>
-									■ Interrupt
-								</button>
-							)}
+							    an idle prompt a second Ctrl+C quits Claude. The chat view's
+							    composer has this same stop, so it shows in Terminal View only. */}
+							{drawerCard.pane.type === "terminal" &&
+								(!chatView || terminalPaneId === drawerCard.pane.id) && (
+									<button
+										type="button"
+										disabled={!isWorkingNow(drawerCard.pane.id)}
+										title={
+											isWorkingNow(drawerCard.pane.id)
+												? "Stop the agent (sends Ctrl+C to the session)"
+												: "Nothing to interrupt - the agent isn't working"
+										}
+										onClick={() => void interruptPane(drawerCard.pane.id)}
+										className={cn(
+											"rounded-[7px] px-3 py-1.5 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-50",
+											BUTTON.secondary,
+										)}
+									>
+										■ Interrupt
+									</button>
+								)}
 							{/* Back from Terminal View: out of a question peek, or the
 							    setting itself when the terminal is the choice. */}
 							{drawerCard.pane.type === "terminal" &&

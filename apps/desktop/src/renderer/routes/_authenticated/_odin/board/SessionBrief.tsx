@@ -11,6 +11,7 @@ import {
 	actionItems,
 	artifactLink,
 	byRepo,
+	claimOpened,
 	emailLink,
 	jiraIssue,
 	jiraKey,
@@ -44,6 +45,8 @@ import {
 export function MyTodos({ paneId }: { paneId: string }) {
 	const todos = usePaneMeta((s) => s.todosByPane[paneId]) ?? [];
 	const updateTodo = usePaneMeta((s) => s.updateTodo);
+	const editTodo = usePaneMeta((s) => s.editTodo);
+	const [editing, setEditing] = useState<number | null>(null);
 	if (!todos.length) return null;
 	return (
 		<ul className="flex flex-col gap-1">
@@ -60,17 +63,43 @@ export function MyTodos({ paneId }: { paneId: string }) {
 						aria-label="Done"
 						className="mt-1 shrink-0 accent-primary"
 					/>
-					<span
-						dir="auto"
-						className={cn(
-							"min-w-0 flex-1 whitespace-pre-wrap break-words",
-							todo.done
-								? "text-faint-foreground line-through"
-								: "text-soft-foreground",
-						)}
-					>
-						{todo.text}
-					</span>
+					{editing === i ? (
+						<textarea
+							dir="auto"
+							// biome-ignore lint/a11y/noAutofocus: opened by clicking the item
+							autoFocus
+							defaultValue={todo.text}
+							aria-label="Edit to-do"
+							onFocus={(event) => event.currentTarget.select()}
+							onBlur={(event) => {
+								editTodo(paneId, i, event.currentTarget.value);
+								setEditing(null);
+							}}
+							onKeyDown={(event) => {
+								if (event.key === "Enter" && !event.shiftKey) {
+									event.preventDefault();
+									editTodo(paneId, i, event.currentTarget.value);
+									setEditing(null);
+								}
+							}}
+							className="min-w-0 flex-1 resize-none rounded border border-border bg-transparent px-1 text-soft-foreground outline-none [field-sizing:content]"
+						/>
+					) : (
+						<button
+							type="button"
+							dir="auto"
+							title="Click to edit"
+							onClick={() => setEditing(i)}
+							className={cn(
+								"min-w-0 flex-1 cursor-text whitespace-pre-wrap break-words text-left",
+								todo.done
+									? "text-faint-foreground line-through"
+									: "text-soft-foreground",
+							)}
+						>
+							{todo.text}
+						</button>
+					)}
 					<button
 						type="button"
 						title="Remove to-do"
@@ -82,6 +111,27 @@ export function MyTodos({ paneId }: { paneId: string }) {
 				</li>
 			))}
 		</ul>
+	);
+}
+
+/**
+ * The agent's action items are replaced by its next message - this copies
+ * them into My notes, where they stay until you tick or remove them.
+ */
+function AddToMyTodos({ paneId, items }: { paneId: string; items: string[] }) {
+	const todos = usePaneMeta((s) => s.todosByPane[paneId]) ?? [];
+	const addTodos = usePaneMeta((s) => s.addTodos);
+	const have = new Set(todos.map((t) => t.from ?? t.text));
+	const added = items.every((item) => have.has(item.trim()));
+	return (
+		<button
+			type="button"
+			disabled={added}
+			onClick={() => addTodos(paneId, items)}
+			className="mt-1 text-[11px] text-link hover:underline disabled:text-faint-foreground disabled:no-underline"
+		>
+			{added ? "In my to-dos ✓" : "+ Add to my to-dos"}
+		</button>
 	);
 }
 
@@ -175,11 +225,14 @@ function StateChip({
 }
 
 // A Jira status category's colour: done like a merged PR, in progress like a
-// running agent, anything else (To Do, Backlog) a plain fact.
+// running agent, anything else (To Do, Backlog) a plain fact. A ticket closed
+// without the work (Rejected, Won't Do) is in the Done category too, so it's
+// matched by name and shown red.
 const JIRA_CHIP: Record<string, string> = {
 	Done: PILL.brand,
 	"In Progress": PILL.working,
 };
+const JIRA_DROPPED = /^(rejected|won'?t (do|fix)|declined|cancell?ed)$/i;
 
 /** A Jira ticket's status in its own words - "closed", "in review". */
 function JiraChip({
@@ -191,7 +244,11 @@ function JiraChip({
 	return (
 		<Chip
 			label={status.status.toLowerCase()}
-			className={JIRA_CHIP[status.statusCategory] ?? PILL.neutral}
+			className={
+				JIRA_DROPPED.test(status.status)
+					? PILL.danger
+					: (JIRA_CHIP[status.statusCategory] ?? PILL.neutral)
+			}
 		/>
 	);
 }
@@ -557,9 +614,11 @@ export function SessionBrief({
 			retry: false,
 			staleTime: 10_000,
 			refetchInterval: (query) =>
-				Object.values(query.state.data ?? {}).some(
-					(status) => status?.state === "OPEN" && status.mine !== false,
-				) && 15_000,
+				Object.values(
+					claimOpened(linkSource ?? [], query.state.data ?? {}),
+				).some((status) => status?.state === "OPEN" && status.mine !== false) &&
+				15_000,
+			select: (states) => claimOpened(linkSource ?? [], states),
 		},
 	);
 	// Only what's still on the panel - a URL the transcript stopped quoting, or
@@ -941,6 +1000,7 @@ export function SessionBrief({
 												</li>
 											))}
 										</ol>
+										<AddToMyTodos paneId={paneId} items={todo} />
 									</Section>
 								) : (
 									written.next && (
@@ -1040,6 +1100,15 @@ export function SessionBrief({
 				{facts && (
 					<div className="pt-2 text-[11px] text-muted-foreground">
 						{facts.turns} turns
+						{transcript?.usage && (
+							<span
+								title={`${transcript.usage.tokens.toLocaleString()} tokens in and out, cache included. Context: what the last reply read.${transcript.usage.usd === null ? "" : " Cost at Anthropic API list prices - a Claude plan or Bedrock bills differently."}`}
+							>
+								{` · ${compact(transcript.usage.tokens)} tokens · context ${compact(transcript.usage.context)}/${compact(transcript.usage.window)}`}
+								{transcript.usage.usd !== null &&
+									` · ~$${transcript.usage.usd.toFixed(2)}`}
+							</span>
+						)}
 						{facts.at &&
 							` · last activity ${new Date(facts.at).toLocaleString()}`}
 						{written?.writtenAt &&
@@ -1093,4 +1162,12 @@ export function SessionBrief({
 			</div>
 		</div>
 	);
+}
+
+/** 840, 64k, 1.2M. */
+function compact(n: number): string {
+	return Intl.NumberFormat("en", {
+		notation: "compact",
+		maximumFractionDigits: 1,
+	}).format(n);
 }

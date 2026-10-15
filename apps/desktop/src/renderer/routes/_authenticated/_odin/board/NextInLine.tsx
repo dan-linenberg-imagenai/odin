@@ -27,7 +27,7 @@ import type { AllItem } from "../all/all-items";
 import { allItems } from "../all/all-items";
 import { cleanTitle, TaskDetails } from "../all/TaskDetails";
 import { useStartAllItem } from "../all/use-start-item";
-import { DropHint } from "../components/DropHint";
+import { SweepDrop } from "../components/DropHint";
 import { FEED_TABS } from "../components/feed-counts";
 import { BUTTON, PILL } from "../components/pill";
 import {
@@ -210,6 +210,27 @@ function useNextInLineRows() {
 }
 
 /**
+ * Tonight's picks still waiting, as a moon and a count on the board's Next in
+ * line toggle - so a shut column still says the Night Agent has work queued.
+ * Stale picks (started, done, gone) don't count, same as the column.
+ */
+export function TonightCount() {
+	const picked = useNextInLinePrompt((s) => s.offHours.picked);
+	const { waiting } = useNextInLineQueue(true);
+	const count = waiting.filter((item) => picked.includes(item.key)).length;
+	if (!count) return null;
+	return (
+		<span
+			title={`${count} picked for tonight - the Night Agent starts them first`}
+			className="flex items-center gap-0.5 text-primary"
+		>
+			<LuMoon className="size-3" aria-hidden />
+			{count}
+		</span>
+	);
+}
+
+/**
  * Next in line as the column shows it: waiting rows in the model's order (or
  * All tasks order), due ones pinned on top. Shared by the column and the
  * Night Agent runner, so the night works through exactly the list you see.
@@ -341,18 +362,7 @@ export function NextInLine() {
 	const { markDone } = useDone();
 	const doneWithUndo = (item: AllItem) =>
 		markDone({ ...item, title: cleanTitle(item.title) });
-	// The Review sweep's DROPs, so a row it wants gone says so here too. By key,
-	// or by link for PRs, which Next in line keys by id and the sweep by repo#n.
 	const swept = useReview((review) => review.swept);
-	const dropFor = useMemo(() => {
-		const drops = swept.filter((row) => row.verdict === "DROP");
-		const byKey = new Map(drops.map((row) => [row.key, row]));
-		const byUrl = new Map(
-			drops.flatMap((row) => (row.url ? [[row.url, row] as const] : [])),
-		);
-		return (item: AllItem) =>
-			byKey.get(item.key) ?? (item.url ? byUrl.get(item.url) : undefined);
-	}, [swept]);
 	// Every verdict, not just DROPs: the hover says what the sweep found either way.
 	const sweptFor = useMemo(() => {
 		const byKey = new Map(swept.map((row) => [row.key, row]));
@@ -550,9 +560,7 @@ export function NextInLine() {
 									</span>
 								)}
 							</div>
-							{dropFor(item) && (
-								<DropHint evidence={dropFor(item)?.evidence ?? ""} />
-							)}
+							<SweepDrop itemKey={item.key} url={item.url} inline={false} />
 							{duplicate && (
 								<div
 									className={`mt-1 line-clamp-2 w-full rounded-[5px] px-[7px] py-px text-[11px] font-medium ${PILL.attention}`}

@@ -11,13 +11,23 @@ import {
 	useRef,
 	useState,
 } from "react";
-import { LuChevronRight, LuSquareTerminal, LuWrench } from "react-icons/lu";
+import {
+	LuChevronRight,
+	LuMic,
+	LuSquareTerminal,
+	LuWrench,
+} from "react-icons/lu";
 import { MarkdownRenderer } from "renderer/components/MarkdownRenderer";
 import { isHotkey, useHotkeyDisplay } from "renderer/hotkeys";
 import { electronTrpc } from "renderer/lib/electron-trpc";
 import { shellEscapePaths } from "renderer/screens/main/components/WorkspaceView/ContentView/TabsContent/Terminal/utils";
 import { draftFor, useChatDrafts } from "renderer/stores/chat-drafts";
 import { useCompacting } from "renderer/stores/compacting";
+import {
+	isDismissed,
+	useDismissedActions,
+	withDismissals,
+} from "renderer/stores/dismissed-actions";
 import { openUrl } from "renderer/stores/in-app-browser";
 import { useSessionView } from "renderer/stores/session-view";
 import {
@@ -25,6 +35,8 @@ import {
 	getVideoMimeType,
 	isPreviewableVideoFile,
 } from "shared/file-types";
+import { freshTldr, sameReply, tldrPlacement } from "shared/latest-reply";
+import { inputBoxRows, odinScreenStatus } from "shared/odin-screen-status";
 import {
 	insertSkill,
 	matchSkills,
@@ -36,6 +48,7 @@ import { actionItemLines } from "./brief";
 import { PlanCard, QuestionCard, ScreenMenuCard } from "./ChatPrompts";
 import { collectRefs, linkify } from "./chat-links";
 import { parseScreenMenu } from "./screen-menu";
+import { useHoldToTalk } from "./voice";
 
 type Item =
 	| {
@@ -46,7 +59,15 @@ type Item =
 			/** When you sent it (ms) - a turn's start. Unset for a mid-turn queued message. */
 			at?: number;
 	  }
-	| { kind: "text"; id: string; text: string; msg?: string; out?: number }
+	| {
+			kind: "text";
+			id: string;
+			text: string;
+			msg?: string;
+			out?: number;
+			/** When Claude wrote it (ms) - matches the brief to the reply it read. */
+			at?: number;
+	  }
 	| {
 			kind: "tool";
 			id: string;
@@ -102,6 +123,9 @@ type Line = {
 	};
 	/** A message you sent mid-turn rides in as a queued_command attachment. */
 	attachment?: { type?: string; prompt?: string | Block[] };
+	/** queue-operation lines: Claude holding a message until it is free. */
+	operation?: string;
+	content?: string;
 };
 
 /** First read takes the transcript's tail - a long session's JSONL runs to MBs. */
@@ -235,6 +259,7 @@ export function applyLines(items: Item[], lines: Line[]): Item[] {
 						text: block.text,
 						msg,
 						out,
+						at,
 					});
 				else if (block.type === "tool_use" && block.id) {
 					toolIndex.set(block.id, next.length);
@@ -253,6 +278,87 @@ export function applyLines(items: Item[], lines: Line[]): Item[] {
 	return next;
 }
 
+/**
+ * The messages Claude holds in its queue - sent while it was busy (a turn, a
+ * `!` command) - oldest first. Claude logs each enqueue at once, so they show
+ * even when Odin thought it was idle or the drawer was switched away.
+ */
+export function applyQueue(queue: string[], lines: Line[]): string[] {
+	const next = [...queue];
+	for (const raw of lines) {
+		const line = unqueue(raw);
+		// The log drifts (a remove that matches nothing, a resume that never
+		// logs its dequeues), so a message that lands as a turn also clears
+		// itself and everything queued before it.
+		if (line.type === "user") {
+			const text = blockText(line.message?.content).trim();
+			const index = text
+				? next.findIndex((item) => item.trim() && text.includes(item.trim()))
+				: -1;
+			if (index >= 0) next.splice(0, index + 1);
+			continue;
+		}
+		if (line.type !== "queue-operation") continue;
+		if (line.operation === "enqueue" && line.content) next.push(line.content);
+		else if (line.operation === "dequeue") next.shift();
+		// Esc pulls every queued message back into Claude's input box.
+		else if (line.operation === "popAll") next.length = 0;
+		else if (line.operation === "remove") {
+			const index = next.indexOf(line.content ?? "");
+			if (index >= 0) next.splice(index, 1);
+		}
+	}
+	return next;
+}
+
+/** A message you just sent, shown until Claude's transcript echoes it. */
+type Sent = {
+	id: number;
+	text: string;
+	previews?: Preview[];
+	seen: Set<string>;
+	/** Claude never took it: no turn, nothing queued. */
+	lost?: boolean;
+};
+
+/**
+ * Claude took something since the send: a user row that wasn't there, or the
+ * message waiting in its queue. Any new row counts - Claude rewrites some
+ * messages (a slash command echoes as its name), so the text can't decide.
+ */
+export function arrived(
+	items: { kind: string; id: string }[],
+	queue: string[],
+	sent: Pick<Sent, "text" | "seen">,
+): boolean {
+	return (
+		items.some((item) => item.kind === "user" && !sent.seen.has(item.id)) ||
+		queue.some((text) => text.includes(sent.text))
+	);
+}
+
+/**
+ * Claude echoed the sent message: a user row that was not there at the send
+ * holds its text. Older rows don't count - a photo sent alone has no text, and
+ * every row "includes" the empty string.
+ */
+export function isEchoed(
+	items: { kind: string; id: string; text?: string }[],
+	sent: Pick<Sent, "text" | "seen">,
+): boolean {
+	return items.some(
+		(item) =>
+			item.kind === "user" &&
+			!sent.seen.has(item.id) &&
+			(item.text ?? "").includes(sent.text),
+	);
+}
+
+/** Your queued messages: background-task notices ride the same queue. */
+export function yourQueued(queue: string[]): string[] {
+	return queue.filter((text) => !text.startsWith("<task-notification"));
+}
+
 function parseLines(parts: string[]): Line[] {
 	return parts.flatMap((part) => {
 		try {
@@ -264,10 +370,31 @@ function parseLines(parts: string[]): Line[] {
 }
 
 function readBytes(read: { kind: string; content: unknown }): Uint8Array {
+	// Native decode: Uint8Array.from(atob(...), fn) took ~100ms on a 4MB tail.
 	return read.kind === "bytes"
-		? Uint8Array.from(atob(read.content as string), (c) => c.charCodeAt(0))
+		? (
+				Uint8Array as unknown as { fromBase64: (b64: string) => Uint8Array }
+			).fromBase64(read.content as string)
 		: new TextEncoder().encode(read.content as string);
 }
+
+/**
+ * Where each transcript's reader stopped, kept when its view unmounts, so
+ * switching back to a session shows it at once and reads only what's new.
+ * ponytail: the last 20 sessions, oldest out first; a file rewritten shorter
+ * than the kept offset is not detected.
+ */
+interface LiveState {
+	offset: number | null;
+	skipFirstLine: boolean;
+	remainder: string;
+	decoder: TextDecoder;
+	start: number;
+	head: Uint8Array;
+	items: Item[];
+	queued: string[];
+}
+const liveCache = new Map<string, LiveState>();
 
 /**
  * An earlier chunk of the transcript, joined to `head` - the first half of the
@@ -305,6 +432,7 @@ export function splitEarlier(
  */
 function useLiveItems(path: string | null, workspaceId: string) {
 	const [items, setItems] = useState<Item[]>([]);
+	const [queued, setQueued] = useState<string[]>([]);
 	const [missing, setMissing] = useState<string | null>(null);
 	const [hasEarlier, setHasEarlier] = useState(false);
 	// Bumps once per loaded earlier chunk, in the same render as its rows.
@@ -317,21 +445,26 @@ function useLiveItems(path: string | null, workspaceId: string) {
 	useEffect(() => {
 		if (!path) return;
 		let cancelled = false;
-		let offset: number | null = null;
-		let skipFirstLine = false;
-		let remainder = "";
-		const decoder = new TextDecoder();
+		const saved = liveCache.get(path);
+		let offset: number | null = saved?.offset ?? null;
+		let skipFirstLine = saved?.skipFirstLine ?? false;
+		let remainder = saved?.remainder ?? "";
+		const decoder = saved?.decoder ?? new TextDecoder();
 		// Where the loaded window starts, and the cut line it starts with: the
 		// earlier chunk ends with that line's first half.
-		let start = 0;
-		let head: Uint8Array = new Uint8Array(0);
+		let start = saved?.start ?? 0;
+		let head: Uint8Array = saved?.head ?? new Uint8Array(0);
 		let loadingEarlier = false;
 		let timer: ReturnType<typeof setTimeout>;
 		let running = false;
 		let again = false;
-		setItems([]);
+		// Mirrors of the state below, so the cleanup keeps rows that match offset.
+		let shown = saved?.items ?? [];
+		let shownQueue = saved?.queued ?? [];
+		setItems(shown);
+		setQueued(shownQueue);
 		setMissing(null);
-		setHasEarlier(false);
+		setHasEarlier(start > 0);
 		const tick = async () => {
 			if (running) {
 				again = true;
@@ -379,7 +512,12 @@ function useLiveItems(path: string | null, workspaceId: string) {
 						skipFirstLine = false;
 					}
 					const lines = parseLines(parts);
-					if (lines.length) setItems((prev) => applyLines(prev, lines));
+					if (lines.length) {
+						shown = applyLines(shown, lines);
+						shownQueue = applyQueue(shownQueue, lines);
+						setItems(shown);
+						setQueued(shownQueue);
+					}
 				}
 				setMissing(null);
 			} catch (error) {
@@ -410,7 +548,8 @@ function useLiveItems(path: string | null, workspaceId: string) {
 				// ponytail: a tool row whose result sits past the cut stays without
 				// it; the tail window already dropped that result.
 				const rows = applyLines([], parseLines(split.lines));
-				setItems((prev) => [...rows, ...prev]);
+				shown = [...rows, ...shown];
+				setItems(shown);
 				setEarlierLoads((n) => n + 1);
 				setHasEarlier(from > 0);
 				return true;
@@ -427,10 +566,26 @@ function useLiveItems(path: string | null, workspaceId: string) {
 		return () => {
 			cancelled = true;
 			clearTimeout(timer);
+			// A read still in flight is dropped before it moves offset or rows.
+			liveCache.delete(path);
+			if (offset === null) return;
+			liveCache.set(path, {
+				offset,
+				skipFirstLine,
+				remainder,
+				decoder,
+				start,
+				head,
+				items: shown,
+				queued: shownQueue,
+			});
+			if (liveCache.size > 20)
+				liveCache.delete(liveCache.keys().next().value as string);
 		};
 	}, [path, workspaceId, utils]);
 	return {
 		items,
+		queued,
 		missing,
 		poke: () => pokeRef.current(),
 		hasEarlier,
@@ -624,7 +779,12 @@ const ToolGroup = memo(
 						lead ? "items-end" : "h-7 items-center",
 					)}
 				>
-					{lead && <div className="min-w-0">{lead}</div>}
+					{/* A line hugs the toggle. An action-items card takes the row: as a size container it has no width of its own. */}
+					{lead && (
+						<div className="min-w-0 has-[[data-action-items]]:flex-1">
+							{lead}
+						</div>
+					)}
 					{/* Live work shows once, in the turn's own "Working..." row below. */}
 					<button
 						type="button"
@@ -767,11 +927,18 @@ function UserBubble({
 	text,
 	images,
 	pending,
+	lost,
+	onShowTerminal,
+	onDismiss,
 	workspaceId,
 }: {
 	text: string;
 	images?: Preview[];
 	pending?: boolean;
+	/** Never reached Claude - say so, with a way to see why. */
+	lost?: boolean;
+	onShowTerminal?: () => void;
+	onDismiss?: () => void;
 	workspaceId?: string;
 }) {
 	// A launch prompt (task + standing rules + reply format) fills the screen;
@@ -790,8 +957,9 @@ function UserBubble({
 		<div
 			className={cn(
 				"mt-5 mb-1 ml-auto max-w-[75%] select-text cursor-text break-words rounded-2xl rounded-br-md border border-primary/30 bg-primary/15 px-4 py-2.5 text-[13.5px] leading-relaxed text-foreground shadow-sm first:mt-0",
-				pending && "opacity-60",
+				pending && !lost && "opacity-60",
 				pending && ENTER,
+				lost && "border-danger/50",
 			)}
 		>
 			{previews.length > 0 && (
@@ -829,6 +997,29 @@ function UserBubble({
 							{full ? "Hide Odin's prompt" : "Show Odin's prompt"}
 						</button>
 					)}
+				</div>
+			)}
+			{lost && (
+				<div className="mt-1.5 flex flex-wrap gap-x-3 text-[12px]">
+					<span className="text-danger">
+						Not delivered - Claude never took it
+					</span>
+					{onShowTerminal && (
+						<button
+							type="button"
+							onClick={onShowTerminal}
+							className="text-link hover:underline"
+						>
+							Show terminal
+						</button>
+					)}
+					<button
+						type="button"
+						onClick={onDismiss}
+						className="text-muted-foreground hover:text-foreground"
+					>
+						Dismiss
+					</button>
 				</div>
 			)}
 		</div>
@@ -1002,6 +1193,13 @@ export function isApprovalItem(item: string): boolean {
 	return /^\W*approve\b/i.test(item);
 }
 
+/** The latest reply that has an ACTION ITEMS block - the only one whose card shows. */
+export function lastActionsId(items: Item[]): string | undefined {
+	return items.findLast(
+		(item) => item.kind === "text" && !!splitActionItems(item.text).actions,
+	)?.id;
+}
+
 /** The numbered or bulleted lines of an ACTION ITEMS block; [] for "none". */
 export const actionItemList = actionItemLines;
 
@@ -1033,8 +1231,9 @@ export function isDoneItem(item: string): boolean {
  */
 export function itemOptions(item: string): { text: string; options: string[] } {
 	// An option may hold a link ("after [#826](url) merges"); a button shows its words.
+	// A trailing "(you only)" still counts: you pick, so the choices are buttons.
 	const match = item.match(
-		/\s*\[((?:[^[\]]|\[[^\]]*\]\([^)]*\))*\|(?:[^[\]]|\[[^\]]*\]\([^)]*\))*)\](?!\()\W*$/,
+		/\s*\[((?:[^[\]]|\[[^\]]*\]\([^)]*\))*\|(?:[^[\]]|\[[^\]]*\]\([^)]*\))*)\](?!\()\s*(?:\(you only\))?\W*$/i,
 	);
 	if (match?.index === undefined) return { text: item, options: [] };
 	return {
@@ -1044,6 +1243,16 @@ export function itemOptions(item: string): { text: string; options: string[] } {
 			.map((option) => option.replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").trim())
 			.filter(Boolean),
 	};
+}
+
+/**
+ * What an item's button sends: the typed answer, "Done" for a "tell me when"
+ * item, else nothing - and Claude is asked to do the item itself.
+ */
+export function itemReply(item: string, answer: string): string | undefined {
+	const typed = answer.trim();
+	if (typed) return typed;
+	return !isApprovalItem(item) && isDoneItem(item) ? "Done" : undefined;
 }
 
 type DoItem = (
@@ -1071,11 +1280,14 @@ function ActionItemRow({
 	item,
 	number,
 	onDo,
+	onDismiss,
 	buttonColumn,
 }: {
 	item: string;
 	number: number;
 	onDo: DoItem;
+	/** Hides the item now and in later replies; set when the session has a pane. */
+	onDismiss?: () => void;
 	/** Some item in the list has a button - line this one's number up with it. */
 	buttonColumn: boolean;
 }) {
@@ -1090,33 +1302,43 @@ function ActionItemRow({
 		onDo(text, number, approve, reply);
 	};
 	return (
-		<li className="flex items-start gap-2">
-			{/* The button leads the row - you scan for it first. */}
+		<li
+			className={cn(
+				"group grid grid-cols-[1rem_minmax(0,1fr)_auto] items-start gap-2",
+				// No button column: number + text only, or the text lands in the 1rem cell.
+				buttonColumn &&
+					"grid-cols-[64px_1rem_minmax(0,1fr)_auto] @max-md:grid-cols-[1rem_minmax(0,1fr)_auto]",
+			)}
+		>
+			{/* The button leads the row - you scan for it first. Too narrow (zoomed in), it drops under the text so the text keeps the width. */}
 			{isYouOnly(item) ? (
-				buttonColumn && <span className="w-[64px] shrink-0" />
+				buttonColumn && <span className="@max-md:hidden" />
 			) : (
 				<button
 					type="button"
 					title={
 						approve
 							? "Tell Claude you approve and to go ahead"
-							: asks
+							: asks && answer.trim()
 								? "Send your answer to Claude"
 								: done
 									? "Tell Claude this is done"
 									: "Ask Claude to do this for you"
 					}
-					disabled={sent || (asks && !answer.trim())}
-					onClick={() => send(asks ? answer.trim() : done ? "Done" : undefined)}
-					className={cn(ACTION_BUTTON, "w-[64px]")}
+					disabled={sent}
+					onClick={() => send(itemReply(item, answer))}
+					className={cn(
+						ACTION_BUTTON,
+						"w-[64px] @max-md:col-start-2 @max-md:row-start-2",
+					)}
 				>
 					{sent ? "Sent" : approve ? "Approve" : done ? "Done" : "Do it"}
 				</button>
 			)}
-			<span className="w-4 shrink-0 pt-px text-right text-[13px] tabular-nums text-muted-foreground">
+			<span className="pt-px text-right text-[13px] tabular-nums text-muted-foreground">
 				{number}.
 			</span>
-			<div className="min-w-0 flex-1">
+			<div className="min-w-0 [overflow-wrap:anywhere]">
 				<MarkdownRenderer
 					content={text}
 					style="default"
@@ -1131,7 +1353,7 @@ function ActionItemRow({
 								type="button"
 								title="Send this choice to Claude"
 								onClick={() => send(option)}
-								className={ACTION_BUTTON}
+								className={cn(ACTION_BUTTON, "max-w-full text-left")}
 							>
 								{option}
 							</button>
@@ -1143,11 +1365,24 @@ function ActionItemRow({
 								if (event.key === "Enter" && answer.trim()) send(answer.trim());
 							}}
 							placeholder={options.length ? "Or type your own" : "Your answer"}
-							className="min-w-[160px] flex-1 rounded-md border border-attention/30 bg-transparent px-2 py-0.5 text-[12px] outline-none placeholder:text-muted-foreground/70 focus:border-attention/60"
+							className="min-w-[min(160px,100%)] flex-1 rounded-md border border-attention/30 bg-transparent px-2 py-0.5 text-[12px] outline-none placeholder:text-muted-foreground/70 focus:border-attention/60"
 						/>
 					</div>
 				)}
 			</div>
+			{onDismiss ? (
+				<button
+					type="button"
+					title="Remove this item - Claude stops listing it"
+					aria-label="Remove this item"
+					onClick={onDismiss}
+					className="px-1 text-[13px] leading-none text-muted-foreground/50 opacity-0 hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
+				>
+					×
+				</button>
+			) : (
+				<span />
+			)}
 		</li>
 	);
 }
@@ -1160,24 +1395,66 @@ function ActionItemRow({
  * item asking you to tell Claude something gets a reply box, plus a button per
  * choice when Claude listed them.
  */
-function ActionItems({ text, onDo }: { text: string; onDo?: DoItem }) {
+function ActionItems({
+	text,
+	onDo,
+	paneId,
+	tldr,
+	full = false,
+	onToggle,
+}: {
+	text: string;
+	onDo?: DoItem;
+	/** Where dismissed items are kept; no X without it. */
+	paneId?: string;
+	/** The latest reply's TL;DR, which leads this card instead of a box of its own. */
+	tldr?: Tldr | null;
+	full?: boolean;
+	onToggle?: () => void;
+}) {
 	// text arrives linkified from ItemView.
-	const items = onDo ? actionItemList(text) : [];
-	const buttonColumn = !items.every(isYouOnly);
+	const dismissed = useDismissedActions(
+		(s) => s.panes.find((pane) => pane.paneId === paneId)?.items,
+	);
+	const dismiss = useDismissedActions((s) => s.dismiss);
+	// Numbered as Claude wrote them, so "action item 3" still means its 3.
+	const items = (onDo ? actionItemList(text) : [])
+		.map((item, index) => ({ item, number: index + 1 }))
+		.filter(({ item }) => !isDismissed(dismissed ?? [], item));
+	const buttonColumn = !items.every(({ item }) => isYouOnly(item));
 	return (
-		<div className="mt-2 rounded-xl border border-attention/35 bg-attention/[0.07] px-4 py-3">
-			<div className="mb-1.5 text-[11px] font-semibold uppercase tracking-[.08em] text-attention">
+		<div
+			data-action-items
+			className="@container mt-2 rounded-xl border border-attention/35 bg-attention/[0.07] px-4 py-3"
+		>
+			<div className="mb-1.5 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[.08em] text-attention">
 				Action items
+				{tldr?.long && onToggle && (
+					<FoldToggle full={full} onToggle={onToggle} />
+				)}
 			</div>
-			{onDo && items.length > 0 ? (
+			{tldr && (
+				<div
+					data-testid="reply-tldr"
+					className="mb-2 text-[13px] leading-relaxed text-foreground"
+				>
+					<span className="mr-1.5 text-[11px] font-semibold uppercase tracking-[.08em] text-muted-foreground">
+						TL;DR
+					</span>
+					<TldrText text={tldr.last} />
+				</div>
+			)}
+			{onDo && items.length === 0 && dismissed?.length ? (
+				<div className="text-[13px] text-muted-foreground">None left.</div>
+			) : onDo && items.length > 0 ? (
 				<ol className="flex flex-col gap-1">
-					{items.map((item, index) => (
+					{items.map(({ item, number }) => (
 						<ActionItemRow
-							// biome-ignore lint/suspicious/noArrayIndexKey: the list is fixed once written
-							key={index}
+							key={number}
 							item={item}
-							number={index + 1}
+							number={number}
 							onDo={onDo}
+							onDismiss={paneId ? () => dismiss(paneId, item) : undefined}
 							buttonColumn={buttonColumn}
 						/>
 					))}
@@ -1194,20 +1471,209 @@ function ActionItems({ text, onDo }: { text: string; onDo?: DoItem }) {
 	);
 }
 
+/** The `! command` blocks Claude hands you to run in the session, without the `!`. */
+export function bangCommands(text: string): string[] {
+	return [...text.matchAll(/```[^\n]*\n\s*!([\s\S]*?)\n?```/g)]
+		.map((match) => (match[1] ?? "").trim())
+		.filter(Boolean);
+}
+
+/** Runs a `! command` in Claude's session, where its output comes back to Claude. */
+function RunCommand({
+	command,
+	onRun,
+}: {
+	command: string;
+	onRun: (command: string) => Promise<void>;
+}) {
+	const [state, setState] = useState<"idle" | "sending" | "sent">("idle");
+	return (
+		<button
+			type="button"
+			disabled={state !== "idle"}
+			onClick={() => {
+				setState("sending");
+				onRun(command).then(
+					() => setState("sent"),
+					(error) => {
+						setState("idle");
+						toast.error(error instanceof Error ? error.message : String(error));
+					},
+				);
+			}}
+			title={`Run in this session: ! ${command}`}
+			className={cn(ACTION_BUTTON, "mt-2 flex max-w-full items-center gap-1.5")}
+		>
+			<LuSquareTerminal className="size-3.5 shrink-0" />
+			<span className="truncate font-mono">
+				{state === "sent" ? "Sent" : "Run"} ! {command.split("\n")[0]}
+			</span>
+		</button>
+	);
+}
+
+/** Claude on Bedrock stops on an expired AWS SSO token and says to run this. */
+export function needsAwsSsoLogin(text: string): boolean {
+	return /run 'aws sso login'/i.test(text);
+}
+
+/** Runs `aws sso login` for the user, then tells Claude to try again. */
+function AwsSsoLogin({ onSend }: { onSend: (text: string) => void }) {
+	const login = electronTrpc.terminal.awsSsoLogin.useMutation({
+		onSuccess: () =>
+			onSend("I signed in to AWS again (aws sso login). Retry what failed."),
+		onError: (error) => toast.error(`aws sso login failed: ${error.message}`),
+	});
+	return (
+		<button
+			type="button"
+			disabled={login.isPending || login.isSuccess}
+			onClick={() => login.mutate()}
+			title="Run aws sso login - approve it in the browser tab that opens - then Claude retries"
+			className={cn(ACTION_BUTTON, "mt-2")}
+		>
+			{login.isSuccess
+				? "Signed in - Claude is retrying"
+				: login.isPending
+					? "Approve in your browser…"
+					: "Sign in to AWS and retry"}
+		</button>
+	);
+}
+
+type Tldr = NonNullable<ReturnType<typeof freshTldr>>;
+
+/** A long reply cut to its first lines, fading out, until you ask for all of it. */
+function FoldedReply({
+	folded,
+	children,
+}: {
+	folded: boolean;
+	children: ReactNode;
+}) {
+	return (
+		<div
+			className={cn(
+				folded &&
+					"max-h-[6.5rem] overflow-hidden [mask-image:linear-gradient(to_bottom,black_55%,transparent)]",
+			)}
+		>
+			{children}
+		</div>
+	);
+}
+
+/** Switches a long latest reply between folded on its TL;DR and shown whole. */
+function FoldToggle({
+	full,
+	onToggle,
+}: {
+	full: boolean;
+	onToggle: () => void;
+}) {
+	return (
+		<button
+			type="button"
+			onClick={onToggle}
+			className="ml-auto text-[12px] font-normal normal-case tracking-normal text-link hover:underline"
+		>
+			{full ? "Show TL;DR" : "Show full reply"}
+		</button>
+	);
+}
+
+/**
+ * The latest reply in a few lines, and whether it wants something from you.
+ * A long reply opens folded on this; the button switches between the two.
+ */
+/** A TL;DR line rendered as Markdown (`code`, **bold**, links) that flows after its inline label. */
+function TldrText({ text }: { text: string }) {
+	return (
+		<MarkdownRenderer
+			content={text}
+			style="default"
+			allowHtml={false}
+			className={cn(
+				COMPACT_MARKDOWN,
+				"inline! text-foreground [&_article]:inline! [&_p]:inline!",
+			)}
+		/>
+	);
+}
+
+function TldrCard({
+	tldr,
+	full,
+	onToggle,
+}: {
+	tldr: Tldr;
+	full: boolean;
+	onToggle: () => void;
+}) {
+	const needsYou = tldr.urgency === "needs-you";
+	return (
+		<div
+			data-testid="reply-tldr"
+			className={cn(
+				"mt-2 rounded-xl border px-4 py-2.5",
+				needsYou
+					? "border-attention/35 bg-attention/[0.07]"
+					: "border-border bg-secondary/30",
+			)}
+		>
+			<div className="mb-1 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[.08em] text-muted-foreground">
+				TL;DR
+				{tldr.urgency && (
+					<span
+						className={cn(
+							"rounded-full px-1.5 py-px text-[10px] tracking-[.04em]",
+							needsYou
+								? "bg-attention/15 text-attention"
+								: "bg-secondary text-muted-foreground",
+						)}
+					>
+						{needsYou ? "Needs you" : "FYI"}
+					</span>
+				)}
+				{tldr.long && <FoldToggle full={full} onToggle={onToggle} />}
+			</div>
+			<div className="text-[13px] leading-relaxed text-foreground">
+				<TldrText text={tldr.last} />
+			</div>
+		</div>
+	);
+}
+
 const ItemView = memo(
 	function ItemView({
 		item,
 		refs,
 		onDo,
+		onSend,
+		onRun,
 		workspaceId,
+		paneId,
+		hideActions = false,
+		tldr,
 	}: {
 		item: Item;
 		refs: Map<string, string>;
 		workspaceId: string;
+		paneId?: string;
 		/** Changes only when a new ref appears - the memo's cue to re-link. */
 		refsKey: string;
 		onDo?: DoItem;
+		/** Types a message into the session - the AWS sign-in retries with it. */
+		onSend?: (text: string) => void;
+		/** Runs a `! command` in the live session - set only while its PTY is up. */
+		onRun?: (command: string) => Promise<void>;
+		/** An older reply's, or one still being followed by output: only the final card shows. */
+		hideActions?: boolean;
+		/** The latest reply's TL;DR, once the brief has read this very reply. */
+		tldr?: Tldr | null;
 	}) {
+		// A long latest reply opens on its TL;DR; this shows it whole.
+		const [full, setFull] = useState(false);
 		if (item.kind === "tool") return <ToolRow item={item} />;
 		if (item.kind === "compact") return <CompactRow item={item} />;
 		if (item.kind === "user")
@@ -1219,17 +1685,41 @@ const ItemView = memo(
 				/>
 			);
 		const { body, actions } = splitActionItems(linkify(item.text, refs));
+		const showsActions = !!actions && !hideActions;
+		const placement = tldrPlacement(tldr, showsActions);
+		const toggleFull = () => setFull((value) => !value);
 		return (
 			<div className="select-text cursor-text">
 				{body && (
-					<MarkdownRenderer
-						content={body}
-						style="default"
-						allowHtml={false}
-						className={COMPACT_MARKDOWN}
+					<FoldedReply folded={!!tldr?.long && !full}>
+						<MarkdownRenderer
+							content={body}
+							style="default"
+							allowHtml={false}
+							className={COMPACT_MARKDOWN}
+						/>
+					</FoldedReply>
+				)}
+				{placement === "card" && tldr && (
+					<TldrCard tldr={tldr} full={full} onToggle={toggleFull} />
+				)}
+				{showsActions && (
+					<ActionItems
+						text={actions}
+						onDo={onDo}
+						paneId={paneId}
+						tldr={placement === "action-items" ? tldr : null}
+						full={full}
+						onToggle={toggleFull}
 					/>
 				)}
-				{actions && <ActionItems text={actions} onDo={onDo} />}
+				{onSend && needsAwsSsoLogin(item.text) && (
+					<AwsSsoLogin onSend={onSend} />
+				)}
+				{onRun &&
+					bangCommands(item.text).map((command) => (
+						<RunCommand key={command} command={command} onRun={onRun} />
+					))}
 			</div>
 		);
 	},
@@ -1237,7 +1727,14 @@ const ItemView = memo(
 		prev.item === next.item &&
 		prev.refsKey === next.refsKey &&
 		prev.workspaceId === next.workspaceId &&
-		prev.onDo === next.onDo,
+		prev.paneId === next.paneId &&
+		prev.onDo === next.onDo &&
+		prev.onSend === next.onSend &&
+		prev.onRun === next.onRun &&
+		prev.hideActions === next.hideActions &&
+		prev.tldr?.last === next.tldr?.last &&
+		prev.tldr?.urgency === next.tldr?.urgency &&
+		prev.tldr?.long === next.tldr?.long,
 );
 
 /**
@@ -1297,8 +1794,15 @@ export function ChatView({
 		home && startCwd && sessionId
 			? transcriptPath(home, startCwd, sessionId)
 			: null;
-	const { items, missing, poke, hasEarlier, earlierLoads, loadEarlier } =
-		useLiveItems(path, workspaceId);
+	const {
+		items,
+		queued,
+		missing,
+		poke,
+		hasEarlier,
+		earlierLoads,
+		loadEarlier,
+	} = useLiveItems(path, workspaceId);
 	// The whole view takes a file drop, not just the reply box: a drop on the
 	// conversation used to do nothing. The composer owns the attachments.
 	const dropRef = useRef<(files: File[]) => void>(undefined);
@@ -1360,33 +1864,54 @@ export function ChatView({
 	);
 	// What you just sent, shown at once - Claude writes it to the transcript a
 	// beat later, and that echo replaces it.
-	const [pending, setPending] = useState<
-		{ id: number; text: string; previews?: Preview[] }[]
-	>([]);
+	const [pending, setPending] = useState<Sent[]>([]);
 	useEffect(() => {
-		setPending((list) =>
-			list.filter(
-				(sent) =>
-					!items.some(
-						(item) => item.kind === "user" && item.text.includes(sent.text),
-					),
-			),
-		);
+		setPending((list) => list.filter((sent) => !isEchoed(items, sent)));
 	}, [items]);
 	const onSent = (text: string, previews?: Preview[]) => {
 		const id = Date.now();
 		pinnedRef.current = true;
-		setPending((list) => [...list, { id, text, previews }]);
+		const seen = new Set(
+			itemsRef.current.flatMap((item) =>
+				item.kind === "user" ? [item.id] : [],
+			),
+		);
+		setPending((list) => [...list, { id, text, previews, seen }]);
 		// Claude takes a moment to write it; look again a few times meanwhile.
 		for (const ms of [150, 500, 1000]) setTimeout(poke, ms);
+		// Claude logs a message the moment it takes it, as a turn or queued
+		// mid-turn. Nothing by now: it never got there, and the bubble says so
+		// instead of waiting on a turn that isn't coming. Not for `onSend`,
+		// which may bring a dead PTY back first, or before a transcript loaded.
+		if (!onSend)
+			setTimeout(() => {
+				if (itemsRef.current.length === 0) return;
+				setPending((list) =>
+					list.map((sent) =>
+						sent.id === id &&
+						!arrived(itemsRef.current, queuedRef.current, sent)
+							? { ...sent, lost: true }
+							: sent,
+					),
+				);
+			}, 10_000);
 		// ponytail: an echo that never matches (Claude rewrote it) just expires.
-		// Not mid-turn: Claude writes a queued message only when it takes it.
+		// Not mid-turn or queued: Claude writes a queued message only when it takes it.
 		const expire = () =>
-			workingRef.current
+			workingRef.current ||
+			yourQueued(queuedRef.current).some((queuedText) =>
+				queuedText.includes(text),
+			)
 				? setTimeout(expire, 30_000)
-				: setPending((list) => list.filter((sent) => sent.id !== id));
+				: setPending((list) =>
+						list.filter((sent) => sent.id !== id || sent.lost),
+					);
 		setTimeout(expire, 30_000);
 	};
+	const itemsRef = useRef(items);
+	itemsRef.current = items;
+	const queuedRef = useRef(queued);
+	queuedRef.current = queued;
 	const workingRef = useRef(working);
 	workingRef.current = working;
 	const onSentRef = useRef(onSent);
@@ -1395,14 +1920,11 @@ export function ChatView({
 	// A ref, so a fresh arrow from the drawer doesn't re-render every message.
 	const onResumeRef = useRef(onResumeWith);
 	onResumeRef.current = onResumeWith;
-	const doItem = useCallback(
-		(item: string, number: number, approve: boolean, answer?: string) => {
-			const text = approve
-				? `Approved - go ahead with action item ${number}: ${item}`
-				: answer !== undefined
-					? `Action item ${number} (${item}): ${answer}`
-					: `Do action item ${number} for me: ${item}`;
+	const sendToClaude = useCallback(
+		(message: string) => {
+			const text = withDismissals(paneId, message);
 			if (onResumeRef.current) {
+				pinnedRef.current = true;
 				onResumeRef.current(text);
 				return;
 			}
@@ -1413,8 +1935,52 @@ export function ChatView({
 		},
 		[paneId, write.mutateAsync],
 	);
+	// "!" alone first: it switches Claude's prompt to bash mode, which a paste can't.
+	const runInClaude = useCallback(
+		async (command: string) => {
+			await write.mutateAsync({ paneId, data: "!" });
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			await typeIntoClaude(write.mutateAsync, paneId, command);
+		},
+		[paneId, write.mutateAsync],
+	);
+	const doItem = useCallback(
+		(item: string, number: number, approve: boolean, answer?: string) => {
+			sendToClaude(
+				approve
+					? `Approved - go ahead with action item ${number}: ${item}`
+					: answer !== undefined
+						? `Action item ${number} (${item}): ${answer}`
+						: `Do action item ${number} for me: ${item}`,
+			);
+		},
+		[sendToClaude],
+	);
+	const lastText = items.findLast(
+		(item): item is Extract<Item, { kind: "text" }> => item.kind === "text",
+	);
+	const lastTextId = lastText?.id;
+	// The brief's TL;DR of the latest reply. Asked for once the turn is over -
+	// mid-turn the latest reply is a moving target - and shown only while the
+	// brief read this very reply: a newer one makes it a wrong TL;DR, so the
+	// card waits for the brief that catches up.
+	const { data: brief } = electronTrpc.terminal.summarizeClaudeSession.useQuery(
+		{ sessionId: sessionId ?? "", settled: true },
+		{
+			enabled: !!sessionId && !!lastText && !working,
+			retry: false,
+			staleTime: 30_000,
+			refetchInterval: (query) =>
+				sameReply(lastText?.at, query.state.data?.replyAt) ? false : 15_000,
+		},
+	);
+	const tldr = working ? null : freshTldr(lastText, brief);
+	// Agents repeat their ACTION ITEMS in every reply; show one card, on the
+	// latest reply that has it. It stays while Claude works on your answer.
+	const actionsId = lastActionsId(items);
 	const scrollRef = useRef<HTMLDivElement>(null);
 	const pinnedRef = useRef(true);
+	const lastScrollTopRef = useRef(0);
 	// What was already there when the drawer opened shows still; only rows
 	// that arrive after it animate in.
 	const firstIdsRef = useRef<Set<string> | null>(null);
@@ -1482,6 +2048,7 @@ export function ChatView({
 		!screenMenu &&
 		items.length === 0 &&
 		pending.length === 0 &&
+		yourQueued(queued).length === 0 &&
 		(!missing || missing.startsWith("Not on disk yet"));
 	return (
 		// biome-ignore lint/a11y/noStaticElementInteractions: Page Up/Down from the composer jump the conversation to its top/bottom; a file dropped anywhere on it attaches
@@ -1518,8 +2085,14 @@ export function ChatView({
 				ref={scrollRef}
 				onScroll={(event) => {
 					const el = event.currentTarget;
-					pinnedRef.current =
+					// Only scrolling up lets go of the bottom. Rows that grow, shrink
+					// or swap (your message's echo) move scrollTop too, and used to
+					// unpin it right after a send.
+					const up = el.scrollTop < lastScrollTopRef.current;
+					lastScrollTopRef.current = el.scrollTop;
+					const atBottom =
 						el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+					if (atBottom || up) pinnedRef.current = atBottom;
 					if (el.scrollTop < el.clientHeight) fetchEarlier();
 				}}
 				// Links open in Odin's browser, like everywhere else on the board.
@@ -1601,7 +2174,20 @@ export function ChatView({
 								refs={refs}
 								refsKey={refsKey}
 								workspaceId={workspaceId}
+								paneId={paneId}
 								onDo={onShowTerminal || onResumeWith ? doItem : undefined}
+								hideActions={segment.id !== actionsId}
+								tldr={segment.id === lastTextId ? tldr : null}
+								onRun={
+									// Only a live PTY runs a ! command; a resume or the raven's send can't.
+									onShowTerminal && !onSend ? runInClaude : undefined
+								}
+								onSend={
+									// Only the latest reply: an old expired-token error is fixed.
+									(onShowTerminal || onResumeWith) && segment.id === lastTextId
+										? sendToClaude
+										: undefined
+								}
 							/>
 						);
 						return (
@@ -1631,8 +2217,25 @@ export function ChatView({
 							text={sent.text}
 							images={sent.previews}
 							pending
+							lost={sent.lost}
+							onShowTerminal={onShowTerminal}
+							onDismiss={() =>
+								setPending((list) =>
+									list.filter((other) => other.id !== sent.id),
+								)
+							}
 						/>
 					))}
+					{yourQueued(queued)
+						.filter((text) => !pending.some((sent) => text.includes(sent.text)))
+						.map((text, index) => (
+							<UserBubble
+								// biome-ignore lint/suspicious/noArrayIndexKey: the same text can be queued twice
+								key={`queued-${index}`}
+								text={text}
+								pending
+							/>
+						))}
 					{prompt && (
 						<div className={cn("flex min-w-0 gap-3", ENTER)}>
 							<OdinMark />
@@ -1761,7 +2364,9 @@ export function ChatView({
 				<Composer
 					paneId={paneId}
 					working={false}
-					onSent={() => {}}
+					onSent={() => {
+						pinnedRef.current = true;
+					}}
 					noTerminal={noTerminal}
 					onResume={onResumeWith}
 					placeholder="Reply to resume the session"
@@ -1784,7 +2389,7 @@ export function ChatView({
  * (Ctrl+X Ctrl+S) instead: mid-turn it lands right away, not after the turn.
  * Ctrl+Enter itself can't cross a PTY - it arrives as a plain Enter.
  */
-async function typeIntoClaude(
+export async function typeIntoClaude(
 	write: (input: { paneId: string; data: string }) => Promise<unknown>,
 	paneId: string,
 	text: string,
@@ -1797,6 +2402,41 @@ async function typeIntoClaude(
 		});
 	await new Promise((resolve) => setTimeout(resolve, 30));
 	await write({ paneId, data: now ? "\x18\x13" : "\r" });
+}
+
+/**
+ * Stops Claude's turn with Ctrl+C. Not Esc: with a message queued, Esc only
+ * pulls the queue back into Claude's input box and the turn runs on. And not
+ * when Claude already sits at its prompt - a hook can leave the card on
+ * Working - because there Ctrl+C stops every background agent the session
+ * runs, and a second one quits Claude. Two reads must agree it's idle: a
+ * snapshot caught mid-repaint can lack the spinner. Returns whether it sent it.
+ */
+export async function interruptClaude(
+	write: (input: { paneId: string; data: string }) => Promise<unknown>,
+	readScreen: (input: { paneId: string }) => Promise<{ text: string | null }>,
+	paneId: string,
+): Promise<boolean> {
+	const atPrompt = async () => {
+		const { text } = await readScreen({ paneId }).catch(() => ({
+			text: null,
+		}));
+		return !!text && odinScreenStatus(text) === "review";
+	};
+	if (await atPrompt()) {
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		if (await atPrompt()) return false;
+	}
+	await write({ paneId, data: "\x03" });
+	// Stopped before it answered, Claude puts your message back in its input
+	// box, and the next one sent from here would land after it: "test" then
+	// "test" went in as "testtest". Clear it: Ctrl+U empties a row, Backspace
+	// joins the row above.
+	await new Promise((resolve) => setTimeout(resolve, 500));
+	const { text } = await readScreen({ paneId }).catch(() => ({ text: null }));
+	const rows = text ? inputBoxRows(text) : 0;
+	if (rows > 0) await write({ paneId, data: `${"\x15\x7f".repeat(rows)}\x15` });
+	return true;
 }
 
 /**
@@ -1877,6 +2517,17 @@ function Composer({
 	dropRef.current = (files) => attach(files, true);
 	const inputRef = useRef<HTMLTextAreaElement>(null);
 	const write = electronTrpc.terminal.write.useMutation();
+	const utils = electronTrpc.useUtils();
+	// Hold Space on an empty box (or the mic) to talk - live sessions only.
+	const canTalk = !onResume && !onSend;
+	const voice = useHoldToTalk({
+		paneId,
+		onText: (text) => {
+			setDraft((d) => (d.trim() ? `${d.trimEnd()} ${text}` : text));
+			inputRef.current?.focus();
+		},
+		onTap: () => setDraft((d) => `${d} `),
+	});
 	const setChat = useSessionView((s) => s.setChat);
 	const sendNowKeys = useHotkeyDisplay("CHAT_SEND_NOW").text;
 	// Type `/` and the agent's skills/commands are searchable, like the New
@@ -1907,7 +2558,8 @@ function Composer({
 		const body = draft.trim();
 		const sending = bash ? [] : attached;
 		if (!body && sending.length === 0) return;
-		const text = bash ? `!${body}` : body;
+		// Not in bash mode: the note would run as part of the command.
+		const text = bash ? `!${body}` : withDismissals(paneId, body);
 		const paths = sending.map((item) => item.path);
 		setDraft("");
 		// Now, not via the effect: sending can remount this box (a resume, a
@@ -1915,15 +2567,15 @@ function Composer({
 		useChatDrafts.getState().save(paneId, "");
 		setBash(false);
 		if (!bash) setAttached([]);
-		if (onResume) {
-			onResume([text, ...paths].filter(Boolean).join(" "));
-			return;
-		}
 		// ponytail: blob URLs are never revoked - a few per session.
 		onSent(
 			text,
 			sending.map((item) => item.preview),
 		);
+		if (onResume) {
+			onResume([text, ...paths].filter(Boolean).join(" "));
+			return;
+		}
 		if (onSend) {
 			onSend([text, ...paths].filter(Boolean).join(" "));
 			return;
@@ -1932,6 +2584,12 @@ function Composer({
 			// A bracketed paste, not typing: only a pasted path becomes an attachment.
 			for (const path of paths)
 				await write.mutateAsync({ paneId, data: `\x1b[200~${path}\x1b[201~ ` });
+			// Claude reads a pasted image path off disk before it shows [Image #N],
+			// and an Enter that lands meanwhile is dropped: nothing sends. ~150ms
+			// was enough for a 6000x4000 JPEG; 500ms leaves room.
+			// ponytail: fixed wait, poll the screen for [Image #N] if it ever misses.
+			if (paths.length > 0)
+				await new Promise((resolve) => setTimeout(resolve, 500));
 			await typeIntoClaude(write.mutateAsync, paneId, text, now);
 		} catch (error) {
 			setDraft(body);
@@ -2010,6 +2668,14 @@ function Composer({
 								event.preventDefault();
 						}}
 						onKeyDown={(event) => {
+							if (
+								event.key === " " &&
+								(voice.holding() || (canTalk && !draft && !bash))
+							) {
+								event.preventDefault();
+								if (!event.repeat) voice.press();
+								return;
+							}
 							if (matches.length > 0 && !event.nativeEvent.isComposing) {
 								// While the skill menu is open it owns these keys.
 								if (event.key === "Escape") {
@@ -2052,7 +2718,20 @@ function Composer({
 								void send(isHotkey("CHAT_SEND_NOW", event.nativeEvent));
 							}
 						}}
-						placeholder={bash ? "Run a shell command" : placeholder}
+						onKeyUp={(event) => {
+							if (event.key === " ") voice.release();
+						}}
+						onBlur={voice.release}
+						readOnly={voice.phase !== "idle"}
+						placeholder={
+							voice.phase === "listening"
+								? voice.heard || "Listening... release Space to stop"
+								: voice.phase === "processing"
+									? voice.heard || "Transcribing..."
+									: bash
+										? "Run a shell command"
+										: placeholder
+						}
 						className={cn(
 							"block max-h-[220px] w-full resize-none bg-transparent text-[13.5px] leading-relaxed text-foreground outline-none placeholder:text-faint-foreground",
 							bash && "font-mono",
@@ -2079,16 +2758,50 @@ function Composer({
 						<span className="text-[11px] text-faint-foreground">
 							Enter to send · {sendNowKeys} to send now · Shift+Enter for a new
 							line · ! for bash · / for skills
+							{canTalk && " · hold Space to talk"}
 						</span>
+					)}
+					{canTalk && (
+						<button
+							type="button"
+							title="Hold to talk"
+							aria-label="Hold to talk"
+							onPointerDown={(event) => {
+								event.preventDefault();
+								voice.press(true);
+							}}
+							onPointerUp={voice.release}
+							onPointerLeave={voice.release}
+							className={cn(
+								"ml-auto flex size-7 shrink-0 items-center justify-center rounded-full text-muted-foreground hover:bg-secondary hover:text-foreground",
+								voice.phase !== "idle" && "bg-primary/15 text-primary",
+							)}
+						>
+							<LuMic
+								className={cn(
+									"size-4",
+									voice.phase === "listening" && "animate-pulse",
+								)}
+							/>
+						</button>
 					)}
 					{working ? (
 						<button
 							type="button"
 							title="Stop Claude"
 							onClick={() =>
-								onStop ? onStop() : write.mutate({ paneId, data: "\x03" })
+								onStop
+									? onStop()
+									: void interruptClaude(
+											write.mutateAsync,
+											utils.client.terminal.readScreen.query,
+											paneId,
+										)
 							}
-							className="ml-auto flex size-7 shrink-0 items-center justify-center rounded-full bg-foreground text-background hover:opacity-85"
+							className={cn(
+								"flex size-7 shrink-0 items-center justify-center rounded-full bg-foreground text-background hover:opacity-85",
+								!canTalk && "ml-auto",
+							)}
 						>
 							<span className="size-[9px] rounded-[2px] bg-background" />
 						</button>
@@ -2098,7 +2811,10 @@ function Composer({
 							title="Send (Enter)"
 							disabled={!draft.trim() && attached.length === 0}
 							onClick={() => void send()}
-							className="ml-auto flex size-7 shrink-0 items-center justify-center rounded-full bg-primary text-[14px] font-bold text-primary-foreground hover:brightness-110 disabled:opacity-40"
+							className={cn(
+								"flex size-7 shrink-0 items-center justify-center rounded-full bg-primary text-[14px] font-bold text-primary-foreground hover:brightness-110 disabled:opacity-40",
+								!canTalk && "ml-auto",
+							)}
 						>
 							↑
 						</button>

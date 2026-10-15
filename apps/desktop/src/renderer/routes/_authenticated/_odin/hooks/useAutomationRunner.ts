@@ -1,10 +1,13 @@
 import { useEffect, useRef } from "react";
 import { useLaunchTaskSession } from "renderer/hooks/useLaunchTaskSession";
+import { useTabsStore } from "renderer/stores/tabs/store";
 import { cronMatches, parseCron } from "shared/cron";
+import type { Pane } from "shared/tabs-types";
 import { BUILTIN_AUTOMATIONS } from "./builtin-automations";
 import { useOdinProfile } from "./useOdinProfile";
 import {
 	type OdinTask,
+	taskNotes,
 	taskPrompt,
 	useMyTasks,
 	useOdinTasks,
@@ -38,6 +41,46 @@ export function dueAutomations(tasks: OdinTask[], now: Date): OdinTask[] {
 		const cron = parseCron(task.cron);
 		return !!cron && cronMatches(cron, now);
 	});
+}
+
+export function taggedSessions(
+	panes: Record<string, Pane>,
+	tags: readonly string[],
+): Pane[] {
+	return Object.values(panes).filter(
+		(pane) =>
+			pane.odinTaskTitle &&
+			!pane.completed &&
+			pane.odinTags?.some((tag) => tags.includes(tag)),
+	);
+}
+
+/**
+ * What a run launches with. Null = skip it: it watches tags and no open
+ * session carries one. The tagged sessions ride in `description`, the text
+ * the agent's prompt is built from - `brief` is only kept on the card.
+ */
+export function automationRun(
+	task: OdinTask,
+	panes: Record<string, Pane>,
+): { description: string | null; brief: string } | null {
+	const notes = taskNotes(task);
+	if (!task.tags?.length)
+		return { description: notes || null, brief: taskPrompt(task) };
+	const sessions = taggedSessions(panes, task.tags);
+	if (sessions.length === 0) return null;
+	const description = [
+		...(notes ? [notes, ""] : []),
+		`Sessions on the board tagged ${task.tags.map((tag) => `#${tag}`).join(" or ")} (paneId is what Odin's local API takes):`,
+		...sessions.map(
+			(pane) =>
+				`- ${pane.odinTaskTitle} - paneId ${pane.id}, status ${pane.status ?? "idle"}, tags ${(pane.odinTags ?? []).map((tag) => `#${tag}`).join(" ")}`,
+		),
+		"",
+		// Without this the tag stays, and every tick runs the same session again.
+		`When you finish with a session, drop ${task.tags.map((tag) => `#${tag}`).join(" / ")} from its tags so the next run skips it: curl -sf http://127.0.0.1:$ODIN_PORT/odin --data-urlencode action=set --data-urlencode store=sessions --data-urlencode 'patch={"panes":{"<paneId>":{"odinTags":[<its other tags>]}}}'`,
+	].join("\n");
+	return { description, brief: `${task.title}\n\n${description}` };
 }
 
 /**
@@ -98,6 +141,8 @@ export function useAutomationRunner() {
 					// that sits waiting for a busy Mac, must not leave the job due on
 					// the next tick as well.
 					latest.current.markRun(task.id, minute);
+					const run = automationRun(task, useTabsStore.getState().panes);
+					if (run === null) continue;
 					const ensured = await latest.current.ensureWorkspace(null, {
 						askForFolder: false,
 					});
@@ -106,8 +151,7 @@ export function useAutomationRunner() {
 						key: task.id,
 						workspaceId: ensured.workspace.id,
 						title: task.title,
-						description: task.notes || null,
-						brief: taskPrompt(task),
+						...run,
 						// #automation on the card, so a session you didn't start
 						// reads as one at a glance on the board.
 						tags: ["automation"],

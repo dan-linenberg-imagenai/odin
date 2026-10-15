@@ -15,9 +15,9 @@ import { cn } from "@odin/ui/utils";
 import { useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
-import { FaGithub, FaSlack } from "react-icons/fa";
-import { LuCloudUpload, LuTrash2 } from "react-icons/lu";
-import { SiClickup, SiGmail, SiJira, SiNotion } from "react-icons/si";
+import { FaGithub, FaSlack, FaTelegram } from "react-icons/fa";
+import { LuCheck, LuCloudUpload, LuTrash2 } from "react-icons/lu";
+import { SiClaude, SiClickup, SiGmail, SiJira, SiNotion } from "react-icons/si";
 import {
 	ConnectProvider,
 	type Provider,
@@ -26,6 +26,7 @@ import { electronTrpc } from "renderer/lib/electron-trpc";
 import { useInAppBrowser } from "renderer/stores/in-app-browser";
 import { LINK_HOSTS } from "shared/in-odin-links";
 import { PROFILE_RESTORE_MS } from "shared/odin-profile";
+import { useClaudeSignIn } from "../../_odin/components/ClaudeSignInBanner";
 import {
 	useOdinFeeds,
 	useSetSlackReaction,
@@ -134,6 +135,7 @@ function ConnectionsSettings() {
 				title="Accounts"
 				description="Signed in for the active profile."
 			>
+				<ClaudeRow />
 				{ORDER.map((provider) => {
 					const row = status.data?.find((s) => s.provider === provider);
 					const meta = META[provider];
@@ -214,6 +216,10 @@ function ConnectionsSettings() {
 				})}
 			</SettingsSection>
 
+			<SettingsSection title="Phone">
+				<TelegramRow />
+			</SettingsSection>
+
 			<SettingsSection title="Links">
 				<OpenLinksInOdinRow />
 			</SettingsSection>
@@ -222,6 +228,208 @@ function ConnectionsSettings() {
 				<BackupRow />
 			</SettingsSection>
 		</SettingsPage>
+	);
+}
+
+/**
+ * The Claude account sessions run on - Mac-wide, not per profile, since it's
+ * Claude Code's own login. Reconnect runs the same `claude auth login` as the
+ * sign-in banner, e.g. to switch to another account or plan.
+ */
+function ClaudeRow() {
+	const { status, login, failed, signedInAs } = useClaudeSignIn();
+	const sendCode = electronTrpc.system.claudeLoginCode.useMutation();
+	const [code, setCode] = useState("");
+	const data = status.data;
+	return (
+		<div data-setting="Claude" className="px-4 py-3.5">
+			<div className="flex items-start justify-between gap-6">
+				<div className="flex items-start gap-3 min-w-0">
+					<div className="flex size-8 shrink-0 items-center justify-center">
+						<SiClaude className="size-5" />
+					</div>
+					<div className="min-w-0">
+						<div className="flex flex-wrap items-center gap-x-3 gap-y-0.5">
+							<span className="text-sm font-medium">Claude</span>
+							<StatusDot
+								loading={status.isLoading}
+								configured={data?.signedIn !== false}
+								identity={
+									data?.signedIn === null
+										? "Signed in outside Odin"
+										: (data?.identity ?? "Signed in")
+								}
+								error={failed}
+							/>
+						</div>
+						<div className="text-xs text-muted-foreground mt-0.5">
+							The account your sessions run on.
+						</div>
+						{signedInAs !== null && (
+							<div className="mt-1 flex items-center gap-1 text-xs font-medium text-success">
+								<LuCheck className="size-3.5" />
+								{signedInAs
+									? `Signed in as ${signedInAs}`
+									: "Signed in to Claude"}
+							</div>
+						)}
+						{login.isPending && (
+							<form
+								className="mt-2 flex items-center gap-2"
+								onSubmit={(event) => {
+									event.preventDefault();
+									if (code.trim()) sendCode.mutate({ code });
+									setCode("");
+								}}
+							>
+								<span className="text-xs text-muted-foreground">
+									Finish in your browser. If claude.ai shows a code, paste it:
+								</span>
+								<Input
+									value={code}
+									onChange={(event) => setCode(event.target.value)}
+									placeholder="Paste code"
+									className="h-8 w-40 text-xs"
+								/>
+							</form>
+						)}
+					</div>
+				</div>
+				<Button
+					variant="outline"
+					size="sm"
+					disabled={login.isPending}
+					onClick={() => login.mutate()}
+				>
+					{login.isPending
+						? "Waiting…"
+						: data?.signedIn === false
+							? "Sign in"
+							: "Reconnect"}
+				</Button>
+			</div>
+		</div>
+	);
+}
+
+/**
+ * Odin's Telegram bot (main/lib/telegram.ts): made with @BotFather, it adds and
+ * starts tasks from your phone and writes back when they wait for you.
+ */
+function TelegramRow() {
+	const status = electronTrpc.telegram.status.useQuery(undefined, {
+		// Pairing lands on its own when you tap Start in Telegram.
+		refetchInterval: (query) => {
+			const data = query.state.data;
+			return data?.state === "connected" && data.pairLink ? 2_000 : false;
+		},
+	});
+	const [token, setToken] = useState("");
+	const onError = (error: { message: string }) => toast.error(error.message);
+	const connect = electronTrpc.telegram.connect.useMutation({
+		onSuccess: () => {
+			setToken("");
+			void status.refetch();
+		},
+		onError,
+	});
+	const disconnect = electronTrpc.telegram.disconnect.useMutation({
+		onSuccess: () => void status.refetch(),
+		onError,
+	});
+	const openUrl = electronTrpc.external.openUrl.useMutation();
+	const data = status.data;
+	const connected = data?.state === "connected";
+	return (
+		<div data-setting="Telegram" className="px-4 py-3.5">
+			<div className="flex items-start justify-between gap-6">
+				<div className="flex items-start gap-3 min-w-0">
+					<div className="flex size-8 shrink-0 items-center justify-center">
+						<FaTelegram className="size-5" />
+					</div>
+					<div className="min-w-0">
+						<div className="flex flex-wrap items-center gap-x-3 gap-y-0.5">
+							<span className="text-sm font-medium">Telegram</span>
+							<StatusDot
+								loading={status.isLoading}
+								configured={connected}
+								identity={connected ? `@${data.bot}` : null}
+								error={data?.state === "error" ? data.error : null}
+							/>
+						</div>
+						<div className="text-xs text-muted-foreground mt-0.5">
+							Add and start tasks from your phone, and hear back when they wait
+							for you.
+						</div>
+						{!connected && (
+							<div className="mt-2 max-w-[70ch] space-y-2">
+								<div className="text-xs text-muted-foreground">
+									In Telegram, open @BotFather, send /newbot, pick any name and
+									username, and paste the token it gives you here. Odin sets the
+									bot's name and icon itself.
+								</div>
+								<form
+									className="flex items-center gap-2"
+									onSubmit={(event) => {
+										event.preventDefault();
+										if (token.trim()) connect.mutate({ token });
+									}}
+								>
+									<Input
+										type="password"
+										placeholder="123456789:AA..."
+										value={token}
+										onChange={(event) => setToken(event.target.value)}
+										className="h-8 text-xs"
+									/>
+									<Button
+										type="submit"
+										variant="outline"
+										size="sm"
+										disabled={!token.trim() || connect.isPending}
+									>
+										{connect.isPending ? "Connecting…" : "Connect"}
+									</Button>
+								</form>
+							</div>
+						)}
+						{connected && data.pairLink && (
+							<div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground max-w-[70ch]">
+								<span>
+									Last step: open the bot in Telegram and tap Start. That makes
+									you the only one it answers.
+								</span>
+								<Button
+									variant="outline"
+									size="sm"
+									onClick={() => openUrl.mutate(data.pairLink as string)}
+								>
+									Open in Telegram
+								</Button>
+							</div>
+						)}
+						{connected && !data.pairLink && (
+							<div className="text-xs text-muted-foreground mt-1 max-w-[70ch]">
+								Message @{data.bot}: any text starts a task, and /help lists the
+								commands. It runs while Odin is open on this Mac.
+							</div>
+						)}
+					</div>
+				</div>
+				{connected && (
+					<div className="flex items-center gap-1 shrink-0">
+						<Button
+							variant="ghost"
+							size="sm"
+							disabled={disconnect.isPending}
+							onClick={() => disconnect.mutate()}
+						>
+							Disconnect
+						</Button>
+					</div>
+				)}
+			</div>
+		</div>
 	);
 }
 

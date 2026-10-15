@@ -99,6 +99,7 @@ const EMULATOR_WRITE_QUEUE_LOW_WATERMARK_BYTES = 250_000;
  * buffered writes flush immediately (same behavior as before this feature).
  */
 const SHELL_READY_TIMEOUT_MS = 15_000;
+const BRACKETED_PASTE_START = "\x1b[200~";
 
 /**
  * Shell readiness lifecycle:
@@ -159,6 +160,8 @@ export class Session {
 
 	private subprocess: ChildProcess | null = null;
 	private subprocessReady = false;
+	/** A key held down (holdKey): the repeat timer. */
+	private heldKey: ReturnType<typeof setInterval> | null = null;
 	private emulator: HeadlessEmulator;
 	private attachedClients: Map<Socket, AttachedClient> = new Map();
 	private clientSocketsWaitingForDrain: Set<Socket> = new Set();
@@ -902,6 +905,12 @@ export class Session {
 	 * prompt. The headless emulator answers those queries directly (see
 	 * constructor), so dropping the renderer's duplicate is safe.
 	 *
+	 * A bracketed paste (`\x1b[200~`) also starts with ESC but is input, not a
+	 * reply: Odin sends every multi-line message to Claude that way (a diff
+	 * review, a chat message), and an agent session's shell can sit "pending"
+	 * for the whole 15s timeout. Dropping it there lost the message while the
+	 * Enter after it still went through.
+	 *
 	 * All other data - user keystrokes and preset commands alike - passes
 	 * through immediately. Buffering here previously froze workspaces when
 	 * shell init commands (e.g. fnm's `use-on-cd` hook) opened an interactive
@@ -911,10 +920,45 @@ export class Session {
 		if (!this.subprocess || !this.subprocessReady) {
 			throw new Error("PTY not spawned");
 		}
-		if (this.shellReadyState === "pending" && data.startsWith("\x1b")) {
+		if (
+			this.shellReadyState === "pending" &&
+			data.startsWith("\x1b") &&
+			!data.startsWith(BRACKETED_PASTE_START)
+		) {
 			return;
 		}
 		this.sendWriteToSubprocess(data);
+	}
+
+	/**
+	 * Hold a key down: write `data` now and every `everyMs` until releaseKey,
+	 * like a terminal repeating a held key. Timed here, next to the PTY, so a
+	 * busy renderer can't open a gap that reads as the key let go.
+	 */
+	holdKey(data: string, everyMs: number): void {
+		this.releaseKey();
+		if (!this.subprocess || !this.subprocessReady) {
+			throw new Error("PTY not spawned");
+		}
+		const started = Date.now();
+		this.sendWriteToSubprocess(data);
+		this.heldKey = setInterval(() => {
+			// ponytail: a 60s cap, for a release that never arrives.
+			if (
+				!this.subprocess ||
+				!this.subprocessReady ||
+				Date.now() - started > 60_000
+			) {
+				this.releaseKey();
+				return;
+			}
+			this.sendWriteToSubprocess(data);
+		}, everyMs);
+	}
+
+	releaseKey(): void {
+		if (this.heldKey) clearInterval(this.heldKey);
+		this.heldKey = null;
 	}
 
 	/**
@@ -984,6 +1028,7 @@ export class Session {
 	 * The actual PTY termination is async - use isTerminating to check state.
 	 */
 	kill(signal: string = "SIGHUP"): void {
+		this.releaseKey();
 		// Idempotent: if already terminating, don't send another signal
 		if (this.terminatingAt !== null) {
 			return;
@@ -1010,6 +1055,7 @@ export class Session {
 	dispose(): Promise<void> {
 		if (this.disposed) return Promise.resolve();
 		this.disposed = true;
+		this.releaseKey();
 
 		const pidsToKill = this.collectProcessPids();
 
