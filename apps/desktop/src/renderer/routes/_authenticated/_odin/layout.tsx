@@ -23,6 +23,7 @@ import {
 	HiOutlineClock,
 	HiOutlineCog6Tooth,
 	HiOutlineEllipsisVertical,
+	HiOutlineMoon,
 	HiOutlineScale,
 	HiOutlineViewColumns,
 } from "react-icons/hi2";
@@ -98,6 +99,18 @@ const RAIL_ITEMS = [
 		label: "Tasks",
 		Icon: HiOutlineClipboardDocumentCheck,
 	},
+	// Its own entry, not a feed tab: an automation isn't waiting on you, it runs itself.
+	{
+		to: "/automations" as const,
+		hotkey: "ODIN_AUTOMATIONS" as const,
+		label: "Automations",
+		Icon: HiOutlineBolt,
+	},
+	{
+		to: "/night-agent" as const,
+		label: "Night Agent",
+		Icon: HiOutlineMoon,
+	},
 ];
 
 /**
@@ -113,9 +126,8 @@ const SETTINGS_ITEM = {
 };
 
 /**
- * The views you visit, not live in - one "More" button under Tasks instead
- * of four icons. Their single-key hotkeys still jump straight
- * to each.
+ * The views you visit now and then - one "More" button, always the last of
+ * the top group. Each keeps its single-key hotkey.
  */
 const MORE_ITEMS = [
 	// Its own page rather than a feed tab: the strip answers "what's waiting
@@ -125,13 +137,6 @@ const MORE_ITEMS = [
 		hotkey: "ODIN_REVIEW" as const,
 		label: "Review",
 		Icon: HiOutlineScale,
-	},
-	// Not a feed tab either: an automation isn't waiting on you, it runs itself.
-	{
-		to: "/automations" as const,
-		hotkey: "ODIN_AUTOMATIONS" as const,
-		label: "Automations",
-		Icon: HiOutlineBolt,
 	},
 	{
 		to: "/insights" as const,
@@ -498,7 +503,7 @@ function OdinShell() {
 		// All - every source at once is the answer to "what's waiting on me".
 		const isFeeds = to === "/all";
 		const isActive = isFeeds ? isFeedRoute : !!matchRoute({ to, fuzzy: true });
-		const keys = railHotkeys[hotkey].text;
+		const keys = hotkey ? railHotkeys[hotkey].text : "";
 		const hint = keys ? `${label} (${keys})` : label;
 		return (
 			<Tooltip key={to} delayDuration={300}>

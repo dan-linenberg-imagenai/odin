@@ -293,7 +293,7 @@ async function expectHealthy() {
  * A rail entry, or one behind its "More" menu. Radix opens that menu on
  * pointerdown, so it takes a real mouse click rather than `.click()`.
  */
-const MORE_MENU = ["Review", "Automations", "Insights", "Session History"];
+const MORE_MENU = ["Review", "Insights", "Session History"];
 async function rail(label: string) {
 	if (!MORE_MENU.includes(label)) return click("button", label);
 	await mouseClick('button[aria-label="More"]');
@@ -378,6 +378,7 @@ const SCREENS: [string, string][] = [
 	["Review", "sweep now"],
 	["Automations", "add automation"],
 	["Insights", "who asks"],
+	["Night Agent", "work the backlog overnight"],
 	["Session History", "every session odin launched"],
 	["Dev Board", "next in line"],
 ];
