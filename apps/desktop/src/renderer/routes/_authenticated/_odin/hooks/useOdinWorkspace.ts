@@ -1,6 +1,7 @@
 import type { SelectWorkspace } from "@odin/local-db";
 import { useMemo, useState } from "react";
 import { electronTrpc } from "renderer/lib/electron-trpc";
+import { askServerFolder } from "renderer/routes/_authenticated/components/ServerFolderDialog";
 
 /**
  * Workspace selection for the Odin views, with zero-friction provisioning:
@@ -73,9 +74,7 @@ export function useOdinWorkspace() {
 						"No server folder set - set one in Settings → Sessions while connected.",
 				};
 			}
-			const typed = window.prompt(
-				"Sessions run on your remote server. Which folder there should they start in? (an absolute path, e.g. /home/me/repo)",
-			);
+			const typed = await askServerFolder();
 			if (!typed?.trim()) {
 				return {
 					ok: false,

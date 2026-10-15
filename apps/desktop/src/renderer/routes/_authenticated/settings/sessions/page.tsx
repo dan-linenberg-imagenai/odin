@@ -11,6 +11,7 @@ import { toast } from "@odin/ui/sonner";
 import { Switch } from "@odin/ui/switch";
 import { createFileRoute } from "@tanstack/react-router";
 import { electronTrpc } from "renderer/lib/electron-trpc";
+import { askServerFolder } from "renderer/routes/_authenticated/components/ServerFolderDialog";
 import {
 	type RemoteControlMode,
 	useClaudeCommand,
@@ -105,6 +106,9 @@ function DefaultRepoRow() {
 	const utils = electronTrpc.useUtils();
 	const { data: path, isLoading } = electronTrpc.repos.getDefault.useQuery();
 	const selectDirectory = electronTrpc.window.selectDirectory.useMutation();
+	// On a server the folder is on its disk, which no file picker can show.
+	const { data: remoteMode } =
+		electronTrpc.remoteConnections.isRemoteMode.useQuery();
 	const setDefault = electronTrpc.repos.setDefault.useMutation({
 		onSuccess: () => void utils.repos.getDefault.invalidate(),
 		onError: (error) => toast.error(error.message),
@@ -112,6 +116,11 @@ function DefaultRepoRow() {
 	const busy = isLoading || selectDirectory.isPending || setDefault.isPending;
 
 	const browse = async () => {
+		if (remoteMode) {
+			const typed = await askServerFolder(path ?? null);
+			if (typed) setDefault.mutate({ path: typed });
+			return;
+		}
 		const result = await selectDirectory.mutateAsync({
 			title: "Select default folder",
 			defaultPath: path ?? undefined,
