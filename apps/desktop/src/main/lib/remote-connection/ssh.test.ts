@@ -146,7 +146,19 @@ describe("buildRemoteStartCommand", () => {
 	it("starts without probing when no previous daemon is known", () => {
 		const command = buildRemoteStartCommand(config, startParams);
 		expect(command).not.toContain(ALREADY_RUNNING_MARKER);
-		expect(command).not.toContain("kill");
+		// No pid of its own to stop - only whatever of ours holds its port.
+		expect(command).not.toMatch(/kill \d/);
+	});
+
+	it("frees its port from a backend another Odin folder left running", () => {
+		const command = buildRemoteStartCommand(config, startParams);
+		// Ours only (this user's host-service processes), and only the one whose
+		// own environment says it serves this port.
+		expect(command).toContain(`pgrep -u "$(id -u)" -f 'host-service[.]js'`);
+		expect(command).toContain("grep -qxF -- 'HOST_SERVICE_PORT=48000'");
+		expect(command.indexOf("HOST_SERVICE_PORT=48000'")).toBeLessThan(
+			command.indexOf("setsid nohup node"),
+		);
 	});
 
 	it("adopts a previous daemon only on the same bundle and its own secret", () => {

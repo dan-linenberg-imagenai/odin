@@ -266,7 +266,23 @@ export function buildRemoteStartCommand(
 	const stamp = shellQuote(`${folder}/backend/.running-bundle`);
 	const hash = shellQuote(params.bundleHash);
 	const log = shellQuote(`${folder}/host-service.log`);
+	// Another backend of ours on this port - one a connect with a different
+	// Odin folder left running - would keep the port, the new one would die
+	// on EADDRINUSE, and the auth check would meet the old one's secret.
+	// Matched by the port in its own environment, so nothing else is touched;
+	// the sessions live in the pty-daemon and outlive it.
+	const portEnv = shellQuote(
+		`HOST_SERVICE_PORT=${config.remoteHostServicePort}`,
+	);
+	const stopOthers = [
+		`for p in $(pgrep -u "$(id -u)" -f 'host-service[.]js'); do`,
+		`tr '\\0' '\\n' < /proc/$p/environ 2>/dev/null | grep -qxF -- ${portEnv} || continue;`,
+		`kill $p 2>/dev/null;`,
+		`for i in $(seq 1 40); do kill -0 $p 2>/dev/null || break; sleep 0.25; done;`,
+		`kill -9 $p 2>/dev/null; done;`,
+	].join(" ");
 	const start = [
+		stopOthers,
 		`cd ${shellQuote(folder)}`,
 		`&& printf '%s' ${hash} > ${stamp}`,
 		`&& { ${env} setsid nohup node ${shellQuote(params.bundlePath)} >> ${log} 2>&1 < /dev/null & }`,
