@@ -274,6 +274,10 @@ function ConnectionsSettings() {
 				})}
 			</SettingsSection>
 
+			<SettingsSection title="Phone">
+				<PhoneRow />
+			</SettingsSection>
+
 			<SettingsSection title="Links">
 				<OpenLinksInOdinRow />
 			</SettingsSection>
@@ -754,6 +758,85 @@ function OpenLinksInOdinRow() {
 						/>
 					</SettingRow>
 				))}
+		</>
+	);
+}
+
+/**
+ * Odin on your iPhone (main/lib/phone): a LAN server for the mobile app. The
+ * QR code carries the token, so scanning it is the whole pairing.
+ */
+function PhoneRow() {
+	const status = electronTrpc.phone.status.useQuery();
+	const onError = (error: { message: string }) => toast.error(error.message);
+	const onSuccess = () => void status.refetch();
+	const setEnabled = electronTrpc.phone.setEnabled.useMutation({
+		onSuccess,
+		onError,
+	});
+	const resetToken = electronTrpc.phone.resetToken.useMutation({
+		onSuccess,
+		onError,
+	});
+	const data = status.data;
+	return (
+		<>
+			<SettingRow
+				label="Phone access"
+				htmlFor="phone-access"
+				description="Open the board and answer sessions from your iPhone on this Wi-Fi. Use on trusted networks only: the connection isn't encrypted."
+			>
+				<Switch
+					id="phone-access"
+					checked={data?.state === "on"}
+					disabled={setEnabled.isPending}
+					onCheckedChange={(enabled) => setEnabled.mutate({ enabled })}
+				/>
+			</SettingRow>
+			{data?.state === "error" && (
+				<div className="px-4 pb-3 text-xs text-danger select-text cursor-text">
+					{data.error}
+				</div>
+			)}
+			{data?.state === "on" && (
+				<div className="flex items-start gap-4 px-4 pb-4">
+					{(
+						[
+							["Safari", data.qr],
+							["iPhone app", data.appQr],
+						] as const
+					).map(([label, qr]) => (
+						<figure key={label} className="shrink-0 text-center">
+							<img
+								src={qr}
+								alt={`QR code for Odin in ${label}`}
+								className="size-36 rounded-md"
+							/>
+							<figcaption className="mt-1 text-xs text-muted-foreground">
+								{label}
+							</figcaption>
+						</figure>
+					))}
+					<div className="min-w-0 space-y-2 text-xs text-muted-foreground">
+						<div>
+							Scan with the iPhone camera. Safari: then Share, Add to Home
+							Screen. iPhone app: it opens Odin and pairs. The phone must be on
+							the same Wi-Fi as this Mac.
+						</div>
+						<div className="break-all font-mono select-text cursor-text">
+							{data.url}
+						</div>
+						<Button
+							variant="outline"
+							size="sm"
+							disabled={resetToken.isPending}
+							onClick={() => resetToken.mutate()}
+						>
+							New link (unpairs every phone)
+						</Button>
+					</div>
+				</div>
+			)}
 		</>
 	);
 }
