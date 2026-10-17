@@ -2,8 +2,23 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { httpBatchLink } from "@trpc/client";
 import { createTRPCReact } from "@trpc/react-query";
 import type { PhoneRouter } from "main/lib/phone/router";
-import { useEffect, useRef, useState } from "react";
+import {
+	type TextareaHTMLAttributes,
+	useEffect,
+	useLayoutEffect,
+	useRef,
+	useState,
+} from "react";
 import ReactDom from "react-dom/client";
+import {
+	LuArrowDown,
+	LuCheck,
+	LuChevronLeft,
+	LuCornerDownLeft,
+	LuPaperclip,
+	LuPlus,
+	LuStar,
+} from "react-icons/lu";
 import type { PaneStatus } from "shared/tabs-types";
 import superjson from "superjson";
 import {
@@ -13,9 +28,11 @@ import {
 	UploadChips,
 	useUploads,
 } from "./attach";
-import { Markdown } from "./markdown";
+import { BriefCard } from "./brief-card";
+import { boardSections, Dot, SessionCard, STATUS } from "./cards";
 import { type Pairing, parsePairLink } from "./pair-link";
 import { useSpeech } from "./speech";
+import { Transcript } from "./transcript";
 import "../globals.css";
 import "./mobile.css";
 
@@ -104,15 +121,6 @@ if (native?.Plugins?.App) {
 // ponytail: polling every 3s; a subscription when the board needs to feel instant.
 const POLL = 3_000;
 
-const STATUS: Record<PaneStatus, { color: string; label: string }> = {
-	permission: { color: "var(--attention)", label: "Needs you" },
-	working: { color: "var(--working)", label: "Working" },
-	review: { color: "var(--success)", label: "Final Review" },
-	idle: { color: "var(--faint-foreground)", label: "Idle" },
-	failed: { color: "var(--danger)", label: "Failed" },
-};
-const ORDER: PaneStatus[] = ["permission", "working", "review", "idle"];
-
 const paneInHash = () => location.hash.match(/^#\/s\/(.+)$/)?.[1] ?? null;
 
 const usePaneFromHash = () => {
@@ -124,15 +132,6 @@ const usePaneFromHash = () => {
 	}, []);
 	return paneId;
 };
-
-function Dot({ status }: { status: PaneStatus }) {
-	return (
-		<span
-			className="inline-block size-2 shrink-0 rounded-full"
-			style={{ background: STATUS[status].color }}
-		/>
-	);
-}
 
 /** A plain message as the error line's input. */
 const textError = (message: string | null) => (message ? { message } : null);
@@ -174,44 +173,36 @@ function Home() {
 	const start = phone.start.useMutation({
 		onSuccess: () => void board.refetch(),
 	});
+	const star = phone.star.useMutation({
+		onSuccess: () => void board.refetch(),
+	});
 	const [adding, setAdding] = useState(false);
 	const sessions = board.data?.sessions ?? [];
 	return (
 		<div className="min-h-dvh pb-24">
 			<header className="sticky top-0 z-10 border-b border-border bg-background/95 px-4 pt-[calc(env(safe-area-inset-top)+12px)] pb-2 backdrop-blur">
-				<h1 className="text-2xl font-bold">Odin</h1>
+				<h1 className="text-2xl font-bold">Board</h1>
 			</header>
 			<ErrorLine error={board.error} />
 			{board.isLoading && (
 				<div className="px-4 py-6 text-sm text-muted-foreground">Loading…</div>
 			)}
-			{ORDER.map((column) => {
-				const rows = sessions.filter((s) => s.column === column);
-				if (rows.length === 0) return null;
-				return (
-					<section key={column}>
-						<h2 className="px-4 pt-4 pb-1 text-[11px] font-semibold uppercase tracking-wide text-faint-foreground">
-							{STATUS[column].label} · {rows.length}
-						</h2>
-						{rows.map((s) => (
-							<a
-								key={s.paneId}
-								href={`#/s/${s.paneId}`}
-								className="mx-3 my-1.5 block rounded-[10px] border border-border bg-card px-3 py-2.5 active:bg-accent"
-							>
-								<div className="flex items-center gap-2 text-[15px] font-semibold">
-									<Dot status={column} />
-									<span className="truncate">{s.title}</span>
-								</div>
-								<div className="mt-0.5 truncate pl-4 text-xs text-muted-foreground">
-									{[s.repo, s.contact].filter(Boolean).join(" · ") ||
-										STATUS[column].label}
-								</div>
-							</a>
-						))}
-					</section>
-				);
-			})}
+			{boardSections(sessions).map((section) => (
+				<section key={section.key}>
+					<h2 className="px-4 pt-4 pb-1 text-[11px] font-semibold uppercase tracking-wide text-faint-foreground">
+						{section.label} · {section.rows.length}
+					</h2>
+					{section.rows.map((session) => (
+						<SessionCard
+							key={session.paneId}
+							session={session}
+							onStar={(starred) =>
+								star.mutate({ paneId: session.paneId, starred })
+							}
+						/>
+					))}
+				</section>
+			))}
 			{board.data && sessions.length === 0 && (
 				<div className="px-4 py-6 text-sm text-muted-foreground">
 					Nothing running.
@@ -246,10 +237,10 @@ function Home() {
 				type="button"
 				aria-label="New task"
 				onClick={() => setAdding(true)}
-				className="fixed right-5 size-14 rounded-full bg-primary text-3xl text-primary-foreground shadow-lg"
+				className="fixed right-5 flex size-14 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-lg"
 				style={{ bottom: "calc(env(safe-area-inset-bottom) + 20px)" }}
 			>
-				+
+				<LuPlus className="size-7" />
 			</button>
 			{adding && (
 				<NewTask
@@ -263,9 +254,27 @@ function Home() {
 	);
 }
 
+/** The board's priorities, as the marks the task store reads on the first line. */
+const PRIORITIES = [
+	{ label: "Low", mark: "!" },
+	{ label: "Medium", mark: "" },
+	{ label: "High", mark: "!!!" },
+] as const;
+
+const withPriority = (text: string, mark: string) =>
+	mark ? `${mark} ${text.trimStart()}` : text;
+
+/**
+ * New task, as the desktop's: what to do, files, the repo it runs in, its
+ * priority, and Save (to the backlog) or Start now.
+ */
 function NewTask({ onClose }: { onClose: () => void }) {
 	const [text, setText] = useState("");
+	const [repo, setRepo] = useState("");
+	const [mark, setMark] = useState("");
 	const add = phone.add.useMutation({ onSuccess: onClose });
+	// An older Odin on the Mac has no repo list: the picker just doesn't show.
+	const repos = phone.repos.useQuery(undefined, { retry: false });
 	const uploads = useUploads(pairing);
 	const speech = useSpeech((words) =>
 		setText((typed) => appendWords(typed, words)),
@@ -274,42 +283,109 @@ function NewTask({ onClose }: { onClose: () => void }) {
 		(text.trim() || uploads.paths.length) &&
 		!uploads.uploading &&
 		!add.isPending;
+	const save = (start: boolean) =>
+		add.mutate({
+			text: withPriority(text, mark),
+			paths: uploads.paths,
+			...(repo && { repo }),
+			start,
+		});
 	return (
-		<div className="fixed inset-0 z-10 flex flex-col bg-background/95 p-4 pt-[calc(env(safe-area-inset-top)+12px)]">
-			<div className="mb-3 flex items-center justify-between">
-				<button type="button" onClick={onClose} className="text-primary">
+		<div className="fixed inset-0 z-10 flex flex-col gap-2.5 bg-background p-4 pt-[calc(env(safe-area-inset-top)+12px)] pb-[calc(env(safe-area-inset-bottom)+12px)]">
+			<div className="flex items-center justify-between">
+				<button
+					type="button"
+					onClick={onClose}
+					className="py-1 text-[15px] text-primary"
+				>
 					Cancel
 				</button>
 				<span className="font-semibold">New task</span>
-				<button
-					type="button"
-					disabled={!ready}
-					onClick={() => add.mutate({ text, paths: uploads.paths })}
-					className="font-semibold text-primary disabled:opacity-40"
-				>
-					Add
-				</button>
+				<span className="w-12" />
 			</div>
 			<textarea
 				// biome-ignore lint/a11y/noAutofocus: the sheet exists to type into
 				autoFocus
 				value={text}
 				onChange={(event) => setText(event.target.value)}
-				placeholder="What should Claude do? First line is the title."
-				className="min-h-48 flex-1 resize-none rounded-[10px] border border-input bg-secondary p-3 text-base outline-none"
+				placeholder="What should Odin do? First line is the title."
+				className="min-h-40 flex-1 resize-none rounded-[10px] border border-input bg-secondary p-3 text-base outline-none"
 			/>
 			<UploadChips uploads={uploads} />
-			<div className="flex gap-2 pt-2 pb-[env(safe-area-inset-bottom)]">
+			{!!repos.data?.length && (
+				<select
+					value={repo}
+					onChange={(event) => setRepo(event.target.value)}
+					aria-label="Repo"
+					className="h-10 rounded-[10px] border border-input bg-secondary px-3 text-[15px] outline-none"
+				>
+					<option value="">Default repo</option>
+					{repos.data.map((path) => (
+						<option key={path} value={path}>
+							{path.split("/").filter(Boolean).pop()}
+						</option>
+					))}
+				</select>
+			)}
+			<fieldset className="flex rounded-[10px] border border-input bg-secondary p-0.5">
+				<legend className="sr-only">Priority</legend>
+				{PRIORITIES.map((priority) => (
+					<button
+						key={priority.label}
+						type="button"
+						aria-pressed={mark === priority.mark}
+						onClick={() => setMark(priority.mark)}
+						className={`h-9 flex-1 rounded-lg text-sm font-medium ${mark === priority.mark ? "bg-accent text-foreground" : "text-muted-foreground"}`}
+					>
+						{priority.label}
+					</button>
+				))}
+			</fieldset>
+			<ErrorLine error={add.error ?? textError(speech.error)} />
+			<div className="flex items-center gap-2">
 				<AttachButton uploads={uploads} />
 				<MicButton speech={speech} />
+				<button
+					type="button"
+					disabled={!ready}
+					onClick={() => save(false)}
+					className="ml-auto h-10 rounded-full border border-border bg-secondary px-4 text-sm font-semibold disabled:opacity-40"
+				>
+					Save
+				</button>
+				<button
+					type="button"
+					disabled={!ready}
+					onClick={() => save(true)}
+					className="h-10 rounded-full bg-primary px-4 text-sm font-semibold text-primary-foreground disabled:opacity-40"
+				>
+					Start now
+				</button>
 			</div>
-			<ErrorLine error={add.error ?? textError(speech.error)} />
 		</div>
 	);
 }
 
+/**
+ * A text box that grows with what's in it - typed or dictated - up to its
+ * max-height, then scrolls. Safari has no `field-sizing: content` yet.
+ */
+function GrowingTextarea(
+	props: TextareaHTMLAttributes<HTMLTextAreaElement> & { value: string },
+) {
+	const box = useRef<HTMLTextAreaElement>(null);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: measure when the text changes
+	useLayoutEffect(() => {
+		const el = box.current;
+		if (!el) return;
+		el.style.height = "auto";
+		el.style.height = `${el.scrollHeight + 2}px`;
+	}, [props.value]);
+	return <textarea ref={box} rows={1} {...props} />;
+}
+
 /** A reply sent from here that Claude hasn't put in its transcript yet. */
-type Sent = { text: string; at: number };
+type Sent = { text: string; files: number; at: number };
 
 /**
  * Claude writes a message to its transcript when it reads it, so a reply sent
@@ -331,7 +407,7 @@ function stillWaiting(
 		.map((message) => squash(message.text));
 	// ponytail: a files-only reply can't be matched on text; it goes after 2 min.
 	return sent.filter((item) =>
-		item.text.startsWith("📎")
+		!item.text
 			? Date.now() - item.at < 120_000
 			: !said.some((text) => text.includes(squash(item.text).slice(0, 60))),
 	);
@@ -343,7 +419,21 @@ function Session({ paneId }: { paneId: string }) {
 	const refetch = () => void session.refetch();
 	const reply = phone.reply.useMutation({ onSuccess: refetch });
 	const [sent, setSent] = useState<Sent[]>(() => sentByPane.get(paneId) ?? []);
+	/** Shows a reply as Sent until the transcript has it, and follows it down. */
+	const remember = (text: string, files: number) => {
+		const item = { text, files, at: Date.now() };
+		setSent((all) => [...all, item]);
+		sentByPane.set(paneId, [...sent, item]);
+		following.current = true;
+	};
+	/** A reply with no files - what an action item's button sends. */
+	const sendText = (text: string) =>
+		reply.mutate(
+			{ paneId, text, paths: [] },
+			{ onSuccess: () => remember(text, 0) },
+		);
 	const key = phone.key.useMutation({ onSuccess: refetch });
+	const star = phone.star.useMutation({ onSuccess: refetch });
 	const done = phone.done.useMutation({
 		onSuccess: () => {
 			location.hash = "";
@@ -370,6 +460,8 @@ function Session({ paneId }: { paneId: string }) {
 	}, [count]);
 	const data = session.data;
 	const status = (data?.status ?? "idle") as PaneStatus;
+	// An older Odin on the Mac doesn't send it: no star until it does.
+	const starred = !!(data as { starred?: boolean } | undefined)?.starred;
 	const waiting = stillWaiting(sent, data?.messages ?? []);
 	// biome-ignore lint/correctness/useExhaustiveDependencies: forget what the transcript shows now
 	useEffect(() => {
@@ -380,26 +472,44 @@ function Session({ paneId }: { paneId: string }) {
 		<div className="relative flex h-dvh flex-col">
 			<header className="border-b border-border bg-card px-3.5 pt-[calc(env(safe-area-inset-top)+10px)] pb-2">
 				<div className="flex items-center justify-between">
-					<a href="#/" className="-ml-1 px-1 py-1.5 text-[15px] text-primary">
-						‹ Odin
-					</a>
-					<button
-						type="button"
-						disabled={done.isPending}
-						onClick={() => done.mutate({ paneId })}
-						className="-mr-1 px-1 py-1.5 text-[15px] text-muted-foreground"
+					<a
+						href="#/"
+						className="-ml-1.5 flex items-center px-1 py-1.5 text-[15px] text-primary"
 					>
-						✓ Done
-					</button>
+						<LuChevronLeft className="size-5" />
+						Board
+					</a>
+					<div className="flex items-center gap-1">
+						<button
+							type="button"
+							aria-label={starred ? "Unstar" : "Star"}
+							onClick={() => star.mutate({ paneId, starred: !starred })}
+							className={`flex size-9 items-center justify-center ${starred ? "text-attention" : "text-muted-foreground"}`}
+						>
+							<LuStar
+								className={`size-[18px] ${starred ? "fill-current" : ""}`}
+							/>
+						</button>
+						<button
+							type="button"
+							disabled={done.isPending}
+							onClick={() => done.mutate({ paneId })}
+							className="-mr-1 flex items-center gap-1 px-1 py-1.5 text-[15px] text-muted-foreground"
+						>
+							<LuCheck className="size-4" />
+							Done
+						</button>
+					</div>
 				</div>
 				<div className="mt-1 truncate text-[17px] font-semibold">
 					{data?.title ?? "…"}
 				</div>
 				<div
-					className="text-[11px] font-semibold uppercase"
+					className="flex items-center gap-1.5 text-[11px] font-semibold uppercase"
 					style={{ color: STATUS[status].color }}
 				>
-					● {STATUS[status].label}
+					<Dot status={status} />
+					{STATUS[status].label}
 				</div>
 			</header>
 			<main
@@ -412,39 +522,22 @@ function Session({ paneId }: { paneId: string }) {
 				}}
 			>
 				<ErrorLine error={session.error ?? done.error} />
-				<div className="mb-2 rounded-[10px] border border-border border-l-[3px] border-l-primary bg-card p-2.5 text-sm leading-snug text-soft-foreground">
-					<div className="text-[10px] font-semibold text-faint-foreground">
-						TL;DR
-					</div>
-					{brief.isLoading
-						? "Writing the TL;DR…"
-						: (brief.data ?? "No summary yet.")}
-				</div>
-				{data?.messages.map((message, index) => (
-					<div
-						// biome-ignore lint/suspicious/noArrayIndexKey: the transcript only grows at the end
-						key={index}
-						className={
-							message.role === "user"
-								? "my-2 ml-10 select-text whitespace-pre-wrap break-words rounded-2xl rounded-br-md bg-accent px-3 py-2 text-[15px] leading-snug"
-								: "my-2 mr-6 rounded-2xl rounded-bl-md border border-border bg-card px-3 py-2 text-[15px] leading-snug text-soft-foreground"
-						}
-					>
-						{message.role === "user" ? (
-							message.text
-						) : (
-							<Markdown text={message.text} />
-						)}
-					</div>
-				))}
+				<BriefCard brief={brief.data} loading={brief.isLoading} />
+				<Transcript messages={data?.messages ?? []} send={sendText} />
 				{waiting.map((item) => (
 					<div
 						key={item.at}
 						className="my-2 ml-10 select-text whitespace-pre-wrap break-words rounded-2xl rounded-br-md bg-accent/60 px-3 py-2 text-[15px] leading-snug"
 					>
 						{item.text}
+						{item.files > 0 && (
+							<div className="flex items-center gap-1 text-sm text-soft-foreground">
+								<LuPaperclip className="size-3.5" />
+								{item.files} file{item.files === 1 ? "" : "s"}
+							</div>
+						)}
 						<div className="mt-1 text-right text-[11px] text-muted-foreground">
-							Sent · Claude reads it when it's free
+							Sent · Odin reads it when it's free
 						</div>
 					</div>
 				))}
@@ -463,7 +556,7 @@ function Session({ paneId }: { paneId: string }) {
 					className="absolute right-4 z-10 flex size-10 items-center justify-center rounded-full border border-border bg-card text-lg shadow-lg"
 					style={{ bottom: "calc(env(safe-area-inset-bottom) + 76px)" }}
 				>
-					↓
+					<LuArrowDown className="size-5" />
 				</button>
 			)}
 			{status === "permission" && (
@@ -480,7 +573,13 @@ function Session({ paneId }: { paneId: string }) {
 									: "h-9 min-w-11 rounded-full border border-border bg-secondary px-3 text-sm font-semibold"
 							}
 						>
-							{{ enter: "⏎", esc: "Esc" }[k as "enter" | "esc"] ?? k}
+							{k === "enter" ? (
+								<LuCornerDownLeft className="mx-auto size-4" />
+							) : k === "esc" ? (
+								"Esc"
+							) : (
+								k
+							)}
 						</button>
 					))}
 				</div>
@@ -497,29 +596,20 @@ function Session({ paneId }: { paneId: string }) {
 						{ paneId, text, paths: uploads.paths },
 						{
 							onSuccess: () => {
-								const item = {
-									text:
-										text.trim() ||
-										`📎 ${uploads.paths.length} file${uploads.paths.length === 1 ? "" : "s"}`,
-									at: Date.now(),
-								};
-								setSent((all) => [...all, item]);
-								sentByPane.set(paneId, [...sent, item]);
+								remember(text.trim(), uploads.paths.length);
 								setText("");
 								uploads.clear();
-								following.current = true;
 							},
 						},
 					);
 				}}
 			>
 				<AttachButton uploads={uploads} />
-				<textarea
-					rows={1}
+				<GrowingTextarea
 					value={text}
 					onChange={(event) => setText(event.target.value)}
-					placeholder="Reply to Claude…"
-					className="max-h-32 min-h-10 flex-1 resize-none rounded-[18px] border border-input bg-secondary px-3 py-2 text-base outline-none"
+					placeholder="Reply to Odin…"
+					className="max-h-[40dvh] min-h-10 flex-1 resize-none overflow-y-auto rounded-[18px] border border-input bg-secondary px-3 py-2 text-base outline-none"
 				/>
 				<MicButton speech={speech} />
 				<button
