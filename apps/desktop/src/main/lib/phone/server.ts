@@ -9,6 +9,13 @@ import express from "express";
 import QRCode from "qrcode";
 import { ODIN_HOME_DIR } from "../app-environment";
 import { attachments } from "./attachments";
+import {
+	type RelayConfig,
+	type RelayStatus,
+	relayStatus,
+	startRelay,
+	stopRelay,
+} from "./relay";
 import { phoneRouter } from "./router";
 
 /**
@@ -18,19 +25,27 @@ import { phoneRouter } from "./router";
  * until you turn it on.
  */
 // ponytail: plain HTTP on the LAN - anyone on the Wi-Fi can read the traffic.
-// HTTPS comes with a relay or tunnel.
+// Away from it, the relay (relay.ts) carries it over HTTPS.
 
 /** Where the switch and the token live; a test points it at a temp file. */
 export const phoneConfig = { file: join(ODIN_HOME_DIR, "phone.json") };
 const PREFERRED_PORT = 4747;
 
-type Config = { enabled: boolean; token: string };
+type Config = { enabled: boolean; token: string; relay?: RelayConfig };
 
 export type PhoneStatus =
 	| { state: "off" }
 	| { state: "error"; error: string }
-	/** qr opens the iPhone app and pairs it; url is the same link, to paste. */
-	| { state: "on"; url: string; qr: string };
+	/**
+	 * qr opens the iPhone app and pairs it; url is the same link, to paste.
+	 * relay: the address away from this Wi-Fi, and whether its tunnel is up.
+	 */
+	| {
+			state: "on";
+			url: string;
+			qr: string;
+			relay: (RelayConfig & RelayStatus) | null;
+	  };
 
 let server: Server | null = null;
 let status: PhoneStatus = { state: "off" };
@@ -106,40 +121,57 @@ async function listen(token: string): Promise<void> {
 	const address = http.address();
 	const port = typeof address === "object" && address ? address.port : 0;
 	const url = `http://${localName()}:${port}/?t=${token}`;
+	const { relay } = readConfig();
+	if (relay) startRelay(relay, port);
+	// The app tries the Wi-Fi address first and the relay (r) when it's away.
+	const pair = `odin://pair?u=${encodeURIComponent(url)}${relay ? `&r=${encodeURIComponent(relay.url)}` : ""}`;
 	status = {
 		state: "on",
 		url,
-		qr: await QRCode.toDataURL(`odin://pair?u=${encodeURIComponent(url)}`, {
-			margin: 1,
-			width: 220,
-		}),
+		qr: await QRCode.toDataURL(pair, { margin: 1, width: 220 }),
+		relay: null,
 	};
 }
 
 async function stop(): Promise<void> {
+	stopRelay();
 	const http = server;
 	server = null;
 	status = { state: "off" };
 	if (http) await new Promise((resolve) => http.close(resolve));
 }
 
-export const phoneStatus = () => status;
+export const phoneStatus = (): PhoneStatus => {
+	const { relay } = readConfig();
+	return status.state === "on" && relay
+		? { ...status, relay: { ...relay, ...relayStatus() } }
+		: status;
+};
 
 export async function setPhoneEnabled(enabled: boolean): Promise<PhoneStatus> {
 	const config = readConfig();
 	const token = config.token || newToken();
-	writeConfig({ enabled, token });
+	writeConfig({ ...config, enabled, token });
 	await stop();
 	if (enabled)
 		await listen(token).catch((error: Error) => {
 			status = { state: "error", error: error.message };
 		});
-	return status;
+	return phoneStatus();
+}
+
+/** Set or clear the relay (null); a running server restarts onto it. */
+export async function setPhoneRelay(
+	relay: RelayConfig | null,
+): Promise<PhoneStatus> {
+	const { relay: _old, ...config } = readConfig();
+	writeConfig(relay ? { ...config, relay } : config);
+	return setPhoneEnabled(config.enabled);
 }
 
 /** A new token: every paired phone has to scan again. */
 export async function resetPhoneToken(): Promise<PhoneStatus> {
-	writeConfig({ enabled: readConfig().enabled, token: newToken() });
+	writeConfig({ ...readConfig(), token: newToken() });
 	return setPhoneEnabled(readConfig().enabled);
 }
 

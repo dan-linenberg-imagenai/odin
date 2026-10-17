@@ -32,6 +32,7 @@ import {
 } from "./attach";
 import { BriefCard } from "./brief-card";
 import { boardSections, DoneShelf, Dot, SessionCard, STATUS } from "./cards";
+import { odinFetch, setPairing } from "./odin-fetch";
 import { type Pairing, parsePairLink } from "./pair-link";
 import { useSpeech } from "./speech";
 import { Transcript } from "./transcript";
@@ -80,6 +81,7 @@ function pairWith(link: string): boolean {
 }
 
 const pairing = savedPairing();
+setPairing(pairing);
 const phone = createTRPCReact<PhoneRouter>();
 const client = phone.createClient({
 	links: [
@@ -87,6 +89,9 @@ const client = phone.createClient({
 			url: `${pairing?.base ?? ""}/trpc`,
 			transformer: superjson,
 			headers: { authorization: `Bearer ${pairing?.token ?? ""}` },
+			// Wi-Fi first, the relay when away: the path is the same on both.
+			fetch: (url, init) =>
+				odinFetch(String(url).slice((pairing?.base ?? "").length), init),
 		}),
 	],
 });

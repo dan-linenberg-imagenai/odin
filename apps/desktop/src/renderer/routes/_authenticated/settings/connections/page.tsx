@@ -781,7 +781,17 @@ function OpenLinksInOdinRow() {
  * QR code carries the token, so scanning it is the whole pairing.
  */
 function PhoneRow() {
-	const status = electronTrpc.phone.status.useQuery();
+	const status = electronTrpc.phone.status.useQuery(undefined, {
+		// The relay's tunnel moves on its own: look again while it settles.
+		refetchInterval: (query) => {
+			const data = query.state.data;
+			return data?.state === "on" && data.relay?.state !== "connected"
+				? data.relay
+					? 3_000
+					: false
+				: false;
+		},
+	});
 	const onError = (error: { message: string }) => toast.error(error.message);
 	const onSuccess = () => void status.refetch();
 	const setEnabled = electronTrpc.phone.setEnabled.useMutation({
@@ -839,6 +849,121 @@ function PhoneRow() {
 					</div>
 				</div>
 			)}
+			{data?.state === "on" && (
+				<PhoneRelay relay={data.relay} onSaved={() => void status.refetch()} />
+			)}
 		</>
+	);
+}
+
+const RELAY_STATE = {
+	connected: { dot: "var(--success)", label: "Connected" },
+	connecting: { dot: "var(--attention)", label: "Connecting…" },
+	retrying: { dot: "var(--danger)", label: "Reconnecting" },
+	off: { dot: "var(--faint-foreground)", label: "Off" },
+} as const;
+
+/**
+ * The phone away from this Wi-Fi (main/lib/phone/relay.ts): a server of
+ * yours serves HTTPS and reaches Odin through an SSH tunnel this Mac opens.
+ * Re-pair after setting it, so the app learns the address.
+ */
+function PhoneRelay({
+	relay,
+	onSaved,
+}: {
+	relay: {
+		ssh: string;
+		url: string;
+		key: string;
+		state: keyof typeof RELAY_STATE;
+		error: string | null;
+	} | null;
+	onSaved: () => void;
+}) {
+	const [ssh, setSsh] = useState("");
+	const [url, setUrl] = useState("");
+	const [key, setKey] = useState("~/.ssh/odin-relay");
+	const setRelay = electronTrpc.phone.setRelay.useMutation({
+		onSuccess: onSaved,
+		onError: (error) => toast.error(error.message),
+	});
+	if (relay) {
+		const shown = RELAY_STATE[relay.state];
+		return (
+			<div className="flex items-start justify-between gap-4 px-4 pb-4 text-xs text-muted-foreground">
+				<div className="min-w-0 space-y-1">
+					<div className="text-sm font-medium text-foreground">
+						Away from this Wi-Fi
+					</div>
+					<div className="flex items-center gap-1.5">
+						<span
+							className="inline-block size-2 rounded-full"
+							style={{ background: shown.dot }}
+						/>
+						{shown.label} · {relay.url} via {relay.ssh}
+					</div>
+					{relay.error && relay.state !== "connected" && (
+						<div className="select-text cursor-text text-danger">
+							{relay.error}
+						</div>
+					)}
+				</div>
+				<Button
+					variant="outline"
+					size="sm"
+					disabled={setRelay.isPending}
+					onClick={() => setRelay.mutate(null)}
+				>
+					Remove
+				</Button>
+			</div>
+		);
+	}
+	return (
+		<form
+			className="space-y-2 px-4 pb-4 text-xs text-muted-foreground"
+			onSubmit={(event) => {
+				event.preventDefault();
+				setRelay.mutate({ ssh: ssh.trim(), url: url.trim(), key: key.trim() });
+			}}
+		>
+			<div className="text-sm font-medium text-foreground">
+				Away from this Wi-Fi
+			</div>
+			<div className="max-w-[70ch]">
+				A server of yours (an EC2 with Caddy serving HTTPS and proxying to
+				127.0.0.1:4747) carries the phone when it isn't on this Wi-Fi. Odin
+				keeps an SSH tunnel to it open. Scan the QR code again after saving.
+			</div>
+			<div className="flex flex-wrap gap-2">
+				<Input
+					value={ssh}
+					onChange={(event) => setSsh(event.target.value)}
+					placeholder="ubuntu@3.76.62.130"
+					className="h-8 w-48 text-xs"
+				/>
+				<Input
+					value={url}
+					onChange={(event) => setUrl(event.target.value)}
+					placeholder="https://3-76-62-130.sslip.io"
+					className="h-8 w-64 text-xs"
+				/>
+				<Input
+					value={key}
+					onChange={(event) => setKey(event.target.value)}
+					placeholder="~/.ssh/odin-relay"
+					className="h-8 w-44 text-xs"
+				/>
+				<Button
+					type="submit"
+					variant="outline"
+					size="sm"
+					disabled={!ssh.trim() || !url.trim() || setRelay.isPending}
+				>
+					Save
+				</Button>
+			</div>
+		</form>
 	);
 }

@@ -6,6 +6,7 @@ import {
 	LuSquare,
 	LuX,
 } from "react-icons/lu";
+import { odinFetch } from "./odin-fetch";
 import type { Pairing } from "./pair-link";
 import { speechAvailable, type useSpeech } from "./speech";
 
@@ -40,14 +41,11 @@ export function useUploads(pairing: Pairing | null) {
 
 	async function upload(file: File, id: number) {
 		try {
-			const reply = await fetch(
-				`${pairing?.base ?? ""}/upload?ext=${extensionOf(file)}`,
-				{
-					method: "POST",
-					headers: { authorization: `Bearer ${pairing?.token ?? ""}` },
-					body: file,
-				},
-			);
+			const reply = await odinFetch(`/upload?ext=${extensionOf(file)}`, {
+				method: "POST",
+				headers: { authorization: `Bearer ${pairing?.token ?? ""}` },
+				body: file,
+			});
 			if (!reply.ok) throw new Error(`Upload failed (${reply.status})`);
 			const { path } = (await reply.json()) as { path: string };
 			update(id, { path });

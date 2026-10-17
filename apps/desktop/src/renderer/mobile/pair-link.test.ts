@@ -23,3 +23,15 @@ test("anything else is not a pairing link", () => {
 	])
 		expect(parsePairLink(link)).toBeNull();
 });
+
+test("the app's link can carry an https relay for away from the Wi-Fi", () => {
+	const link = (relay: string) =>
+		`odin://pair?u=${encodeURIComponent(web)}&r=${encodeURIComponent(relay)}`;
+	expect(parsePairLink(link("https://3-76-62-130.sslip.io/"))).toEqual({
+		base: "http://dans-mac.local:4747",
+		token: "abc_123",
+		relay: "https://3-76-62-130.sslip.io",
+	});
+	// Never plain http off the Wi-Fi.
+	expect(parsePairLink(link("http://3.76.62.130"))?.relay).toBeUndefined();
+});
