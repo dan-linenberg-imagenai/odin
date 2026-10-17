@@ -38,7 +38,21 @@ const messages: Record<string, Message[]> = {
 		},
 		{
 			role: "assistant",
-			text: "The sort uses file names, so IMG_9999 comes before IMG_0001 at a rollover. I now sort by capture time and added a test. 14 pass.",
+			text: [
+				"**Found it.** The sort uses file names, so `IMG_9999` comes before `IMG_0001` at a rollover.",
+				"",
+				"- Sorted by capture time instead",
+				"- Added a test for the rollover",
+				"- 14 pass",
+				"",
+				"```py",
+				"brackets.sort(key=lambda p: p.captured_at)",
+				"```",
+				"",
+				"| Before | After |",
+				"| --- | --- |",
+				"| 1 in 5 fail | 0 in 50 |",
+			].join("\n"),
 			at: null,
 		},
 	],
@@ -108,13 +122,15 @@ async function inputs(
 
 Bun.serve({
 	port: PORT,
-	async fetch(req) {
+	async fetch(req, server) {
+		// Who's asking: the Simulator (127.0.0.1) or a phone on the Wi-Fi.
+		const from = server.requestIP(req)?.address ?? "?";
 		const url = new URL(req.url);
 		if (req.headers.get("authorization") !== "Bearer fake")
 			return new Response(null, { status: 401 });
 		if (url.pathname === "/upload") {
 			const bytes = (await req.arrayBuffer()).byteLength;
-			console.log("upload", url.searchParams.get("ext"), bytes, "bytes");
+			console.log(from, "upload", url.searchParams.get("ext"), bytes, "bytes");
 			return Response.json({
 				path: `/fake/attachments/${Date.now()}.${url.searchParams.get("ext")}`,
 			});
@@ -126,7 +142,7 @@ Bun.serve({
 		return Response.json(
 			paths.map((path, i) => {
 				const input = (batch[i] as { json?: Record<string, string> })?.json;
-				console.log(path, input ? JSON.stringify(input) : "");
+				console.log(from, path, input ? JSON.stringify(input) : "");
 				return { result: { data: { json: answer(path, input) } } };
 			}),
 		);
