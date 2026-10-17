@@ -176,11 +176,10 @@ const URGENCIES: { id: Exclude<Urgency, null> | "none"; label: string }[] = [
 	{ id: "none", label: "Unrated" },
 ];
 
-/** The status filter: Odin's own statuses, plus the two every row always had. */
+/** The status filter: Odin's own statuses, plus Waiting on you, which every row starts as. */
 const STATUS_FILTERS: { id: string; label: string }[] = [
 	{ id: "waiting", label: "Waiting on you" },
 	...TASK_STATUSES,
-	{ id: "reading", label: "Read later" },
 ];
 
 /** The bands, top to bottom, and what each one says it holds. */
@@ -197,7 +196,9 @@ const STATUS_FILTER_KEY = "odin.all.statusFilter";
 
 function readStatusFilter(): string {
 	try {
-		return localStorage.getItem(STATUS_FILTER_KEY) ?? "";
+		const saved = localStorage.getItem(STATUS_FILTER_KEY) ?? "";
+		// Read later rows live under Docs now: a saved "reading" cut would show nothing.
+		return saved.endsWith(":reading") ? "" : saved;
 	} catch {
 		return "";
 	}
@@ -1280,7 +1281,7 @@ function DetailsActions({
 	);
 }
 
-/** Read later, or back from it - the row stays on the list either way. */
+/** Read later, or back from it. Read later moves the row to Docs. */
 function ReadLaterButton({
 	on,
 	onClick,
@@ -1293,9 +1294,7 @@ function ReadLaterButton({
 			type="button"
 			onClick={onClick}
 			title={
-				on
-					? "Back to Waiting on you"
-					: "Mark it Read later - it stays here, off the Night Agent"
+				on ? "Back to Waiting on you" : "Mark it Read later - it moves to Docs"
 			}
 			className={ROW_LINK_BUTTON}
 		>
