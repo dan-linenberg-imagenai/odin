@@ -16,6 +16,7 @@ import {
 	itemDetail,
 	itemOptions,
 	itemReply,
+	itemsFoldLabel,
 	lastActionsId,
 	launchAttachments,
 	launchRequest,
@@ -678,6 +679,16 @@ describe("interruptClaude", () => {
 	});
 	test("an unreadable screen still interrupts", async () => {
 		expect(await run([null])).toEqual({ sent: true, writes: ["\x03"] });
+	});
+});
+
+describe("itemsFoldLabel - the action items card folds its own items", () => {
+	test("open card offers to hide the items", () => {
+		expect(itemsFoldLabel(false, 5)).toBe("Hide items");
+	});
+	test("folded card counts what it hides", () => {
+		expect(itemsFoldLabel(true, 5)).toBe("Show 5 items");
+		expect(itemsFoldLabel(true, 1)).toBe("Show 1 item");
 	});
 });
 
