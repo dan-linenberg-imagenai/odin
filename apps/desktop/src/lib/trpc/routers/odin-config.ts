@@ -59,6 +59,8 @@ export interface OdinFileConfig {
 		claudeSetup?: string[];
 		/** When they were last copied, epoch ms. */
 		claudeSetupSyncedAt?: number;
+		/** true: sessions there move to ANTHROPIC_API_KEY at the plan limit. Off by default. */
+		apiKeyFallback?: boolean;
 	};
 	/** `claude setup-token`'s token for remote sessions, encrypted with safeStorage. */
 	claudeToken?: string;
