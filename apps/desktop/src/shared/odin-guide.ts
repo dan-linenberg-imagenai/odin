@@ -8,7 +8,7 @@ export const ODIN_GUIDE = `# Odin
 "Store:" names are for your own action=state calls. Never show them, or any other code, to the user.
 
 ## Left rail
-Top to bottom: Dev Board, Tasks, Automations, Night Agent (status, the next run's picks - add, reorder, remove, and what to do after them - its schedule and a log of each night), More (the ⋮ button: Review, Insights, Session History). At the foot: Settings, and the raven button (Huginn, ⌘⇧I). Each but Night Agent has a one-key hotkey (rebind in Settings → Keyboard); the keys do nothing while you type, also inside agent terminals.
+Top to bottom: Dev Board, Tasks, Automations, Night Agent (status, Last night - the sessions the last window started and where each stands now, click one to open it - the next run's picks - add, reorder, remove, and what to do after them - its log by night, and its schedule), More (the ⋮ button: Review, Insights, Session History). At the foot: Settings, and the raven button (Huginn, ⌘⇧I). Each but Night Agent has a one-key hotkey (rebind in Settings → Keyboard); the keys do nothing while you type, also inside agent terminals.
 
 ## Tasks screen and its feeds
 Tabs, in two groups split by a hairline: Odin's own (All, Tasks, Docs), then the connections (Slack, Jira, GitHub, Notion, Email, ClickUp).
@@ -182,7 +182,7 @@ Three tabs: Schedules, Rules, Reminders.
 - The AI ranks Next in line using your "How to sort it" words and the Night Agent instructions, so "don't include X" in either keeps X out. It re-ranks when the words change or new rows arrive.
 - Its Instructions are added to every Night Agent session's prompt. The default says: work alone, open a PR, but send nothing other people see (no Slack, email, comments, merges or deploys).
 - It runs only on power: on battery it starts nothing. Odin keeps the Mac from idle sleep during the window, but a closed lid still sleeps it. It runs only while Odin is open.
-- Its log says when each window opened and closed, what it started, and why it started nothing (off, battery, Odin shut or asleep, cap reached, waiting on a session, everything ruled out, ranking failed). Read it with action=night.
+- Its log says when each window opened and closed, what it started, and why it started nothing (off, battery, Odin shut or asleep, cap reached, waiting on a session, everything ruled out, ranking failed). The Night Agent page groups it by night, newest first, and its Last night card lists the sessions the last window started with each one's state (Working, Needs you, Final Review, Idle, Done). Read the log with action=night.
 - Store: nightAgent (offHours: enabled, start, end, maxSessions, instructions, picked, afterPicks; nightLog).
 
 ## One by one

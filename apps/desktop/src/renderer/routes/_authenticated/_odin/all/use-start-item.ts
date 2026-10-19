@@ -22,6 +22,11 @@ export function paneWorksOn(
 	);
 }
 
+/** What starting a row came to: the session, or why there is none. */
+export type StartResult =
+	| { ok: true; paneId: string; sessionId: string }
+	| { ok: false; error: string };
+
 /**
  * Start a session on an All row, from wherever the row is shown - the All
  * feed, or the board's Next in line. `onSlackStarted` refetches whatever
@@ -63,12 +68,15 @@ export function useStartAllItem(onSlackStarted?: () => void) {
 	const start = async (
 		item: AllItem,
 		offHours?: { instructions: string; hostSession?: string },
-	) => {
+	): Promise<StartResult> => {
 		// Nobody is there to answer at night.
 		const context = offHours ? {} : await askSessionContext(item.launch.title);
-		if (!context) return;
+		if (!context) return { ok: false, error: "Cancelled" };
 		const ensured = await ensureWorkspace();
-		if (!ensured.ok) return toast.error(ensured.error);
+		if (!ensured.ok) {
+			toast.error(ensured.error);
+			return { ok: false, error: ensured.error };
+		}
 		const description = [item.launch.description, offHours?.instructions]
 			.filter(Boolean)
 			.join("\n\n");
@@ -82,7 +90,10 @@ export function useStartAllItem(onSlackStarted?: () => void) {
 				? { resumeSessionId: offHours.hostSession, onHost: true }
 				: {}),
 		});
-		if (!result.ok) return toast.error(result.error);
+		if (!result.ok) {
+			toast.error(result.error);
+			return { ok: false, error: result.error };
+		}
 		if (item.source === "Slack") {
 			markStarted.mutate({ id: item.launch.key });
 			usePaneMeta.getState().setTitle(result.paneId, item.launch.title);
@@ -91,9 +102,15 @@ export function useStartAllItem(onSlackStarted?: () => void) {
 		}
 		// My own tasks keep their row and gain a way into the session.
 		if (item.source === "Tasks") setPane(item.launch.key, result.paneId);
-		if (offHours) return;
+		const started = {
+			ok: true as const,
+			paneId: result.paneId,
+			sessionId: result.sessionId,
+		};
+		if (offHours) return started;
 		usePendingFocus.getState().focus(result.paneId);
 		navigate({ to: "/board" });
+		return started;
 	};
 
 	/** The Night Agent's launch of this row, built for the remote host and not started. */
