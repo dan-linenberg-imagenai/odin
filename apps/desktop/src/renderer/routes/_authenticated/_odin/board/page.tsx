@@ -4392,6 +4392,7 @@ function DevBoardPage() {
 		rawPrompt: string,
 		images: PromptImage[],
 		repoPath: string,
+		onHost?: boolean,
 	) => {
 		const prompt = rawPrompt.trim();
 		if (!prompt && images.length === 0) return;
@@ -4421,6 +4422,7 @@ function DevBoardPage() {
 			description: prompt && prompt !== title ? prompt : null,
 			images,
 			repoPath,
+			onHost,
 		});
 		setIsComposerOpen(false);
 		if (result.ok) {
@@ -6025,6 +6027,7 @@ function DevBoardPage() {
 					defaultRepo={composerRepo}
 					modelPicker
 					backlogToggle
+					wherePicker
 					onCancel={() => setIsComposerOpen(false)}
 					onSubmit={handleNewSession}
 				/>
