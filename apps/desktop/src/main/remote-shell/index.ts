@@ -236,7 +236,9 @@ async function login(
 	const sock = await openSsmStream(target);
 	const client = new Client();
 	await new Promise<void>((resolve, reject) => {
-		client.once("ready", resolve).once("error", (err) => {
+		// Not once: a handshake timeout emits an error, then the SSM socket's
+		// abort emits another, and an unheard one crashes the helper.
+		client.once("ready", resolve).on("error", (err) => {
 			// A failed handshake leaves the SSM plugin running otherwise.
 			sock.destroy();
 			reject(err);
@@ -267,9 +269,9 @@ async function connectOnce(
 }
 
 /**
- * Attaches this terminal to the session's tmux on the host. Resolves true
- * when the connection dropped, false when the session there ended or you
- * detached from it.
+ * Attaches this terminal to the session's tmux on the host. Resolves false
+ * when the session there ended or you detached from it (tmux exits 0), true
+ * when the connection dropped or tmux died (the host ran out of memory).
  */
 async function attach(
 	client: Client,
@@ -295,7 +297,8 @@ async function attach(
 			},
 			(err, stream) => {
 				if (err) return reject(err);
-				// Only a command that finished sends an exit status; a dropped connection doesn't.
+				// Only a command that finished sends an exit status; a dropped
+				// connection doesn't, and a killed tmux exits non-zero or by signal.
 				let exited = false;
 				const resize = () =>
 					stream.setWindow(stdout.rows ?? 40, stdout.columns ?? 120, 0, 0);
@@ -304,8 +307,8 @@ async function attach(
 				stream.pipe(stdout, { end: false });
 				stream.stderr.pipe(process.stderr, { end: false });
 				stdout.on("resize", resize);
-				stream.on("exit", () => {
-					exited = true;
+				stream.on("exit", (code: number | null) => {
+					exited = code === 0;
 				});
 				// A connection that drops closes the client but not this stream.
 				let done = false;
@@ -335,17 +338,11 @@ async function main(): Promise<void> {
 		profile: spec.profile,
 		region: spec.region,
 	};
-	say(`connecting to ${spec.instanceId}...`);
-	let client = await connectOnce(spec, target);
-	// Claude keeps working in tmux on the host while the connection is down.
-	for (let first = true; ; first = false) {
-		const dropped = await attach(client, spec, env, first).catch(() => true);
-		if (!dropped) break;
-		say(`connection lost - reconnecting to ${spec.instanceId}...`);
+	// A host busy enough to miss the SSH handshake answers a later try.
+	const reconnect = async (): Promise<Client> => {
 		for (;;) {
 			try {
-				client = await connectOnce(spec, target);
-				break;
+				return await connectOnce(spec, target);
 			} catch (err) {
 				say(
 					`could not reconnect: ${err instanceof Error ? err.message : String(err)} - trying again in 10s`,
@@ -353,6 +350,27 @@ async function main(): Promise<void> {
 				await new Promise((resolve) => setTimeout(resolve, 10_000));
 			}
 		}
+	};
+	say(`connecting to ${spec.instanceId}...`);
+	let client = await connectOnce(spec, target).catch(reconnect);
+	// Claude keeps working in tmux on the host while the connection is down.
+	// If tmux is gone by then, the conversation resumes instead of starting over.
+	const again: RemoteSessionSpec = {
+		...spec,
+		claudeArgs: `--resume ${spec.pane}`,
+		prompt: null,
+		fresh: false,
+	};
+	for (let first = true; ; first = false) {
+		const dropped = await attach(
+			client,
+			first ? spec : again,
+			env,
+			first,
+		).catch(() => true);
+		if (!dropped) break;
+		say(`connection lost - reconnecting to ${spec.instanceId}...`);
+		client = await reconnect();
 	}
 	process.exit(0);
 }
