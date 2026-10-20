@@ -52,3 +52,30 @@ describe("logNight", () => {
 		expect(log.at(-1)?.event).toBe("line 399");
 	});
 });
+
+describe("logNight with a started session", () => {
+	test("keeps what it started, and the time it really started", () => {
+		const { logNight } = useNextInLinePrompt.getState();
+		useNextInLinePrompt.setState({ nightLog: [] });
+		logNight('"Fix the build" ran on odin-remote overnight.', {
+			started: {
+				key: "gh:1",
+				title: "Fix the build",
+				source: "GitHub",
+				sessionId: "abc",
+			},
+			at: "2026-10-18T23:05:00.000Z",
+		});
+		logNight("Sent odin-remote tonight's plan.", { night: 1760828400000 });
+		const [ran, plan] = useNextInLinePrompt.getState().nightLog;
+		expect(ran?.at).toBe("2026-10-18T23:05:00.000Z");
+		expect(ran?.started).toEqual({
+			key: "gh:1",
+			title: "Fix the build",
+			source: "GitHub",
+			sessionId: "abc",
+		});
+		expect(plan?.night).toBe(1760828400000);
+		expect(plan?.started).toBeUndefined();
+	});
+});

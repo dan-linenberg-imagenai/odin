@@ -5,6 +5,8 @@ import {
 	useNextInLinePrompt,
 } from "renderer/stores/next-in-line-prompt";
 import { useTabsStore } from "renderer/stores/tabs/store";
+import type { AllItem } from "../all/all-items";
+import type { StartResult } from "../all/use-start-item";
 import { useNextInLineQueue } from "../board/NextInLine";
 
 const TICK_MS = 60_000;
@@ -110,8 +112,40 @@ export function useNightAgentRunner() {
 				awake = !next;
 			});
 		};
-		/** The night's order: your picks, then the ranking (asked when stale). */
-		const tonight = async (instructions: string) => {
+		/**
+		 * The line for a start: what it started, with a way back to it, or why
+		 * it didn't. Written after the launch, so a failed one doesn't read as
+		 * started in the morning.
+		 */
+		const logStart = (
+			item: AllItem,
+			launched: StartResult,
+			how: "pick" | "ranked",
+		) => {
+			const { logNight } = useNextInLinePrompt.getState();
+			if (!launched.ok)
+				return logNight(
+					`Couldn't start "${item.title}" (${item.source}): ${launched.error}`,
+				);
+			logNight(
+				how === "pick"
+					? `Started your pick "${item.title}" (${item.source}).`
+					: `Started "${item.title}" (${item.source}), top of the ranking.`,
+				{
+					started: {
+						key: item.key,
+						title: item.title,
+						source: item.source,
+						sessionId: launched.sessionId,
+					},
+				},
+			);
+		};
+		/**
+		 * The night's order: your picks, then the ranking (asked when stale).
+		 * `forNight` is the window the plan is for, so its lines file under it.
+		 */
+		const tonight = async (instructions: string, forNight?: number) => {
 			const { offHours, setOffHours, logNight } =
 				useNextInLinePrompt.getState();
 			const { waiting, rankInput, duplicateFor, pinned, unpinned } =
@@ -141,6 +175,7 @@ export function useNightAgentRunner() {
 				};
 				logNight(
 					`Ranked ${waiting.length} waiting rows for the remote host; your instructions ruled out ${ranking.hidden.length}.`,
+					{ night: forNight },
 				);
 			}
 			const { order, hidden } = night.current as NightRanking;
@@ -166,12 +201,28 @@ export function useNightAgentRunner() {
 						(row) => row.key === run.key,
 					);
 					if (!item) continue;
-					await latest.current.start(item, {
+					const adopted = await latest.current.start(item, {
 						instructions: offHours.instructions,
 						hostSession: run.sessionId,
 					});
+					if (!adopted.ok) {
+						logNight(
+							`Couldn't put "${run.title}" from ${name} on the board: ${adopted.error}`,
+						);
+						continue;
+					}
+					// Dated when the host started it, not when this computer woke.
 					logNight(
 						`"${run.title}" ran on ${name} overnight - it's on the board now.`,
+						{
+							started: {
+								key: run.key,
+								title: run.title,
+								source: item.source,
+								sessionId: run.sessionId,
+							},
+							at: new Date(run.at * 1000).toISOString(),
+						},
 					);
 				}
 			}
@@ -180,8 +231,9 @@ export function useNightAgentRunner() {
 				latest.current.prompt,
 				offHours.instructions,
 			);
+			const forNight = window.from * 1000;
 			// A few past the cap, so a task that fails to start still leaves a night's worth.
-			const order = (await tonight(instructions)).slice(
+			const order = (await tonight(instructions, forNight)).slice(
 				0,
 				offHours.maxSessions + 3,
 			);
@@ -218,6 +270,7 @@ export function useNightAgentRunner() {
 			if (sent.current?.signature !== signature)
 				logNight(
 					`Sent ${name} tonight's plan: ${tasks.length} tasks in order, at most ${offHours.maxSessions}, ${span}. It runs there with this computer closed.`,
+					{ night: forNight },
 				);
 			sent.current = { signature, at: Date.now() };
 		};
@@ -273,6 +326,9 @@ export function useNightAgentRunner() {
 				} catch (error) {
 					logNight(
 						`Tonight's plan for ${host.name || host.instanceId} failed: ${error instanceof Error ? error.message : String(error)}`,
+						{
+							night: nightWindow(now, offHours.start, offHours.end).from * 1000,
+						},
 					);
 				} finally {
 					running = false;
@@ -324,13 +380,16 @@ export function useNightAgentRunner() {
 						);
 					if (item) {
 						tried.current.add(item.key);
-						logNight(`Started your pick "${item.title}" (${item.source}).`);
 						setOffHours({
 							picked: offHours.picked.filter((key) => key !== item.key),
 						});
 						setOffHoursFromPicks(true);
 						setOffHoursStarted(offHoursStarted + 1);
-						await start(item, { instructions: offHours.instructions });
+						logStart(
+							item,
+							await start(item, { instructions: offHours.instructions }),
+							"pick",
+						);
 						return;
 					}
 				}
@@ -385,11 +444,12 @@ export function useNightAgentRunner() {
 						`Nothing left to start: ${waiting.length} waiting, ${hidden.size} ruled out, ${tried.current.size} already tried, the rest marked duplicates.`,
 					);
 				tried.current.add(item.key);
-				logNight(
-					`Started "${item.title}" (${item.source}), top of the ranking.`,
-				);
 				setOffHoursStarted(offHoursStarted + 1);
-				await start(item, { instructions: offHours.instructions });
+				logStart(
+					item,
+					await start(item, { instructions: offHours.instructions }),
+					"ranked",
+				);
 			} catch (error) {
 				logNight(
 					`Ranking failed, so it started nothing: ${error instanceof Error ? error.message : String(error)}`,

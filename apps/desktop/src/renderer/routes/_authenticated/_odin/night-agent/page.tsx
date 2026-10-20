@@ -1,55 +1,75 @@
 import { Input } from "@odin/ui/input";
 import { cn } from "@odin/ui/utils";
-import { createFileRoute } from "@tanstack/react-router";
-import { useState } from "react";
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { useEffect, useMemo, useState } from "react";
+import type { IconType } from "react-icons";
 import {
 	LuArrowDown,
 	LuArrowUp,
+	LuArrowUpRight,
+	LuChevronDown,
+	LuChevronRight,
 	LuMoon,
 	LuPlus,
 	LuSearch,
 	LuX,
 } from "react-icons/lu";
+import { electronTrpc } from "renderer/lib/electron-trpc";
 import {
 	canPickForTonight,
 	inOffHours,
 	MAX_NIGHT_PICKS,
+	type NightLogEntry,
+	type NightStart,
 	type OffHours,
 	toggleNightPick,
 	useNextInLinePrompt,
 } from "renderer/stores/next-in-line-prompt";
+import { useTabsStore } from "renderer/stores/tabs/store";
+import { boardColumn } from "shared/board-column";
+import type { Pane } from "shared/tabs-types";
 import { NightAgentRows } from "../../settings/backlog/page";
 import { SettingsSection } from "../../settings/components/SettingsPage";
 import type { AllItem } from "../all/all-items";
 import { SOURCE_ICON } from "../all/TaskTable";
 import { useNextInLineQueue } from "../board/NextInLine";
 import { useNightAgentIntro } from "../board/NightAgentIntro";
+import { FEED_TABS } from "../components/feed-counts";
+import { PILL } from "../components/pill";
+import { usePendingFocus } from "../hooks/usePendingFocus";
+import { PANE_STATUS } from "../pane-status";
+import { featuredNight, groupNights, type Night } from "./night-log";
 
 export const Route = createFileRoute("/_authenticated/_odin/night-agent/")({
 	component: NightAgentPage,
 });
 
-/** The log can run to a week of nights; the page opens on the latest. */
-const LOG_PREVIEW = 30;
+/** How many of the newest nights the log opens on; older ones fold to a line. */
+const OPEN_NIGHTS = 2;
 
-/** The Night Agent's own screen: what it will do next, its schedule, its log. */
+/**
+ * The Night Agent's own screen: what it will do next, its schedule, its log.
+ * Last night comes first, under the status - the morning's question is
+ * "what ran", and the log is the detail behind it.
+ */
 function NightAgentPage() {
 	return (
 		<div className="h-full overflow-y-auto">
 			<div className="mx-auto w-full max-w-[1600px] space-y-8 px-8 py-8">
 				<StatusHero />
+				<LastNightSection />
 				<div className="grid items-start gap-8 xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
 					<div className="space-y-8">
 						<NextRunSection />
 					</div>
 					<div className="space-y-8">
+						<LogSection />
 						<SettingsSection
 							title="Schedule"
 							description="When it runs, how much, and what every session is told."
 						>
 							<NightAgentRows />
 						</SettingsSection>
-						<LogSection />
 					</div>
 				</div>
 			</div>
@@ -405,48 +425,331 @@ function IconButton({
 	);
 }
 
-/** What each tick decided, newest first - the latest few unless you ask. */
-function LogSection() {
+/** "23:05" - the same 24-hour clock the window is set in. */
+function hhmm(iso: string): string {
+	return new Date(iso).toLocaleTimeString([], {
+		hour: "2-digit",
+		minute: "2-digit",
+		hourCycle: "h23",
+	});
+}
+
+/** The feed's mark for a source name - the log keeps the name, not the path. */
+const ICON_BY_SOURCE = Object.fromEntries(
+	FEED_TABS.map(({ label, Icon }) => [label, Icon]),
+) as Record<string, IconType | undefined>;
+
+/** The log by night, and the night to lead with. Re-labelled each minute, the runner's own tick. */
+function useNights() {
 	const nightLog = useNextInLinePrompt((s) => s.nightLog);
-	const [showAll, setShowAll] = useState(false);
-	const newestFirst = nightLog.slice().reverse();
-	const shown = showAll ? newestFirst : newestFirst.slice(0, LOG_PREVIEW);
+	const start = useNextInLinePrompt((s) => s.offHours.start);
+	const end = useNextInLinePrompt((s) => s.offHours.end);
+	const [now, setNow] = useState(() => new Date());
+	useEffect(() => {
+		const id = setInterval(() => setNow(new Date()), 60_000);
+		return () => clearInterval(id);
+	}, []);
+	return useMemo(() => {
+		const nights = groupNights(nightLog, start, end, now);
+		return { nights, featured: featuredNight(nights, start, end, now) };
+	}, [nightLog, start, end, now]);
+}
+
+/**
+ * What the last window started - the morning's question - and where each
+ * session stands now. Tonight's, while the window is open. A row opens the
+ * session: on the board, or in Session History once it's Done.
+ */
+function LastNightSection() {
+	const hasLog = useNextInLinePrompt((s) => s.nightLog.length > 0);
+	const start = useNextInLinePrompt((s) => s.offHours.start);
+	const end = useNextInLinePrompt((s) => s.offHours.end);
+	const { featured: night } = useNights();
+	if (!hasLog) return null;
+	const count = night.started.length;
+	const when = `${night.date}, ${start} to ${end}`;
+	return (
+		<SettingsSection
+			title={night.label === "Tonight" ? "Tonight so far" : "Last night"}
+			description={
+				count
+					? `${when}: ${count} session${count === 1 ? "" : "s"} started, in order. Click one to open it.`
+					: `${when}: nothing started.`
+			}
+		>
+			{count ? <StartedRows night={night} /> : <EmptyNight night={night} />}
+		</SettingsSection>
+	);
+}
+
+/** Why a night started nothing: its last two lines, or that it has none. */
+function EmptyNight({ night }: { night: Night }) {
+	if (night.lines.length === 0)
+		return (
+			<p className="px-4 py-3 text-sm text-muted-foreground">
+				Nothing in the log for this night: Odin wasn't open, or the computer was
+				asleep. Sessions the remote host ran show up a few minutes after Odin
+				opens.
+			</p>
+		);
+	return night.lines.slice(0, 2).map((entry) => (
+		<div
+			key={`${entry.at}-${entry.event}`}
+			className="flex gap-3 px-4 py-2 text-[13px]"
+		>
+			<span className="w-10 shrink-0 text-right text-xs leading-5 tabular-nums text-muted-foreground">
+				{hhmm(entry.at)}
+			</span>
+			<span className="cursor-text select-text leading-5 text-muted-foreground">
+				{entry.event}
+			</span>
+		</div>
+	));
+}
+
+/** Where a started session stands now: the board's column, or Done once it's gone. */
+function sessionState(
+	pane: Pane | undefined,
+	alive: Set<string> | undefined,
+): { dot: string; label: string } {
+	if (!pane || pane.completed) return { dot: "var(--success)", label: "Done" };
+	return PANE_STATUS[
+		boardColumn(
+			pane.status ?? "idle",
+			alive?.has(pane.id),
+			pane.odinParked ?? false,
+			false,
+			pane.odinClosedIn,
+		)
+	];
+}
+
+function StartedRows({ night }: { night: Night }) {
+	const panes = useTabsStore((s) => s.panes);
+	// The board's own 5s poll - one shared query - so a dead session reads Idle, not Working.
+	const { data: daemon } = electronTrpc.terminal.listDaemonSessions.useQuery(
+		undefined,
+		{ refetchInterval: 5_000 },
+	);
+	const alive = useMemo(
+		() =>
+			daemon &&
+			new Set(
+				daemon.sessions
+					.filter((session) => session.isAlive)
+					.map((session) => session.sessionId),
+			),
+		[daemon],
+	);
+	const bySession = useMemo(
+		() =>
+			new Map(
+				Object.values(panes).flatMap((pane) =>
+					pane.claudeSessionId ? [[pane.claudeSessionId, pane] as const] : [],
+				),
+			),
+		[panes],
+	);
+	return night.started.map(
+		(entry, i) =>
+			entry.started && (
+				<StartedRow
+					key={`${entry.at}-${entry.started.key}`}
+					index={i}
+					entry={entry}
+					started={entry.started}
+					pane={bySession.get(entry.started.sessionId ?? "")}
+					alive={alive}
+				/>
+			),
+	);
+}
+
+function StartedRow({
+	index,
+	entry,
+	started,
+	pane,
+	alive,
+}: {
+	index: number;
+	entry: NightLogEntry;
+	started: NightStart;
+	pane: Pane | undefined;
+	alive: Set<string> | undefined;
+}) {
+	const navigate = useNavigate();
+	const state = sessionState(pane, alive);
+	const Icon = ICON_BY_SOURCE[started.source];
+	const onBoard = !!pane && !pane.completed;
+	const canOpen = onBoard || !!started.sessionId;
+	const open = () => {
+		if (pane && onBoard) {
+			usePendingFocus.getState().focus(pane.id);
+			void navigate({ to: "/board" });
+		} else if (started.sessionId)
+			void navigate({
+				to: "/sessions",
+				search: { q: started.title, open: started.sessionId },
+			});
+	};
+	return (
+		<button
+			type="button"
+			disabled={!canOpen}
+			onClick={open}
+			title={onBoard ? "Open on the board" : "Open in Session History"}
+			className="group flex w-full items-center gap-3 px-4 py-2.5 text-left hover:bg-muted/30 disabled:cursor-default disabled:hover:bg-transparent"
+		>
+			<span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-primary/15 text-xs font-semibold tabular-nums text-primary">
+				{index + 1}
+			</span>
+			{Icon && (
+				<Icon
+					className="size-3.5 shrink-0 text-muted-foreground"
+					aria-label={started.source}
+				/>
+			)}
+			<span className="min-w-0 flex-1 truncate text-sm" title={started.title}>
+				{started.title}
+			</span>
+			<span className="shrink-0 text-xs tabular-nums text-muted-foreground">
+				{hhmm(entry.at)}
+			</span>
+			<span
+				className={cn(
+					"flex shrink-0 items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] font-medium",
+					PILL.neutral,
+				)}
+			>
+				<span
+					className="size-1.5 rounded-full"
+					style={{ background: state.dot }}
+					aria-hidden
+				/>
+				{state.label}
+			</span>
+			<LuArrowUpRight
+				className="size-3.5 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 group-disabled:opacity-0"
+				aria-hidden
+			/>
+		</button>
+	);
+}
+
+/**
+ * What each tick decided, by night, newest first. The newest two nights are
+ * open; an older one folds to its header until you click it.
+ */
+function LogSection() {
+	const { nights } = useNights();
+	const [toggled, setToggled] = useState<Record<number, boolean>>({});
+	const isOpen = (night: Night, i: number) =>
+		toggled[night.from] ?? i < OPEN_NIGHTS;
 	return (
 		<SettingsSection
 			title="Log"
 			description="What each night did, or why it didn't start."
 		>
-			{shown.length === 0 ? (
+			{nights.length === 0 ? (
 				<p className="px-4 py-3 text-sm text-muted-foreground">
 					Nothing yet. The first night shows up here.
 				</p>
 			) : (
-				shown.map((entry) => (
-					<div
-						key={`${entry.at}-${entry.event}`}
-						className="flex gap-4 px-4 py-2 text-[13px] leading-relaxed"
-					>
-						<span className="w-24 shrink-0 tabular-nums text-xs leading-[1.6rem] text-muted-foreground">
-							{new Date(entry.at).toLocaleString([], {
-								month: "short",
-								day: "numeric",
-								hour: "2-digit",
-								minute: "2-digit",
-							})}
-						</span>
-						<span className="cursor-text select-text">{entry.event}</span>
-					</div>
+				nights.map((night, i) => (
+					<NightGroup
+						key={night.from}
+						night={night}
+						open={isOpen(night, i)}
+						onToggle={() =>
+							setToggled({ ...toggled, [night.from]: !isOpen(night, i) })
+						}
+					/>
 				))
 			)}
-			{newestFirst.length > LOG_PREVIEW && (
-				<button
-					type="button"
-					onClick={() => setShowAll(!showAll)}
-					className="w-full px-4 py-2 text-left text-xs text-muted-foreground hover:text-foreground"
-				>
-					{showAll ? "Show fewer" : `Show all ${newestFirst.length}`}
-				</button>
-			)}
 		</SettingsSection>
+	);
+}
+
+/** One night: a header line to fold it by, then its lines down a rail. */
+function NightGroup({
+	night,
+	open,
+	onToggle,
+}: {
+	night: Night;
+	open: boolean;
+	onToggle: () => void;
+}) {
+	const Chevron = open ? LuChevronDown : LuChevronRight;
+	const count = night.started.length;
+	return (
+		<div>
+			<button
+				type="button"
+				onClick={onToggle}
+				aria-expanded={open}
+				className="flex w-full items-center gap-2.5 px-4 py-2.5 text-left hover:bg-muted/30"
+			>
+				<Chevron
+					className="size-3.5 shrink-0 text-muted-foreground"
+					aria-hidden
+				/>
+				<LuMoon
+					className={cn(
+						"size-3.5 shrink-0",
+						count ? "text-primary" : "text-muted-foreground",
+					)}
+					aria-hidden
+				/>
+				<span className="text-sm font-medium">{night.label}</span>
+				{night.label !== night.date && (
+					<span className="text-xs text-muted-foreground">{night.date}</span>
+				)}
+				<span className="ml-auto shrink-0 text-xs tabular-nums text-muted-foreground">
+					{count ? `${count} started` : "nothing started"}
+				</span>
+			</button>
+			{open && (
+				<div className="relative pb-2">
+					<div
+						className="absolute inset-y-0 left-[4.625rem] w-px bg-border/70"
+						aria-hidden
+					/>
+					{night.lines.map((entry) => (
+						<LogLine key={`${entry.at}-${entry.event}`} entry={entry} />
+					))}
+				</div>
+			)}
+		</div>
+	);
+}
+
+/** Time, a dot on the rail, the line. A start is lit; the rest is quiet. */
+function LogLine({ entry }: { entry: NightLogEntry }) {
+	return (
+		<div className="relative flex items-start gap-3 px-4 py-1">
+			<span className="w-10 shrink-0 text-right text-xs leading-5 tabular-nums text-muted-foreground">
+				{hhmm(entry.at)}
+			</span>
+			<span className="flex h-5 w-3 shrink-0 items-center justify-center">
+				<span
+					className={cn(
+						"relative size-1.5 rounded-full",
+						entry.started
+							? "bg-primary glow-primary"
+							: "bg-border ring-2 ring-card",
+					)}
+				/>
+			</span>
+			<span
+				className={cn(
+					"min-w-0 flex-1 cursor-text select-text text-[13px] leading-5",
+					entry.started ? "text-foreground" : "text-muted-foreground",
+				)}
+			>
+				{entry.event}
+			</span>
+		</div>
 	);
 }

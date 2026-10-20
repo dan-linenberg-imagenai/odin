@@ -18,11 +18,27 @@ export interface OffHours {
 	introSeen: boolean;
 }
 
+/** A session the Night Agent started: what the night ran, and a way back to it. */
+export interface NightStart {
+	key: string;
+	title: string;
+	source: string;
+	/** The Claude conversation id, so the row can open the session. */
+	sessionId?: string;
+}
+
 /** One line of what the Night Agent did or why it didn't, for Huginn and you. */
 export interface NightLogEntry {
-	/** ISO time. */
+	/** ISO time: when it happened, which for a host's session is when it started there. */
 	at: string;
 	event: string;
+	/** Set on the lines that started a session. */
+	started?: NightStart;
+	/**
+	 * The night this line is about, as the window's start in ms - set on lines
+	 * written in the daytime about the coming night (a plan sent to the host).
+	 */
+	night?: number;
 }
 
 /** About a week of nights; the oldest lines drop first. */
@@ -98,9 +114,16 @@ export const useNextInLinePrompt = create<{
 	/** Whether this window has started a pick - reset once it closes. */
 	offHoursFromPicks: boolean;
 	setOffHoursFromPicks: (fromPicks: boolean) => void;
-	/** What each tick decided, newest last. A repeat of the last line isn't added. */
+	/**
+	 * What each tick decided, newest last. A repeat of the last line isn't
+	 * added. `at` backdates a line to when it happened, for a session the host
+	 * started while this computer was closed.
+	 */
 	nightLog: NightLogEntry[];
-	logNight: (event: string) => void;
+	logNight: (
+		event: string,
+		extra?: { started?: NightStart; night?: number; at?: string },
+	) => void;
 	/** When the runner last ticked, so a gap (Odin shut, computer asleep) shows. */
 	nightLastTick: string;
 	setNightLastTick: (at: string) => void;
@@ -119,14 +142,19 @@ export const useNextInLinePrompt = create<{
 			offHoursFromPicks: false,
 			setOffHoursFromPicks: (offHoursFromPicks) => set({ offHoursFromPicks }),
 			nightLog: [],
-			logNight: (event) =>
+			logNight: (event, extra) =>
 				set((state) =>
 					state.nightLog.at(-1)?.event === event
 						? state
 						: {
 								nightLog: [
 									...state.nightLog,
-									{ at: new Date().toISOString(), event },
+									{
+										at: extra?.at ?? new Date().toISOString(),
+										event,
+										...(extra?.started ? { started: extra.started } : {}),
+										...(extra?.night ? { night: extra.night } : {}),
+									},
 								].slice(-MAX_NIGHT_LOG),
 							},
 				),
