@@ -193,6 +193,12 @@ import {
 	remindSession,
 	SessionReminders,
 } from "./SessionReminders";
+import {
+	SWITCH_SORTS,
+	type SwitchSort,
+	sessionOrder,
+	statusAt,
+} from "./session-order";
 import { moveToVsCode } from "./vscode-move";
 
 /**
@@ -219,15 +225,6 @@ const SECTION_ICON: Record<BoardSection, IconType> = {
 	// Not from a feed - a session you opened yourself.
 	normal: LuTerminal,
 };
-
-/** The drawer session list's sort options - value to menu label. */
-const SWITCH_SORTS = {
-	status: "Needs you first",
-	updated: "Last update",
-	oldest: "Waiting longest",
-	name: "Name",
-} as const;
-type SwitchSort = keyof typeof SWITCH_SORTS;
 
 export const Route = createFileRoute("/_authenticated/_odin/board/")({
 	component: DevBoardPage,
@@ -3738,39 +3735,16 @@ function DevBoardPage() {
 			localStorage.setItem("odin:drawer-sessions-group", next ? "1" : "0");
 		} catch {}
 	};
-	const statusRank = { permission: 0, review: 0, working: 1 } as const;
-	const groupRank = { permission: 0, review: 1, working: 2 } as const;
-	// Last update = the newest hook (every tool call fires one) or status change.
-	// odinStatusAt alone stays put for a whole turn, so an hour of work read as
-	// an hour stale.
-	const updatedAt = (card: { pane: { id: string; odinStatusAt?: number } }) =>
-		Math.max(
-			card.pane.odinStatusAt ?? 0,
-			lastAgentHookAt.get(card.pane.id) ?? 0,
-		);
+	// The time sorts read when a session entered its state, not its newest
+	// hook: hooks fire on every tool call, and sorting on them had the Working
+	// rows trade places every few seconds. A row moves when its state changes.
 	const switchCards = (["permission", "review", "working"] as const)
 		.flatMap((status) => cardsByStatus.get(status) ?? [])
-		.toSorted(
-			(a, b) =>
-				(isSwitchGrouped
-					? groupRank[a.status as keyof typeof groupRank] -
-						groupRank[b.status as keyof typeof groupRank]
-					: 0) ||
-				Number(!!b.pane.odinStarred) - Number(!!a.pane.odinStarred) ||
-				(switchSort === "status"
-					? statusRank[a.status as keyof typeof statusRank] -
-						statusRank[b.status as keyof typeof statusRank]
-					: 0) ||
-				(switchSort === "name"
-					? cardTitle(a).localeCompare(cardTitle(b))
-					: switchSort === "oldest"
-						? updatedAt(a) - updatedAt(b)
-						: updatedAt(b) - updatedAt(a)),
-		);
+		.toSorted(sessionOrder(switchSort, isSwitchGrouped, cardTitle));
 	// Idle sits under the list, folded until opened; remembered per machine.
 	// Not in switchCards, so the next/prev keys still walk only what's in flight.
 	const idleSwitchCards = (cardsByStatus.get("idle") ?? []).toSorted(
-		(a, b) => updatedAt(b) - updatedAt(a),
+		(a, b) => statusAt(b) - statusAt(a),
 	);
 	const [isIdleSwitchOpen, setIsIdleSwitchOpen] = useState(() => {
 		try {
