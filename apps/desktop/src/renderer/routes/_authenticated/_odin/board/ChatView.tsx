@@ -86,6 +86,7 @@ import {
 	ScreenMenuCard,
 } from "./ChatPrompts";
 import { collectRefs, linkify, withSchemes } from "./chat-links";
+import { replyBoxOwnsEsc } from "./drawer-esc";
 import {
 	deliverOnHost,
 	type HostDeps,
@@ -3858,10 +3859,11 @@ function Composer({
 	const remote = useTabsStore((s) => !!s.panes[paneId]?.odinRemote);
 	const fileCwd = remote ? undefined : (filesCwd ?? undefined);
 	const atToken = bash || !fileCwd ? undefined : fileToken(draft);
-	const { data: files = [] } = electronTrpc.sessionFiles.list.useQuery(
-		{ cwd: fileCwd ?? "" },
-		{ enabled: atToken !== undefined, staleTime: 30_000 },
-	);
+	const { data: files = [], isFetched: filesFetched } =
+		electronTrpc.sessionFiles.list.useQuery(
+			{ cwd: fileCwd ?? "" },
+			{ enabled: atToken !== undefined, staleTime: 30_000 },
+		);
 	const options = useMemo(() => {
 		if (menuClosed) return [];
 		if (atToken !== undefined)
@@ -3881,6 +3883,13 @@ function Composer({
 			enterPicks: enterPicks(skill.name, token ?? ""),
 		}));
 	}, [menuClosed, atToken, files, matches, token]);
+	// An `@` with nothing to pick says so, rather than showing no list at all.
+	const noFiles =
+		!menuClosed && atToken !== undefined && filesFetched && !options.length
+			? files.length
+				? `No files match @${atToken}`
+				: "No files to pick in this folder"
+			: null;
 	const activeIndex = Math.min(selected, Math.max(options.length - 1, 0));
 	const pick = (option: (typeof options)[number]) => {
 		setDraft(option.insert);
@@ -3969,6 +3978,11 @@ function Composer({
 					dragging && "border-primary bg-primary/10",
 				)}
 			>
+				{noFiles && (
+					<div className="absolute inset-x-0 bottom-full mb-1.5 rounded-[10px] border border-border bg-popover px-3 py-1.5 text-[11.5px] text-muted-foreground shadow-[0_12px_40px_rgba(0,0,0,0.5)]">
+						{noFiles}
+					</div>
+				)}
 				{options.length > 0 && (
 					<div className="absolute inset-x-0 bottom-full mb-1.5 overflow-hidden rounded-[10px] border border-border bg-popover shadow-[0_12px_40px_rgba(0,0,0,0.5)]">
 						<div className="max-h-[240px] overflow-y-auto py-1">
@@ -4020,6 +4034,14 @@ function Composer({
 					)}
 					<textarea
 						ref={inputRef}
+						// Tells the drawer's window-level Esc to stand aside.
+						data-owns-esc={
+							replyBoxOwnsEsc({
+								menuOpen: options.length > 0 || !!noFiles,
+								bash,
+								draft,
+							}) || undefined
+						}
 						value={draft}
 						rows={1}
 						onChange={(event) => {
@@ -4041,6 +4063,15 @@ function Composer({
 							) {
 								event.preventDefault();
 								if (!event.repeat) voice.press();
+								return;
+							}
+							if (
+								noFiles &&
+								event.key === "Escape" &&
+								!event.nativeEvent.isComposing
+							) {
+								event.preventDefault();
+								setMenuClosed(true);
 								return;
 							}
 							if (options.length > 0 && !event.nativeEvent.isComposing) {
