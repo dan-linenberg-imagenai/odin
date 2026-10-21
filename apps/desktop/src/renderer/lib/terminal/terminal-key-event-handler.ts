@@ -1,5 +1,9 @@
 import type { Terminal as XTerm } from "@xterm/xterm";
-import { isHotkey, resolveHotkeyFromEvent } from "renderer/hotkeys";
+import {
+	hasModifier,
+	isHotkey,
+	resolveHotkeyFromEvent,
+} from "renderer/hotkeys";
 import {
 	shouldBubbleClipboardShortcut,
 	shouldSelectAllShortcut,
@@ -55,7 +59,15 @@ export function createTerminalKeyEventHandler(
 			}
 			return false;
 		}
-		if (resolveHotkeyFromEvent(event) !== null) return false;
+		// An app chord leaves the terminal only when a modifier is held. A bare
+		// key - an arrow, Enter, a letter - is the terminal's even when the app
+		// binds it too: Catch up's Enter, right arrow and E only mean something
+		// while Catch up is open, never while you type in a terminal. Letters
+		// survive being given up here because xterm types them on keypress;
+		// an arrow has no keypress, so giving it up loses it, and the cursor
+		// stopped moving right.
+		if (resolveHotkeyFromEvent(event) !== null && hasModifier(event))
+			return false;
 
 		const translation = translateLineEditChord(event, { isMac, isWindows });
 		if (translation !== null) {
